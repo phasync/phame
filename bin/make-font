@@ -1,0 +1,125 @@
+#!/usr/bin/env php
+<?php
+// Rasterizes a TrueType font into a BMFont (text format) atlas: bin/make-font <font.ttf> <size in pixels> <outname>
+// Writes assets/fonts/<outname>.fnt and .png. Needs GD with FreeType.
+
+require __DIR__ . '/../vendor/autoload.php';
+
+use Phame\Textures\Png;
+
+if ($argc !== 4 || !is_file($argv[1]) || (int) $argv[2] < 4) {
+    fwrite(STDERR, "usage: bin/make-font <font.ttf> <size in pixels> <outname>\n");
+    exit(1);
+}
+[, $ttf, $size, $name] = $argv;
+$size = (int) $size;
+$pt = $size * 0.75; // GD sizes text in points at 96 dpi
+
+$ttfData = file_get_contents($ttf);
+$tables = [];
+for ($i = 0, $n = unpack('n', $ttfData, 4)[1]; $i < $n; ++$i) {
+    $e = unpack('a4tag/Nsum/Noffset/Nlength', $ttfData, 12 + $i * 16);
+    $tables[$e['tag']] = $e['offset'];
+}
+$unitsPerEm = unpack('n', $ttfData, $tables['head'] + 18)[1];
+['asc' => $asc, 'desc' => $desc, 'gap' => $gap] = unpack('nasc/ndesc/ngap', $ttfData, $tables['hhea'] + 4);
+$asc = $asc >= 32768 ? $asc - 65536 : $asc;
+$desc = $desc >= 32768 ? $desc - 65536 : $desc;
+$base = (int) round($asc * $size / $unitsPerEm);
+$lineHeight = (int) round(($asc - $desc + $gap) * $size / $unitsPerEm);
+
+$ids = array_merge(range(32, 126), range(160, 255));
+$pad = 2;
+$cell = 128;
+[$ox, $oy] = [48, 88];
+
+$scratch = imagecreatetruecolor($cell, $cell);
+$white = imagecolorallocate($scratch, 255, 255, 255);
+$black = imagecolorallocate($scratch, 0, 0, 0);
+
+$glyphs = [];
+foreach ($ids as $id) {
+    $ch = mb_chr($id, 'UTF-8');
+    imagefilledrectangle($scratch, 0, 0, $cell - 1, $cell - 1, $white);
+    imagettftext($scratch, $pt, 0, $ox, $oy, $black, $ttf, $ch);
+    $adv = (int) (imagettfbbox($pt, 0, $ttf, $ch . '|')[2] - imagettfbbox($pt, 0, $ttf, '|')[2]);
+    [$x0, $y0, $x1, $y1] = [$cell, $cell, -1, -1];
+    $cov = [];
+    for ($y = 0; $y < $cell; ++$y) {
+        for ($x = 0; $x < $cell; ++$x) {
+            $a = 255 - (imagecolorat($scratch, $x, $y) & 255);
+            if ($a > 0) {
+                $cov[$y * $cell + $x] = $a;
+                [$x0, $y0, $x1, $y1] = [min($x0, $x), min($y0, $y), max($x1, $x), max($y1, $y)];
+            }
+        }
+    }
+    if ($x1 < 0) {
+        [$x0, $y0] = [$ox, $oy - $base];
+    }
+    $w = $x1 >= 0 ? $x1 - $x0 + 1 : 0;
+    $h = $y1 >= 0 ? $y1 - $y0 + 1 : 0;
+    $glyphs[$id] = ['w' => $w, 'h' => $h, 'xo' => $x0 - $ox, 'yo' => $y0 - ($oy - $base), 'adv' => $adv, 'cov' => $cov, 'x0' => $x0, 'y0' => $y0];
+}
+
+// shelf packing
+$atlasW = 512;
+[$px, $py, $rowH] = [$pad, $pad, 0];
+foreach ($glyphs as $id => &$g) {
+    if ($px + $g['w'] + $pad > $atlasW) {
+        [$px, $py, $rowH] = [$pad, $py + $rowH + $pad, 0];
+    }
+    $g['ax'] = $px;
+    $g['ay'] = $py;
+    $px += $g['w'] + $pad;
+    $rowH = max($rowH, $g['h']);
+}
+unset($g);
+$atlasH = 1;
+while ($atlasH < $py + $rowH + $pad) {
+    $atlasH *= 2;
+}
+
+$rgba = str_repeat("\xFF\xFF\xFF\x00", $atlasW * $atlasH);
+foreach ($glyphs as $g) {
+    foreach ($g['cov'] as $i => $a) {
+        $x = $g['ax'] + intdiv($i, 1) % $cell - $g['x0'];
+        $y = $g['ay'] + intdiv($i, $cell) - $g['y0'];
+        $rgba[($y * $atlasW + $x) * 4 + 3] = chr($a);
+    }
+}
+
+// kerning from the pair width: the second glyph's pen position minus the first glyph's advance
+$ascii = range(32, 126);
+$right = [];
+foreach ($ascii as $id) {
+    $right[$id] = imagettfbbox($pt, 0, $ttf, mb_chr($id))[2];
+}
+$kerns = [];
+foreach ($ascii as $a) {
+    foreach ($ascii as $b) {
+        $k = imagettfbbox($pt, 0, $ttf, mb_chr($a) . mb_chr($b))[2] - $right[$b] - $glyphs[$a]['adv'];
+        if (abs($k) >= 2) { // one pixel is rounding noise from hinted advances
+            $kerns[] = [$a, $b, $k];
+        }
+    }
+}
+
+$face = pathinfo($ttf, PATHINFO_FILENAME);
+$fnt = "info face=\"$face\" size=$size bold=0 italic=0 charset=\"\" unicode=1 stretchH=100 smooth=1 aa=1 padding=0,0,0,0 spacing=$pad,$pad\n";
+$fnt .= "common lineHeight=$lineHeight base=$base scaleW=$atlasW scaleH=$atlasH pages=1 packed=0\n";
+$fnt .= "page id=0 file=\"$name.png\"\n";
+$fnt .= 'chars count=' . count($glyphs) . "\n";
+foreach ($glyphs as $id => $g) {
+    $fnt .= "char id=$id x={$g['ax']} y={$g['ay']} width={$g['w']} height={$g['h']} xoffset={$g['xo']} yoffset={$g['yo']} xadvance={$g['adv']} page=0 chnl=15\n";
+}
+$fnt .= 'kernings count=' . count($kerns) . "\n";
+foreach ($kerns as [$a, $b, $k]) {
+    $fnt .= "kerning first=$a second=$b amount=$k\n";
+}
+
+$dir = __DIR__ . '/../assets/fonts';
+is_dir($dir) || mkdir($dir, 0777, true);
+file_put_contents("$dir/$name.fnt", $fnt);
+file_put_contents("$dir/$name.png", Png::encode($atlasW, $atlasH, $rgba));
+echo "$name: " . count($glyphs) . " glyphs, " . count($kerns) . " kerning pairs, atlas {$atlasW}x{$atlasH}, base $base, line height $lineHeight\n";

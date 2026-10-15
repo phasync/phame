@@ -1,0 +1,34 @@
+{
+    "name": "phame/server",
+    "description": "Serves Phame worlds to browsers through swerve: the game runs on the server, every tab renders its own view.",
+    "type": "project",
+    "license": "MIT",
+    "repositories": [
+        {
+            "type": "path",
+            "url": "/home/frode/dev/swerve",
+            "options": {
+                "symlink": true
+            }
+        },
+        {
+            "type": "path",
+            "url": "..",
+            "options": {
+                "symlink": true
+            }
+        }
+    ],
+    "require": {
+        "php": ">=8.4",
+        "phasync/swerve": "*@dev",
+        "frodeborli/phame": "*@dev"
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true,
+    "autoload": {
+        "psr-4": {
+            "PhameServer\\": "src/"
+        }
+    }
+}
