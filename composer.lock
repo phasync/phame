@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "29f691268f1005df416d6e8a3556188f",
+    "content-hash": "becdb69ef0f8a155cff4db2d495782f6",
     "packages": [
         {
             "name": "fiber-interop/scope",
@@ -66,20 +66,20 @@
         },
         {
             "name": "phasync/phasync",
-            "version": "2.0.0-beta9",
+            "version": "2.0.0-beta10",
             "source": {
                 "type": "git",
                 "url": "https://github.com/phasync/phasync.git",
-                "reference": "6676f335fe5dc2bcb414d9b778b1a758e84074a3"
+                "reference": "ff86aa4625202e938dd635aaabf57f13f587f210"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/phasync/phasync/zipball/6676f335fe5dc2bcb414d9b778b1a758e84074a3",
-                "reference": "6676f335fe5dc2bcb414d9b778b1a758e84074a3",
+                "url": "https://api.github.com/repos/phasync/phasync/zipball/ff86aa4625202e938dd635aaabf57f13f587f210",
+                "reference": "ff86aa4625202e938dd635aaabf57f13f587f210",
                 "shasum": ""
             },
             "require": {
-                "fiber-interop/scope": "^0.2",
+                "fiber-interop/scope": "^0.2.1",
                 "php": "^8.2",
                 "psr/http-factory": "^1.0",
                 "psr/http-message": "^1.0 || ^2.0",
@@ -135,9 +135,9 @@
             "description": "phasync asyncio library for PHP, providing seamless and efficient coroutines via PHP fibers",
             "support": {
                 "issues": "https://github.com/phasync/phasync/issues",
-                "source": "https://github.com/phasync/phasync/tree/2.0.0-beta9"
+                "source": "https://github.com/phasync/phasync/tree/2.0.0-beta10"
             },
-            "time": "2026-10-15T08:02:31+00:00"
+            "time": "2026-10-15T20:31:06+00:00"
         },
         {
             "name": "psr/http-factory",

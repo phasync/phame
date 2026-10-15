@@ -239,11 +239,8 @@ final class World
             $wait = $this->nextEventTime() - $this->clock->time - ((hrtime(true) - $this->eventedAt) / 1e9);
             if ($wait > 0.0) {
                 $this->sleepingUntil = $this->clock->time + $wait;
-                try {
-                    phasync::awaitFlag($this->wakeFlag, min($wait, 3600.0));
-                } catch (\phasync\TimeoutException) {
-                    // the event is due
-                }
+                // until woken, or until the event is due (the usual case: a timeout, so no exception for it)
+                phasync::awaitFlag($this->wakeFlag, min($wait, 3600.0), throw: false);
                 $this->sleepingUntil = -INF;
             }
             $now = hrtime(true);
