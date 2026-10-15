@@ -33,58 +33,6 @@ abstract class Ball extends Node3D
     }
 }
 
-/** A part of a ragdoll a viewer throws: a sphere, tethered to its neighbours, that the box does not hold. */
-final class Part extends Ball
-{
-    /** The parts: where each sits (x right, y up, in the ragdoll's own frame), its radius, and the part it hangs on. */
-    public const BODY = [
-        [0.0, 5.2, 1.1, 1],     // head, on the chest
-        [0.0, 3.0, 1.5, -1],    // chest
-        [0.0, 0.8, 1.4, 1],     // pelvis
-        [-2.5, 3.6, 0.75, 1],   // left upper arm
-        [-4.8, 3.6, 0.65, 3],   // left forearm
-        [2.5, 3.6, 0.75, 1],    // right upper arm
-        [4.8, 3.6, 0.65, 5],    // right forearm
-        [-0.9, -1.6, 0.9, 2],   // left thigh
-        [-1.0, -4.2, 0.8, 7],   // left shin
-        [0.9, -1.6, 0.9, 2],    // right thigh
-        [1.0, -4.2, 0.8, 9],    // right shin
-    ];
-
-    public function __construct(public readonly Observer $by, float $radius)
-    {
-        $this->confined = false;
-        $this->radius = $radius;
-        $this->mass = 3.0 * $radius ** 3;   // denser than the rocks, so a limb shoves a rock and a rock bends a limb
-        $this->color = $by->color;
-    }
-
-    public function kind(): int
-    {
-        return 3;
-    }
-
-    /** A crash test dummy: glossy plastic in the thrower's colour, with the black and yellow quadrant markers. */
-    public static function material(): MeshShader
-    {
-        return new MeshShader(<<<'GLSL'
-            vec4 shade() {
-                vec3 n = normalize(vNormal);
-                vec3 view = normalize(uEye - vWorldPos);
-                vec3 p = normalize(vWorldPos - vCenter);
-                // quadrant markers on the round parts (the limbs between them are thinner): black and colour
-                float marker = step(0.0, p.x * p.y) * step(0.7, vRadius);
-                vec3 albedo = mix(vColor, vec3(0.05), marker * 0.9);
-                float diffuse = max(dot(n, SUN), 0.0);
-                vec3 sky = mix(vec3(0.04, 0.035, 0.03), vec3(0.1, 0.12, 0.2), n.y * 0.5 + 0.5);
-                float spec = pow(max(dot(reflect(-SUN, n), view), 0.0), 40.0) * 0.5;
-                float rim = pow(1.0 - max(dot(n, view), 0.0), 3.0);
-                return vec4(albedo * (sky + vec3(1.5, 1.35, 1.15) * diffuse) + spec + vColor * rim * 0.35, 1.0);
-            }
-            GLSL);
-    }
-}
-
 final class Rock extends Ball
 {
     public function kind(): int
@@ -219,8 +167,10 @@ final class RocksGame
     private int $batched = 0;
     /** Raised when a batch starts: the flusher sleeps on it while nothing changes. */
     private object $batchStarted;
-    /** @var array<int, array{parts: list<Part>, links: list<array{int, int, float}>}> the ragdolls in flight */
+    /** @var array<int, Ragdoll> the ragdolls in flight */
     private array $ragdolls = [];
+    /** How many were thrown: the next is the next type. */
+    private int $thrown = 0;
     /** @var array<string, Observer> by client */
     private array $observers = [];
     private float $started;
@@ -290,6 +240,9 @@ final class RocksGame
             $impulse = $contact->impulse(1.0);   // elastic: they keep their energy, so they keep colliding
             $a->bounced($contact, $impulse);
             $b->bounced($contact, $impulse);
+        });
+        $this->world->onCollision(function (Limb $limb, Ball $ball, Contact $contact) {
+            $limb->doll->hit($limb, $ball, $contact);
         });
         $this->world->onCollision(function (Ball $ball, Wall $wall, Contact $contact) {
             $ball->hitWall($wall);
@@ -425,68 +378,68 @@ final class RocksGame
     }
 
     /**
-     * A viewer throws a ragdoll: from in front of their camera, the way it looks, tumbling head over heels, its parts
-     * tethered at the joints. It is gone again after 10 seconds.
+     * A viewer throws a ragdoll, the next type in turn: from in front of their camera, the way it looks, tumbling head
+     * over heels and flailing. It is gone again after 10 seconds.
      */
     private function drop(Observer $by): void
     {
         $now = microtime(true);
-        // each ragdoll in flight is some 400 events a second for the world: 25 is about what one PHP worker keeps up with
-        if ($now - $by->droppedAt < 0.1 || $by->ragdolls >= 10 || count($this->ragdolls) >= 25) {
+        // each ragdoll in flight costs the world some 18 ms a second (probing its limbs), 30 about half a core
+        if ($now - $by->droppedAt < 0.1 || $by->ragdolls >= 10 || count($this->ragdolls) >= 30) {
             return;
         }
         $by->droppedAt = $now;
         ++$by->ragdolls;
-        // the camera's frame: it looks along $look, $right and $up span the ragdoll
+        $doll = new Ragdoll($by, Ragdoll::TYPES[$this->thrown++ % count(Ragdoll::TYPES)]);
         [$lx, $ly, $lz] = [$by->lookX, $by->lookY, $by->lookZ];
-        [$rx, $ry, $rz] = [-$lz, 0.0, $lx];   // look x world up
-        $n = sqrt($rx * $rx + $rz * $rz) ?: 1.0;
-        [$rx, $rz] = [$rx / $n, $rz / $n];
-        [$ux, $uy, $uz] = [$ry * $lz - $rz * $ly, $rz * $lx - $rx * $lz, $rx * $ly - $ry * $lx];
-        [$cx, $cy, $cz] = [$by->x + $lx * 16.0, $by->y + $ly * 16.0, $by->z + $lz * 16.0];
-        $tumble = 4.0;   // radians per second about $right: head over heels
-        $parts = [];
-        $bodies = [];
-        foreach (Part::BODY as [$x, $y, $radius]) {
-            $part = new Part($by, $radius);
-            [$ox, $oy, $oz] = [$rx * $x + $ux * $y, $ry * $x + $uy * $y, $rz * $x + $uz * $y];
-            $part->moveTo($cx + $ox, $cy + $oy, $cz + $oz);
-            // thrown at 38 units per second, turning: each part moves with omega x r
-            $part->setVelocity(
-                $lx * 38.0 + $tumble * ($ry * $oz - $rz * $oy),
-                $ly * 38.0 + $tumble * ($rz * $ox - $rx * $oz),
-                $lz * 38.0 + $tumble * ($rx * $oy - $ry * $ox),
-            );
-            $part->published = true;
-            $this->scene->root->addChild($part);
-            $this->rocks[spl_object_id($part)] = $part;
-            $parts[] = $part;
-            $bodies[] = [spl_object_id($part), $radius, $part->color, 3, ...$part->describe()];
+        $n = sqrt($lx * $lx + $lz * $lz) ?: 1.0;   // the camera's right: look x world up
+        foreach ($doll->nodes() as $node) {
+            $node->published = true;
         }
-        $links = [];
-        $space = $this->world->physics($this->scene);
-        foreach (Part::BODY as $i => [$x, $y, $radius, $parent]) {
-            if ($parent >= 0) {
-                [$a, $b] = [$parts[$parent], $parts[$i]];
-                $space->tether($a, $b, 1.04 * sqrt(($b->x - $a->x) ** 2 + ($b->y - $a->y) ** 2 + ($b->z - $a->z) ** 2));
-                $links[] = [spl_object_id($a), spl_object_id($b), 0.45];
-            }
-        }
-        $key = spl_object_id($parts[1]);
-        $this->ragdolls[$key] = ['parts' => $parts, 'links' => $links];
-        $this->announce(['type' => 'add', 'bodies' => $bodies, 'links' => $links]);
-        $this->world->go(function () use ($by, $key) {
+        $this->scene->root->addChild($doll);
+        $doll->launch(
+            $this->world,
+            [$by->x + $lx * 18.0, $by->y + $ly * 18.0, $by->z + $lz * 18.0],
+            [$lx * 34.0, $ly * 34.0, $lz * 34.0],
+            [-$lz / $n * 3.0 + $lx, $ly, $lx / $n * 3.0 + $lz],   // head over heels, and a little about the way it flies
+        );
+        $this->ragdolls[spl_object_id($doll)] = $doll;
+        $this->announce(['type' => 'add'] + $this->describeDolls([$doll]));
+        $this->world->go(function () use ($doll) {
             \phasync::sleep(10.0);
             $this->world->sync();
-            $ids = [];
-            foreach ($this->ragdolls[$key]['parts'] as $part) {
-                $this->scene->root->removeChild($part);
-                unset($this->rocks[$ids[] = spl_object_id($part)]);
+            $doll->gone = true;
+            foreach ($doll->joints as $joint) {
+                $this->world->wake($joint);   // their coroutines end
             }
-            unset($this->ragdolls[$key]);
-            --$by->ragdolls;
+            $ids = array_map('spl_object_id', $doll->nodes());
+            $this->scene->root->removeChild($doll);
+            unset($this->ragdolls[spl_object_id($doll)]);
+            --$doll->by->ragdolls;
             $this->announce(['type' => 'remove', 'ids' => $ids]);
         });
+    }
+
+    /**
+     * Ragdolls as viewers get them: every node a body (the root and the joints invisible), with the parent each hangs
+     * on (its motion description is in the parent's space) and the bones drawn between limbs.
+     *
+     * @param list<Ragdoll> $dolls
+     */
+    private function describeDolls(array $dolls): array
+    {
+        $out = ['bodies' => [], 'parents' => [], 'trees' => [], 'links' => []];
+        foreach ($dolls as $doll) {
+            $out['trees'][] = spl_object_id($doll);
+            foreach ($doll->nodes() as $node) {
+                $out['bodies'][] = [spl_object_id($node), $node instanceof Limb ? $node->radius : 0.0, $doll->by->color, 3, ...$node->describe()];
+                if ($node !== $doll) {
+                    $out['parents'][] = [spl_object_id($node), spl_object_id($node->parent)];
+                }
+            }
+            array_push($out['links'], ...$doll->bones);
+        }
+        return $out;
     }
 
     private function leave(string $client, string $why): void
@@ -540,13 +493,13 @@ final class RocksGame
                 'epoch' => $this->started, 'tick' => self::TICK + self::BATCH, 'size' => self::SIZE, 'bodies' => $bodies,
             ] + ($i === 0 ? [   // how things look, written in PHP: the browser compiles it, games write no JavaScript
                 'you' => spl_object_id($you),
-                'links' => array_merge([], ...array_column($this->ragdolls, 'links')),   // applied after the last part
+                'dolls' => $this->describeDolls(array_values($this->ragdolls)),
                 'environment' => $this->scene->environment,
                 'materials' => [
                     ['shade' => Rock::material()->fragment, 'mesh' => 'rock', 'transparent' => false, 'tumble' => true],
                     ['shade' => Marble::material()->fragment, 'mesh' => 'sphere', 'transparent' => true, 'tumble' => true],
                     ['shade' => Observer::material()->fragment, 'mesh' => 'camera', 'transparent' => false, 'tumble' => false],
-                    ['shade' => Part::material()->fragment, 'mesh' => 'sphere', 'transparent' => false, 'tumble' => false],
+                    ['shade' => Limb::material()->fragment, 'mesh' => 'sphere', 'transparent' => false, 'tumble' => false],
                 ],
             ] : []));
         }

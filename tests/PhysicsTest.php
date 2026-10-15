@@ -3,7 +3,7 @@
 namespace Phame\Tests;
 
 use Phame\World;
-use Phame\Physics\{Contact, Wall};
+use Phame\Physics\{Contact, Space, Wall};
 use Phame\Scene\{Node3D, Scene3D};
 use PHPUnit\Framework\TestCase;
 
@@ -270,6 +270,50 @@ final class PhysicsTest extends TestCase
         $this->assertCount(3, $changes);
         $this->assertEqualsWithDelta([0.05, 0.15, 0.25], array_map(static fn ($c) => $c[1][0], $changes), 1e-9, 'each turn at its moment');
         $this->assertSame([-10.0, 10.0, -10.0], array_map(static fn ($c) => $c[1][4], $changes), 'with the velocity it turned to');
+        $world->dispose();
+    }
+
+    public function testARockHitsThePartOfATurningCompoundWhenItTouches(): void
+    {
+        // a compound: a root spinning about z, with an arm whose part sits 4 out along x; a rock comes in along y
+        // where the part will sweep past. The contact must come when the part touches, not when the rock reaches
+        // the bounding sphere, and with the part's world velocity (omega x r) in it
+        $world = new World();
+        $scene = $world->stage->addChild(new Scene3D(100, 100));
+        $hits = [];
+        $gap = null;
+        $world->onCollision(function (TestRock $part, TestRock $rock, Contact $c) use (&$hits, &$gap) {
+            $hits[] = $c;
+            $m = $part->getWorldMatrix();
+            $gap = sqrt(($rock->x - $m->m12) ** 2 + ($rock->y - $m->m13) ** 2 + ($rock->z - $m->m14) ** 2) - 1.0;
+        });
+        $root = new TestRock();
+        $root->compound = true;
+        $root->radius = 5.0;
+        $root->spin(0.0, 0.0, 1.0);   // 1 rad/s: the part at (4, 0, 0) moves along +y at 4 units per second
+        $part = new TestRock();
+        $part->radius = 0.5;
+        $part->moveTo(4.0, 0.0, 0.0);
+        $root->addChild($part);
+        $scene->root->addChild($root);
+        $rock = new TestRock();
+        $rock->radius = 0.5;
+        $rock->moveTo(0.0, 20.0, 0.0);
+        $rock->setVelocity(0.0, -10.0, 0.0);
+        $scene->root->addChild($rock);
+        \phasync::run(static function () use ($world, $part, $rock, &$hits) {
+            $world->run(static function (World $w) use ($part, $rock, &$hits) {
+                while ($hits === [] && $w->clock->time < 3.0) {
+                    $w->tick(0.01);
+                }
+            });
+        });
+        $this->assertCount(1, $hits);
+        $c = $hits[0];
+        $this->assertSame($part, $c->a, 'the part that touched, not the compound');
+        $this->assertGreaterThan(Space::PROBE_TOLERANCE, $gap, 'when it touched: in the contact zone');
+        $this->assertLessThanOrEqual(2.0 * Space::PROBE_TOLERANCE, $gap);
+        $this->assertLessThan(0.0, $c->normalSpeed, 'closing in');
         $world->dispose();
     }
 }

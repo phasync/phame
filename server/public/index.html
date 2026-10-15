@@ -220,6 +220,7 @@ let environmentSource = DEFAULT_ENVIRONMENT;
 function setMaterials(list, environment) {
   environmentSource = environment || DEFAULT_ENVIRONMENT;
   backgroundProgram = program(BACKGROUND_VS, backgroundFS(environmentSource));
+  parentOf.clear(); childrenOf.clear(); localOf.clear(); trees.clear();
   materials = list.map(m => ({ program: program(INSTANCE_VS, materialFS(environmentSource, m.shade)), transparent: m.transparent, tumble: m.tumble ?? false, batch: instanced((MESHES[m.mesh] ?? MESHES.sphere)()), shade: m.shade, links: null }));
   linksOf.clear();
 }
@@ -288,6 +289,41 @@ function setBox(s) {
 // presentation delay): it waits in `pending` until the render time reaches it. Applied early, the new path would be
 // evaluated backwards from its start: the body would jump.
 let pending = [], snapshotLinks = [];
+// trees (ragdolls): a node's description is in its parent's space, so its place is worked out here, every frame
+const parentOf = new Map(), childrenOf = new Map(), localOf = new Map(), trees = new Set();
+function adoptTrees(m) {
+  for (const [id, parent] of m.parents ?? []) {
+    parentOf.set(id, parent);
+    if (!childrenOf.has(parent)) childrenOf.set(parent, []);
+    childrenOf.get(parent).push(id);
+  }
+  for (const root of m.trees ?? []) trees.add(root);
+}
+const qmul = (a, b) => [a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1], a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+  a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3], a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2]];
+function qrot(q, v) {   // v turned by q
+  const [x, y, z, w] = q, tx = 2 * (y * v[2] - z * v[1]), ty = 2 * (z * v[0] - x * v[2]), tz = 2 * (x * v[1] - y * v[0]);
+  return [v[0] + w * tx + y * tz - z * ty, v[1] + w * ty + z * tx - x * tz, v[2] + w * tz + x * ty - y * tx];
+}
+// a node at time t: its description (position and velocity, orientation and spin, in the parent's space) evaluated,
+// then placed in the parent's world transform; its children follow
+function placeTree(id, t, P = [0, 0, 0], Q = [0, 0, 0, 1]) {
+  const d = localOf.get(id);
+  if (!d) return;
+  const age = t - d[0], spin = Math.hypot(d[11], d[12], d[13]);
+  let q = [d[7], d[8], d[9], d[10]];
+  if (spin > 0) { const s = Math.sin(spin * age / 2) / spin; q = qmul([d[11] * s, d[12] * s, d[13] * s, Math.cos(spin * age / 2)], q); }
+  const p = qrot(Q, [d[1] + d[4] * age, d[2] + d[5] * age, d[3] + d[6] * age]);
+  const at = [P[0] + p[0], P[1] + p[1], P[2] + p[2]], turn = qmul(Q, q);
+  const body = bodyData(id);
+  if (body) {
+    const [data, o] = body;
+    data[o] = t; data[o + 1] = at[0]; data[o + 2] = at[1]; data[o + 3] = at[2]; data[o + 4] = data[o + 5] = data[o + 6] = 0;
+    data[o + 12] = turn[0]; data[o + 13] = turn[1]; data[o + 14] = turn[2]; data[o + 15] = turn[3];
+    for (const link of linksOf.get(id) ?? []) writeLinkEnd(link, id);
+  }
+  for (const child of childrenOf.get(id) ?? []) placeTree(child, t, at, turn);
+}
 const kindOf = new Map();
 let snapshotTime = -Infinity, size = 30, timeBase = 0;
 function writeBody(id, d, radius, color, kind) {
@@ -311,9 +347,11 @@ function writeBody(id, d, radius, color, kind) {
   k.data[o + 4] = d[4]; k.data[o + 5] = d[5]; k.data[o + 6] = d[6];
   k.data[o + 12] = d[7] ?? 0; k.data[o + 13] = d[8] ?? 0; k.data[o + 14] = d[9] ?? 0; k.data[o + 15] = d[10] ?? 1;
   for (const link of linksOf.get(id) ?? []) writeLinkEnd(link, id);
+  if (trees.has(id) || parentOf.has(id)) localOf.set(id, [d[0] - timeBase, ...d.slice(1, 14)]);
 }
 function removeBody(id) {
   for (const link of linksOf.get(id) ?? []) removeLink(link);
+  trees.delete(id); parentOf.delete(id); childrenOf.delete(id); localOf.delete(id);
   const k = materials[kindOf.get(id) ?? 0]?.batch;
   const i = k?.index.get(id);
   if (i === undefined) return;
@@ -357,10 +395,12 @@ function connect() {
         setMaterials(m.materials ?? [{ shade: 'vec4 shade() { return vec4(vColor, 1.0); }', mesh: 'sphere', transparent: false }], m.environment); kindOf.clear(); }
       snapshotTime = m.t; serverTick = m.tick ?? 0.05; timeBase = m.t; size = m.size; setBox(size);
       for (const b of m.bodies) writeBody(b[0], b.slice(4), b[1], b[2], b[3]);
-      if ((m.part ?? 0) === 0) snapshotLinks = m.links ?? [];
+      if (m.dolls) { adoptTrees(m.dolls); for (const b of m.dolls.bodies) writeBody(b[0], b.slice(4), b[1], b[2], b[3]); }
+      if ((m.part ?? 0) === 0) snapshotLinks = [...(m.links ?? []), ...(m.dolls?.links ?? [])];
       if ((m.part ?? 0) === (m.parts ?? 1) - 1) { for (const [a, b, r] of snapshotLinks) addLink(a, b, r); snapshotLinks = []; }
       if (offset === null) offset = m.t - performance.now() / 1000;
-    } else if (m.type === 'add') {   // one body, or several and the links between them
+    } else if (m.type === 'add') {   // one body, or several (a tree: with their parents) and the links between them
+      adoptTrees(m);
       for (const b of m.bodies ?? [m.body]) writeBody(b[0], b.slice(4), b[1], b[2], b[3]);
       for (const [a, b, r] of m.links ?? []) addLink(a, b, r);
     } else if (m.type === 'remove') {
@@ -481,6 +521,7 @@ function frame() {
     for (const b of pending) { if (b[1] <= due) writeBody(b[0], b.slice(1)); else later.push(b); }
     pending = later;
   }
+  for (const root of trees) placeTree(root, renderTime);
 
   gl.disable(gl.DEPTH_TEST);   // the environment, behind everything
   gl.useProgram(backgroundProgram.p);
@@ -515,7 +556,7 @@ function frame() {
   if (counts.length) {
     hud.innerHTML = `<b>Phame</b> · rocks and glass in a box, simulated in PHP<br>` +
       (worker ? `<span class="k">your socket's worker</span> ${worker} · <span class="k">of</span> 4<br>` : '') +
-      `<span class="k">rocks</span> ${counts[0] ?? 0} · <span class="k">marbles</span> ${counts[1] ?? 0} · <span class="k">other viewers</span> ${Math.max(0, (counts[2] ?? 0) - 1)} · <span class="k">ragdolls</span> ${Math.round((counts[3] ?? 0) / 11)} · <span class="k">fps</span> ${fps.toFixed(0)}<br>` +
+      `<span class="k">rocks</span> ${counts[0] ?? 0} · <span class="k">marbles</span> ${counts[1] ?? 0} · <span class="k">other viewers</span> ${Math.max(0, (counts[2] ?? 0) - 1)} · <span class="k">ragdolls</span> ${trees.size} · <span class="k">fps</span> ${fps.toFixed(0)}<br>` +
       `<span class="k">round trip</span> ${(rttAvg * 1000).toFixed(1)} ms · <span class="k">delay</span> ${(delay * 1000).toFixed(0)} ms<br>` +
       `<span class="k">descriptions</span> ${ups.toFixed(0)}/s · ${(bps / 1024).toFixed(1)} KB/s<br>` +
       `<span class="k">late descriptions</span> ${lateCount} · <span class="k">worst</span> ${(lateMax * 1000).toFixed(1)} ms`;

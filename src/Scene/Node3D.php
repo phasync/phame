@@ -32,9 +32,9 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
     public private(set) float $mvy = 0.0;
     public private(set) float $mvz = 0.0;
     /** Angular velocity in the parent's space: the axis is its direction, the speed (rad/s) its length. */
-    private float $mwx = 0.0;
-    private float $mwy = 0.0;
-    private float $mwz = 0.0;
+    public private(set) float $mwx = 0.0;
+    public private(set) float $mwy = 0.0;
+    public private(set) float $mwz = 0.0;
     /** @internal The clock of the world the node is in, for reading the description. */
     public ?\Phame\Clock $clock = null;
     /** @internal The Scene3D whose root this node is. */
@@ -50,6 +50,13 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
         set { $this->radius = $value; $this->syncPhysics(); $this->physicsSpace?->changed($this); }
     }
     public float $mass = 1.0;
+    /**
+     * Its descendants with a radius above 0 take part in collisions as its parts, carried by the tree; its own radius
+     * must bound them all, however the tree turns. Set it before the node joins the scene. See Physics\Space.
+     */
+    public bool $compound = false;
+    /** @internal The compound body whose part (or joint) this node is. */
+    public ?Node3D $physicsCompound = null;
     /** Whether the walls of the scene's box hold it in (see Scene3D's world bounds). False: it goes straight through. */
     public bool $confined = true;
     /** The last contact the world handled for this node (set before the collision handler runs). */
@@ -235,6 +242,7 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
         $this->dirty = true;
         $this->motionChanged();
         $this->physicsSpace?->changed($this);
+        $this->physicsCompound?->physicsSpace?->changed($this->physicsCompound);   // a joint turned: the body changed
         if ($this->published && $this->clock !== null) {
             $this->world()->descriptionChanged($this);
         }
