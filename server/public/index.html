@@ -370,7 +370,9 @@ let offset = null, bestRtt = Infinity, rttAvg = 0, jitter = 0, delay = 0.05;
 function serverNow() { return performance.now() / 1000 + (offset ?? 0); }
 
 // ---------- connection
-const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + location.pathname.replace(/\/[^/]*$/, '') + '/ws';
+// the socket sits beside the page: /phame and /phame/ are both the directory, /phame/index.html is in it
+const base = /\.[a-z0-9]+$/i.test(location.pathname) ? location.pathname.replace(/[^/]*$/, '') : location.pathname.replace(/\/?$/, '/');
+const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + base + 'ws';
 let ws, bytes = 0, lastStats = performance.now(), bps = 0, updates = 0, ups = 0;
 function connect() {
   ws = new WebSocket(url);
