@@ -18,7 +18,7 @@
 <body>
 <canvas id="c"></canvas>
 <div id="hud">Connecting…</div>
-<div id="help">drag to orbit · wheel to zoom · space or double-click to drop a ball</div>
+<div id="help">drag to orbit · wheel to zoom · space or double-click to throw a ragdoll</div>
 <script>
 'use strict';
 // The Phame browser client: the same for every game. The game, in PHP, sends what exists (motion descriptions) and
@@ -71,6 +71,32 @@ const INSTANCE_VS = `#version 300 es
     vLocal = aPos;
     vWorldPos = center + r * aPos * aVelocity.w;
     vNormal = r * aNormal; vColor = aLook.rgb; vSeed = aLook.w; vCenter = center; vRadius = aVelocity.w;
+    gl_Position = uViewProjection * vec4(vWorldPos, 1.0);
+  }`;
+
+// a link between two bodies (a ragdoll's limb): a cylinder from one to the other, both ends evaluated on the GPU from
+// their own motion descriptions, shaded by the material of the first body
+const LINK_VS = `#version 300 es
+  layout(location = 0) in vec3 aPos;          // a unit cylinder: x and z on the circle, y from 0 (one end) to 1 (the other)
+  layout(location = 1) in vec3 aNormal;
+  layout(location = 2) in vec4 aStartA;       // t0, x0, y0, z0 of one end
+  layout(location = 3) in vec4 aVelocityA;    // vx, vy, vz, the link's radius
+  layout(location = 4) in vec4 aStartB;       // t0, x0, y0, z0 of the other end
+  layout(location = 5) in vec4 aVelocityB;    // vx, vy, vz, unused
+  layout(location = 6) in vec4 aLook;         // r, g, b, seed
+  uniform mat4 uViewProjection;
+  uniform float uTime;
+  out vec3 vNormal; out vec3 vColor; out vec3 vWorldPos; out vec3 vLocal; out float vSeed; out vec3 vCenter; out float vRadius;
+  void main() {
+    vec3 a = aStartA.yzw + aVelocityA.xyz * (uTime - aStartA.x);
+    vec3 b = aStartB.yzw + aVelocityB.xyz * (uTime - aStartB.x);
+    float len = max(length(b - a), 1e-4), r = aVelocityA.w;
+    vec3 y = (b - a) / len;
+    vec3 x = normalize(cross(y, abs(y.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0))), z = cross(x, y);
+    vCenter = a + (b - a) * aPos.y; vRadius = r;
+    vWorldPos = vCenter + (x * aPos.x + z * aPos.z) * r;
+    vNormal = x * aNormal.x + z * aNormal.z;
+    vLocal = vec3(aPos.x, aPos.y * len / r, aPos.z); vColor = aLook.rgb; vSeed = aLook.w;
     gl_Position = uViewProjection * vec4(vWorldPos, 1.0);
   }`;
 
@@ -162,6 +188,15 @@ function camera() {
   box(-0.2, 0.42, -0.15, 0.2, 0.62, 0.25);    // viewfinder
   return { positions: new Float32Array(positions), normals: new Float32Array(normals), indices: new Uint16Array(indices) };
 }
+function cylinder() {
+  const positions = [], normals = [], indices = [], n = 14;
+  for (let i = 0; i <= n; i++) {
+    const a = i / n * 2 * Math.PI, x = Math.cos(a), z = Math.sin(a);
+    positions.push(x, 0, z, x, 1, z); normals.push(x, 0, z, x, 0, z);
+    if (i < n) { const o = i * 2; indices.push(o, o + 1, o + 2, o + 1, o + 3, o + 2); }
+  }
+  return { positions: new Float32Array(positions), normals: new Float32Array(normals), indices: new Uint16Array(indices) };
+}
 const MESHES = { rock: () => icosphere(3, true), sphere: () => icosphere(4, false), camera };
 
 const FLOATS = 16;   // per instance: t0 x y z | vx vy vz radius | r g b seed | qx qy qz qw
@@ -180,11 +215,60 @@ function instanced(geometry) {
 }
 
 // ---------- materials, as the game sent them
-let materials = [];   // { program, transparent, batch }
+let materials = [];   // { program, transparent, batch, shade, links }
+let environmentSource = DEFAULT_ENVIRONMENT;
 function setMaterials(list, environment) {
-  const env = environment || DEFAULT_ENVIRONMENT;
-  backgroundProgram = program(BACKGROUND_VS, backgroundFS(env));
-  materials = list.map(m => ({ program: program(INSTANCE_VS, materialFS(env, m.shade)), transparent: m.transparent, tumble: m.tumble ?? false, batch: instanced((MESHES[m.mesh] ?? MESHES.sphere)()) }));
+  environmentSource = environment || DEFAULT_ENVIRONMENT;
+  backgroundProgram = program(BACKGROUND_VS, backgroundFS(environmentSource));
+  materials = list.map(m => ({ program: program(INSTANCE_VS, materialFS(environmentSource, m.shade)), transparent: m.transparent, tumble: m.tumble ?? false, batch: instanced((MESHES[m.mesh] ?? MESHES.sphere)()), shade: m.shade, links: null }));
+  linksOf.clear();
+}
+
+// ---------- links: per material, made with its first link; each end copies its body's description when it changes
+const LINK_FLOATS = 20;   // per link: end a (t0 x y z | vx vy vz radius), end b (t0 x y z | vx vy vz -), r g b seed
+const linksOf = new Map();   // body id -> the links it is an end of: { material, i, a, b }
+function linkBatch(material) {
+  if (material.links) return material.links;
+  const geometry = cylinder(), vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const buf = (data, target = gl.ARRAY_BUFFER) => { const b = gl.createBuffer(); gl.bindBuffer(target, b); gl.bufferData(target, data, gl.STATIC_DRAW); return b; };
+  buf(geometry.positions); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  buf(geometry.normals); gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+  buf(geometry.indices, gl.ELEMENT_ARRAY_BUFFER);
+  const instances = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, instances);
+  for (let i = 0; i < 5; i++) { gl.enableVertexAttribArray(2 + i); gl.vertexAttribPointer(2 + i, 4, gl.FLOAT, false, LINK_FLOATS * 4, i * 16); gl.vertexAttribDivisor(2 + i, 1); }
+  gl.bindVertexArray(null);
+  return material.links = { program: program(LINK_VS, materialFS(environmentSource, material.shade)), vao, instances, indexCount: geometry.indices.length, data: new Float32Array(LINK_FLOATS * 64), count: 0, all: [] };
+}
+function bodyData(id) {
+  const k = materials[kindOf.get(id)]?.batch, i = k?.index.get(id);
+  return i === undefined ? null : [k.data, i * FLOATS];
+}
+function writeLinkEnd(link, id) {
+  const body = bodyData(id);
+  if (!body) return;
+  const [data, o] = body, d = link.material.links.data, at = link.i * LINK_FLOATS + (id === link.a ? 0 : 8);
+  for (let k = 0; k < 7; k++) d[at + k] = data[o + k];
+}
+function addLink(a, b, radius) {
+  const body = bodyData(a);
+  if (!body || !bodyData(b)) return;
+  const material = materials[kindOf.get(a)], k = linkBatch(material);
+  if ((k.count + 1) * LINK_FLOATS > k.data.length) { const grown = new Float32Array(k.data.length * 2); grown.set(k.data); k.data = grown; }
+  const link = { material, i: k.count++, a, b };
+  k.all.push(link);
+  const o = link.i * LINK_FLOATS;
+  k.data[o + 7] = radius;
+  for (let c = 0; c < 4; c++) k.data[o + 16 + c] = body[0][body[1] + 8 + c];   // its first body's colour and seed
+  writeLinkEnd(link, a); writeLinkEnd(link, b);
+  for (const id of [a, b]) { if (!linksOf.has(id)) linksOf.set(id, []); linksOf.get(id).push(link); }
+}
+function removeLink(link) {
+  const k = link.material.links, last = --k.count, moved = k.all[last];
+  if (link.i !== last) { k.data.copyWithin(link.i * LINK_FLOATS, last * LINK_FLOATS, (last + 1) * LINK_FLOATS); k.all[link.i] = moved; moved.i = link.i; }
+  k.all.pop();
+  for (const id of [link.a, link.b]) { const list = linksOf.get(id)?.filter(l => l !== link); if (list?.length) linksOf.set(id, list); else linksOf.delete(id); }
 }
 
 const boxVao = gl.createVertexArray();
@@ -203,7 +287,7 @@ function setBox(s) {
 // A description takes effect at its t0, which usually lies in this browser's future (it renders in the past, by the
 // presentation delay): it waits in `pending` until the render time reaches it. Applied early, the new path would be
 // evaluated backwards from its start: the body would jump.
-let pending = [];
+let pending = [], snapshotLinks = [];
 const kindOf = new Map();
 let snapshotTime = -Infinity, size = 30, timeBase = 0;
 function writeBody(id, d, radius, color, kind) {
@@ -226,8 +310,10 @@ function writeBody(id, d, radius, color, kind) {
   k.data[o] = d[0] - timeBase; k.data[o + 1] = d[1]; k.data[o + 2] = d[2]; k.data[o + 3] = d[3];
   k.data[o + 4] = d[4]; k.data[o + 5] = d[5]; k.data[o + 6] = d[6];
   k.data[o + 12] = d[7] ?? 0; k.data[o + 13] = d[8] ?? 0; k.data[o + 14] = d[9] ?? 0; k.data[o + 15] = d[10] ?? 1;
+  for (const link of linksOf.get(id) ?? []) writeLinkEnd(link, id);
 }
 function removeBody(id) {
+  for (const link of linksOf.get(id) ?? []) removeLink(link);
   const k = materials[kindOf.get(id) ?? 0]?.batch;
   const i = k?.index.get(id);
   if (i === undefined) return;
@@ -271,11 +357,14 @@ function connect() {
         setMaterials(m.materials ?? [{ shade: 'vec4 shade() { return vec4(vColor, 1.0); }', mesh: 'sphere', transparent: false }], m.environment); kindOf.clear(); }
       snapshotTime = m.t; serverTick = m.tick ?? 0.05; timeBase = m.t; size = m.size; setBox(size);
       for (const b of m.bodies) writeBody(b[0], b.slice(4), b[1], b[2], b[3]);
+      if ((m.part ?? 0) === 0) snapshotLinks = m.links ?? [];
+      if ((m.part ?? 0) === (m.parts ?? 1) - 1) { for (const [a, b, r] of snapshotLinks) addLink(a, b, r); snapshotLinks = []; }
       if (offset === null) offset = m.t - performance.now() / 1000;
-    } else if (m.type === 'add') {
-      writeBody(m.body[0], m.body.slice(4), m.body[1], m.body[2], m.body[3]);
+    } else if (m.type === 'add') {   // one body, or several and the links between them
+      for (const b of m.bodies ?? [m.body]) writeBody(b[0], b.slice(4), b[1], b[2], b[3]);
+      for (const [a, b, r] of m.links ?? []) addLink(a, b, r);
     } else if (m.type === 'remove') {
-      removeBody(m.id);
+      for (const id of m.ids ?? [m.id]) removeBody(id);
     }
   };
 }
@@ -365,6 +454,16 @@ function draw(material, vp, eye, renderTime) {
   gl.bufferData(gl.ARRAY_BUFFER, k.data.subarray(0, k.count * FLOATS), gl.DYNAMIC_DRAW);
   gl.bindVertexArray(k.vao);
   gl.drawElementsInstanced(gl.TRIANGLES, k.indexCount, gl.UNSIGNED_SHORT, 0, k.count);
+  const l = material.links;
+  if (!l || l.count === 0) return;
+  gl.useProgram(l.program.p);
+  gl.uniformMatrix4fv(l.program.u('uViewProjection'), false, vp);
+  gl.uniform1f(l.program.u('uTime'), renderTime);
+  gl.uniform3fv(l.program.u('uEye'), eye);
+  gl.bindBuffer(gl.ARRAY_BUFFER, l.instances);
+  gl.bufferData(gl.ARRAY_BUFFER, l.data.subarray(0, l.count * LINK_FLOATS), gl.DYNAMIC_DRAW);
+  gl.bindVertexArray(l.vao);
+  gl.drawElementsInstanced(gl.TRIANGLES, l.indexCount, gl.UNSIGNED_SHORT, 0, l.count);
 }
 function frame() {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -416,7 +515,7 @@ function frame() {
   if (counts.length) {
     hud.innerHTML = `<b>Phame</b> · rocks and glass in a box, simulated in PHP<br>` +
       (worker ? `<span class="k">your socket's worker</span> ${worker} · <span class="k">of</span> 4<br>` : '') +
-      `<span class="k">rocks</span> ${counts[0] ?? 0} · <span class="k">marbles</span> ${counts[1] ?? 0} · <span class="k">other viewers</span> ${Math.max(0, (counts[2] ?? 0) - 1)} · <span class="k">balls</span> ${counts[3] ?? 0} · <span class="k">fps</span> ${fps.toFixed(0)}<br>` +
+      `<span class="k">rocks</span> ${counts[0] ?? 0} · <span class="k">marbles</span> ${counts[1] ?? 0} · <span class="k">other viewers</span> ${Math.max(0, (counts[2] ?? 0) - 1)} · <span class="k">ragdolls</span> ${Math.round((counts[3] ?? 0) / 11)} · <span class="k">fps</span> ${fps.toFixed(0)}<br>` +
       `<span class="k">round trip</span> ${(rttAvg * 1000).toFixed(1)} ms · <span class="k">delay</span> ${(delay * 1000).toFixed(0)} ms<br>` +
       `<span class="k">descriptions</span> ${ups.toFixed(0)}/s · ${(bps / 1024).toFixed(1)} KB/s<br>` +
       `<span class="k">late descriptions</span> ${lateCount} · <span class="k">worst</span> ${(lateMax * 1000).toFixed(1)} ms`;

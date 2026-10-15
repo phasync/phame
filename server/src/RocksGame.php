@@ -33,14 +33,29 @@ abstract class Ball extends Node3D
     }
 }
 
-/** A heavy ball a viewer drops: the box does not hold it, the rocks it meets only nudge it. */
-final class Boulder extends Ball
+/** A part of a ragdoll a viewer throws: a sphere, tethered to its neighbours, that the box does not hold. */
+final class Part extends Ball
 {
-    public function __construct(public readonly Observer $by)
+    /** The parts: where each sits (x right, y up, in the ragdoll's own frame), its radius, and the part it hangs on. */
+    public const BODY = [
+        [0.0, 5.2, 1.1, 1],     // head, on the chest
+        [0.0, 3.0, 1.5, -1],    // chest
+        [0.0, 0.8, 1.4, 1],     // pelvis
+        [-2.5, 3.6, 0.75, 1],   // left upper arm
+        [-4.8, 3.6, 0.65, 3],   // left forearm
+        [2.5, 3.6, 0.75, 1],    // right upper arm
+        [4.8, 3.6, 0.65, 5],    // right forearm
+        [-0.9, -1.6, 0.9, 2],   // left thigh
+        [-1.0, -4.2, 0.8, 7],   // left shin
+        [0.9, -1.6, 0.9, 2],    // right thigh
+        [1.0, -4.2, 0.8, 9],    // right shin
+    ];
+
+    public function __construct(public readonly Observer $by, float $radius)
     {
         $this->confined = false;
-        $this->radius = 7.0;
-        $this->mass = 8.0 * 7.0 ** 3;   // iron, beside rocks of density 1
+        $this->radius = $radius;
+        $this->mass = 3.0 * $radius ** 3;   // denser than the rocks, so a limb shoves a rock and a rock bends a limb
         $this->color = $by->color;
     }
 
@@ -49,22 +64,22 @@ final class Boulder extends Ball
         return 3;
     }
 
-    /** Dark iron, glowing in the colour of whoever dropped it from cracks that run over it. */
+    /** A crash test dummy: glossy plastic in the thrower's colour, with the black and yellow quadrant markers. */
     public static function material(): MeshShader
     {
         return new MeshShader(<<<'GLSL'
             vec4 shade() {
-                vec3 n = normalize(vWorldPos - vCenter);
+                vec3 n = normalize(vNormal);
                 vec3 view = normalize(uEye - vWorldPos);
-                vec3 p = vLocal * 1.7 + vSeed * 13.0;
-                float h = fbm(p * 2.0);
-                float crack = 1.0 - smoothstep(0.0, 0.05, abs(noise(p * 1.3) - 0.5));
+                vec3 p = normalize(vWorldPos - vCenter);
+                // quadrant markers on the round parts (the limbs between them are thinner): black and colour
+                float marker = step(0.0, p.x * p.y) * step(0.7, vRadius);
+                vec3 albedo = mix(vColor, vec3(0.05), marker * 0.9);
                 float diffuse = max(dot(n, SUN), 0.0);
-                vec3 iron = vec3(0.10, 0.10, 0.11) * (0.7 + 0.6 * h) * (0.25 + 1.2 * diffuse);
-                vec3 reflection = environment(reflect(-view, n)) * (0.05 + 0.25 * pow(1.0 - max(dot(n, view), 0.0), 4.0));
-                float spec = pow(max(dot(reflect(-SUN, n), view), 0.0), 60.0) * 0.6;
-                vec3 glow = vColor * (2.5 + 1.5 * sin(uTime * 3.0 + vSeed * 40.0)) * crack;
-                return vec4(iron + reflection + spec + glow + vColor * 0.05, 1.0);
+                vec3 sky = mix(vec3(0.04, 0.035, 0.03), vec3(0.1, 0.12, 0.2), n.y * 0.5 + 0.5);
+                float spec = pow(max(dot(reflect(-SUN, n), view), 0.0), 40.0) * 0.5;
+                float rim = pow(1.0 - max(dot(n, view), 0.0), 3.0);
+                return vec4(albedo * (sky + vec3(1.5, 1.35, 1.15) * diffuse) + spec + vColor * rim * 0.35, 1.0);
             }
             GLSL);
     }
@@ -111,7 +126,7 @@ final class Observer extends Node3D
     public float $lookY = 0.0;
     public float $lookZ = -1.0;
     public float $droppedAt = 0.0;
-    public int $boulders = 0;
+    public int $ragdolls = 0;
 
     public function __construct(public readonly string $client, public readonly int $color)
     {
@@ -204,6 +219,8 @@ final class RocksGame
     private int $batched = 0;
     /** Raised when a batch starts: the flusher sleeps on it while nothing changes. */
     private object $batchStarted;
+    /** @var array<int, array{parts: list<Part>, links: list<array{int, int, float}>}> the ragdolls in flight */
+    private array $ragdolls = [];
     /** @var array<string, Observer> by client */
     private array $observers = [];
     private float $started;
@@ -311,6 +328,7 @@ final class RocksGame
         $this->world->run(function (World $world) {
             $world->go(function () {   // through the world: a failure here stops the game visibly, it does not vanish
                 foreach (Swerve::subscribe('phame:rocks:in') as $message) {
+                    $this->world->sync();   // the world's clock stood at its last event: what a player does starts now
                     $request = json_decode($message, true);
                     $client = (string) ($request['client'] ?? '');
                     if (isset($this->observers[$client])) {
@@ -344,6 +362,7 @@ final class RocksGame
                     \phasync::sleep(2.0);
                     foreach ($this->observers as $client => $observer) {
                         if (microtime(true) - $observer->heard > 6.0) {
+                            $this->world->sync();
                             $this->leave($client, 'went quiet');
                         }
                     }
@@ -369,8 +388,8 @@ final class RocksGame
                 if ($this->batched === 0) {
                     \phasync::raiseFlag($this->batchStarted);
                 }
-                foreach ($changed as $node) {
-                    array_push($this->batch, spl_object_id($node), ...$node->describe());
+                foreach ($changed as [$node, $description]) {
+                    array_push($this->batch, spl_object_id($node), ...$description);
                     ++$this->batched;
                 }
                 if ($this->batched >= 2000) {   // a message is at most 128 KiB: 64 bytes each
@@ -405,30 +424,68 @@ final class RocksGame
         Swerve::publishRaw('phame:rocks:out', json_encode($message));
     }
 
-    /** A viewer drops a boulder: from just in front of their camera, the way it looks, gone again after 10 seconds. */
+    /**
+     * A viewer throws a ragdoll: from in front of their camera, the way it looks, tumbling head over heels, its parts
+     * tethered at the joints. It is gone again after 10 seconds.
+     */
     private function drop(Observer $by): void
     {
         $now = microtime(true);
-        if ($now - $by->droppedAt < 0.1 || $by->boulders >= 100) {
+        // each ragdoll in flight is some 400 events a second for the world: 25 is about what one PHP worker keeps up with
+        if ($now - $by->droppedAt < 0.1 || $by->ragdolls >= 10 || count($this->ragdolls) >= 25) {
             return;
         }
         $by->droppedAt = $now;
-        ++$by->boulders;
-        $boulder = new Boulder($by);
-        $boulder->moveTo($by->x + $by->lookX * 10.0, $by->y + $by->lookY * 10.0, $by->z + $by->lookZ * 10.0);
-        $boulder->setVelocity($by->lookX * 45.0, $by->lookY * 45.0, $by->lookZ * 45.0);
-        $boulder->spin(0.7, 1.1, 0.0);
-        $boulder->published = true;
-        $this->scene->root->addChild($boulder);
-        $id = spl_object_id($boulder);
-        $this->rocks[$id] = $boulder;
-        $this->announce(['type' => 'add', 'body' => [$id, $boulder->radius, $boulder->color, 3, ...$boulder->describe()]]);
-        $this->world->go(function () use ($boulder, $id) {
+        ++$by->ragdolls;
+        // the camera's frame: it looks along $look, $right and $up span the ragdoll
+        [$lx, $ly, $lz] = [$by->lookX, $by->lookY, $by->lookZ];
+        [$rx, $ry, $rz] = [-$lz, 0.0, $lx];   // look x world up
+        $n = sqrt($rx * $rx + $rz * $rz) ?: 1.0;
+        [$rx, $rz] = [$rx / $n, $rz / $n];
+        [$ux, $uy, $uz] = [$ry * $lz - $rz * $ly, $rz * $lx - $rx * $lz, $rx * $ly - $ry * $lx];
+        [$cx, $cy, $cz] = [$by->x + $lx * 16.0, $by->y + $ly * 16.0, $by->z + $lz * 16.0];
+        $tumble = 4.0;   // radians per second about $right: head over heels
+        $parts = [];
+        $bodies = [];
+        foreach (Part::BODY as [$x, $y, $radius]) {
+            $part = new Part($by, $radius);
+            [$ox, $oy, $oz] = [$rx * $x + $ux * $y, $ry * $x + $uy * $y, $rz * $x + $uz * $y];
+            $part->moveTo($cx + $ox, $cy + $oy, $cz + $oz);
+            // thrown at 38 units per second, turning: each part moves with omega x r
+            $part->setVelocity(
+                $lx * 38.0 + $tumble * ($ry * $oz - $rz * $oy),
+                $ly * 38.0 + $tumble * ($rz * $ox - $rx * $oz),
+                $lz * 38.0 + $tumble * ($rx * $oy - $ry * $ox),
+            );
+            $part->published = true;
+            $this->scene->root->addChild($part);
+            $this->rocks[spl_object_id($part)] = $part;
+            $parts[] = $part;
+            $bodies[] = [spl_object_id($part), $radius, $part->color, 3, ...$part->describe()];
+        }
+        $links = [];
+        $space = $this->world->physics($this->scene);
+        foreach (Part::BODY as $i => [$x, $y, $radius, $parent]) {
+            if ($parent >= 0) {
+                [$a, $b] = [$parts[$parent], $parts[$i]];
+                $space->tether($a, $b, 1.04 * sqrt(($b->x - $a->x) ** 2 + ($b->y - $a->y) ** 2 + ($b->z - $a->z) ** 2));
+                $links[] = [spl_object_id($a), spl_object_id($b), 0.45];
+            }
+        }
+        $key = spl_object_id($parts[1]);
+        $this->ragdolls[$key] = ['parts' => $parts, 'links' => $links];
+        $this->announce(['type' => 'add', 'bodies' => $bodies, 'links' => $links]);
+        $this->world->go(function () use ($by, $key) {
             \phasync::sleep(10.0);
-            $this->scene->root->removeChild($boulder);
-            unset($this->rocks[$id]);
-            --$boulder->by->boulders;
-            $this->announce(['type' => 'remove', 'id' => $id]);
+            $this->world->sync();
+            $ids = [];
+            foreach ($this->ragdolls[$key]['parts'] as $part) {
+                $this->scene->root->removeChild($part);
+                unset($this->rocks[$ids[] = spl_object_id($part)]);
+            }
+            unset($this->ragdolls[$key]);
+            --$by->ragdolls;
+            $this->announce(['type' => 'remove', 'ids' => $ids]);
         });
     }
 
@@ -483,12 +540,13 @@ final class RocksGame
                 'epoch' => $this->started, 'tick' => self::TICK + self::BATCH, 'size' => self::SIZE, 'bodies' => $bodies,
             ] + ($i === 0 ? [   // how things look, written in PHP: the browser compiles it, games write no JavaScript
                 'you' => spl_object_id($you),
+                'links' => array_merge([], ...array_column($this->ragdolls, 'links')),   // applied after the last part
                 'environment' => $this->scene->environment,
                 'materials' => [
                     ['shade' => Rock::material()->fragment, 'mesh' => 'rock', 'transparent' => false, 'tumble' => true],
                     ['shade' => Marble::material()->fragment, 'mesh' => 'sphere', 'transparent' => true, 'tumble' => true],
                     ['shade' => Observer::material()->fragment, 'mesh' => 'camera', 'transparent' => false, 'tumble' => false],
-                    ['shade' => Boulder::material()->fragment, 'mesh' => 'sphere', 'transparent' => false, 'tumble' => true],
+                    ['shade' => Part::material()->fragment, 'mesh' => 'sphere', 'transparent' => false, 'tumble' => false],
                 ],
             ] : []));
         }
