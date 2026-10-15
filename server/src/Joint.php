@@ -7,7 +7,8 @@ use Phame\Scene\Node3D;
 /**
  * A hinge in a ragdoll: a node that turns about one axis of its parent's space, at a constant rate between events,
  * within limits. Its angle is a function of time like any motion description, so the time it reaches a limit is
- * known exactly; there it stops (no bounce, so no rattle). What hangs on it turns with it.
+ * known exactly; there it turns back with $bounce of its speed (a limb: none, it stops; a rope: some), and a swing
+ * too slow to matter stops. What hangs on it turns with it.
  */
 final class Joint extends Node3D
 {
@@ -22,7 +23,18 @@ final class Joint extends Node3D
         public readonly float $az,
         public readonly float $min,
         public readonly float $max,
+        /** How much of its speed it keeps, turning back, at a limit (0: it stops there). */
+        public readonly float $bounce = 0.0,
+        /** How fast it may be flailing when thrown (rad/s, either way). */
+        public readonly float $flail = 3.0,
     ) {
+    }
+
+    /** At a limit: turns back with $bounce of its speed, or stops when that is too slow to matter. */
+    public function reachLimit(): void
+    {
+        $rate = -$this->rate * $this->bounce;
+        $this->setRate(abs($rate) < 0.3 ? 0.0 : $rate);
     }
 
     public function angleNow(): float

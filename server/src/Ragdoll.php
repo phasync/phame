@@ -15,7 +15,7 @@ use Phame\World;
  */
 final class Ragdoll extends Node3D
 {
-    public const TYPES = ['dummy', 'spider', 'snake', 'starfish'];
+    public const TYPES = ['dummy', 'spider', 'rope', 'starfish'];
 
     /** @var list<Joint> */
     public private(set) array $joints = [];
@@ -26,6 +26,8 @@ final class Ragdoll extends Node3D
     /** @var array<int, float> by joint: the mass of the limbs that turn with it */
     private array $below = [];
     private float $inertia = 1.0;
+    /** How much of the throw's tumble it takes: a long rope swung like a baton would whip its end around. */
+    private float $tumble = 1.0;
     public bool $gone = false;
 
     public function __construct(public readonly Observer $by, public readonly string $type)
@@ -35,7 +37,7 @@ final class Ragdoll extends Node3D
         match ($type) {
             'dummy' => $this->dummy(),
             'spider' => $this->spider(),
-            'snake' => $this->snake(),
+            'rope' => $this->rope(),
             default => $this->starfish(),
         };
         // mass, an inertia about the root (the rest pose, as a cloud of spheres), and a radius that holds every pose
@@ -96,17 +98,19 @@ final class Ragdoll extends Node3D
         }
     }
 
-    private function snake(): void
+    private function rope(): void
     {
-        $previous = $this->limb($this, 0.0, 0.0, 0.0, 1.1);
+        // many short segments, joints that bend far either way (sideways and up in turn) and swing back off their
+        // limits: a hit anywhere curls the rest of it
+        $this->tumble = 0.3;
+        $previous = $this->limb($this, 0.0, 0.0, 0.0, 0.8);
         $parent = $this;
-        $at = -1.0;
-        for ($i = 1; $i < 9; ++$i) {
-            // the joints bend sideways and up in turn, each carrying the rest of the tail
-            $joint = $this->joint($parent, 0.0, 0.0, $at, $i % 2 ? [0, 1, 0] : [1, 0, 0], -0.7, 0.7);
-            $segment = $this->limb($joint, 0.0, 0.0, -1.0, 1.0 - 0.06 * $i);
-            $this->bone($previous, $segment, 0.5 - 0.03 * $i);
-            [$parent, $previous, $at] = [$joint, $segment, -2.0];
+        $at = -0.6;
+        for ($i = 1; $i < 11; ++$i) {
+            $joint = $this->joint($parent, 0.0, 0.0, $at, $i % 2 ? [0, 1, 0] : [1, 0, 0], -1.4, 1.4, 0.4, 1.0);
+            $segment = $this->limb($joint, 0.0, 0.0, -0.6, 0.75 - 0.025 * $i);
+            $this->bone($previous, $segment, 0.4 - 0.015 * $i);
+            [$parent, $previous, $at] = [$joint, $segment, -1.2];
         }
     }
 
@@ -126,9 +130,9 @@ final class Ragdoll extends Node3D
         }
     }
 
-    private function joint(Node3D $parent, float $x, float $y, float $z, array $axis, float $min, float $max): Joint
+    private function joint(Node3D $parent, float $x, float $y, float $z, array $axis, float $min, float $max, float $bounce = 0.0, float $flail = 3.0): Joint
     {
-        $joint = new Joint(...array_map('floatval', $axis), min: $min, max: $max);
+        $joint = new Joint(...array_map('floatval', $axis), min: $min, max: $max, bounce: $bounce, flail: $flail);
         $joint->moveTo($x, $y, $z);
         $parent->addChild($joint);
         $this->joints[] = $joint;
@@ -176,9 +180,9 @@ final class Ragdoll extends Node3D
     {
         $this->moveTo(...$at);
         $this->setVelocity(...$v);
-        $this->spin(...$spin);
+        $this->spin(...array_map(fn (float $c) => $c * $this->tumble, $spin));
         foreach ($this->joints as $joint) {
-            $joint->setRate(mt_rand(-300, 300) / 100);
+            $joint->setRate(mt_rand(-100, 100) / 100 * $joint->flail);
             // each joint waits for its limit (an exact time: its angle is a straight line too), stops there, and
             // starts over whenever a hit changes its rate
             $world->go(function () use ($joint) {
@@ -188,7 +192,7 @@ final class Ragdoll extends Node3D
                         return;
                     }
                     if ($woken === null && $joint->untilLimit() <= 1e-9) {
-                        $joint->setRate(0.0);
+                        $joint->reachLimit();
                     }
                 }
             });
@@ -197,8 +201,8 @@ final class Ragdoll extends Node3D
 
     /**
      * A limb hit a ball (or the ball hit the limb). The impulse at the contact point is shared by the flight, the
-     * tumble (its torque about the root) and the joint the limb hangs on (its torque about the hinge), in proportion
-     * to how easily each gives way: the effective mass at the point decides how hard the ball bounces.
+     * tumble (its torque about the root) and every joint between the limb and the root (its torque about its hinge),
+     * in proportion to how easily each gives way: the effective mass at the point decides how hard the ball bounces.
      */
     public function hit(Limb $limb, Ball $ball, Contact $c): void
     {
@@ -208,10 +212,10 @@ final class Ragdoll extends Node3D
         [$rx, $ry, $rz] = [$px - $this->x, $py - $this->y, $pz - $this->z];
         [$tx, $ty, $tz] = [$ry * $nz - $rz * $ny, $rz * $nx - $rx * $nz, $rx * $ny - $ry * $nx];   // r x n
         $inverse = 1.0 / $this->mass + ($tx * $tx + $ty * $ty + $tz * $tz) / $this->inertia;
-        $joint = $limb->parent instanceof Joint ? $limb->parent : null;
-        $arm = 0.0;
-        $jointInertia = 1.0;
-        if ($joint !== null) {
+        // every joint between the limb and the root gives way, each by its torque about its hinge and the mass that
+        // turns with it: a hit near the end of a rope curls the length of it
+        $giving = [];
+        for ($joint = $limb->parent; $joint instanceof Joint; $joint = $joint->parent) {
             $j = $joint->getWorldMatrix();
             [$lx, $ly, $lz] = [$px - $j->m12, $py - $j->m13, $pz - $j->m14];
             $p = $joint->parent->getWorldMatrix();   // the hinge axis turns with the joint's parent
@@ -221,13 +225,13 @@ final class Ragdoll extends Node3D
                 $p->m2 * $joint->ax + $p->m6 * $joint->ay + $p->m10 * $joint->az,
             ];
             $arm = ($ly * $nz - $lz * $ny) * $wx + ($lz * $nx - $lx * $nz) * $wy + ($lx * $ny - $ly * $nx) * $wz;   // (l x n) . axis
-            $jointInertia = $this->below[spl_object_id($joint)] * max(0.5, $lx * $lx + $ly * $ly + $lz * $lz);
             $angle = $joint->angleNow();
             if (($angle >= $joint->max && $arm < 0.0) || ($angle <= $joint->min && $arm > 0.0)) {
-                $joint = null;   // pushed against its limit: it holds, and the hit goes to the whole body
-            } else {
-                $inverse += $arm * $arm / $jointInertia;
+                continue;   // pushed against its limit: it holds
             }
+            $jointInertia = $this->below[spl_object_id($joint)] * max(0.5, $lx * $lx + $ly * $ly + $lz * $lz);
+            $inverse += $arm * $arm / $jointInertia;
+            $giving[] = [$joint, $arm, $jointInertia];
         }
         $impulse = 1.5 * -$c->normalSpeed / (1.0 / $ball->mass + $inverse);   // restitution 0.5: plastic gives a little
         $k = $impulse / $ball->mass;
@@ -236,8 +240,12 @@ final class Ragdoll extends Node3D
         $this->setVelocity($this->velocityX - $k * $nx, $this->velocityY - $k * $ny, $this->velocityZ - $k * $nz);
         $k = $impulse / $this->inertia;
         $this->spin($this->mwx - $k * $tx, $this->mwy - $k * $ty, $this->mwz - $k * $tz);
-        if ($joint !== null) {
-            $joint->setRate($joint->rate - $impulse * $arm / $jointInertia);
+        foreach ($giving as [$joint, $arm, $jointInertia]) {
+            $turn = $impulse * $arm / $jointInertia;
+            if (abs($turn) < 0.15) {
+                continue;   // far up a long chain the share is next to nothing: not worth waking the joint for
+            }
+            $joint->setRate($joint->rate - $turn);
             $this->world()->wake($joint);
         }
     }
