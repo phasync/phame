@@ -90,19 +90,27 @@ class EventDispatcher
         return \Phame\World::current();
     }
 
+    /**
+     * @var array<string, int> by event type: how many listeners are registered anywhere. A broadcast nobody listens to
+     * (enter-frame, every tick) can skip walking the tree. Objects dropped with their listeners keep it counted.
+     */
+    public static array $listening = [];
+
     public function addEventListener(string $type, callable $listener): void
     {
         $this->listeners[$type][] = $listener;
+        self::$listening[$type] = (self::$listening[$type] ?? 0) + 1;
     }
 
     public function removeEventListener(string $type, ?callable $listener = null): void
     {
+        $before = count($this->listeners[$type] ?? []);
         if ($listener === null) {
             unset($this->listeners[$type]);
-            return;
+        } else {
+            $this->listeners[$type] = array_values(array_filter($this->listeners[$type] ?? [], static fn ($l) => $l != $listener));
         }
-        $list = $this->listeners[$type] ?? [];
-        $this->listeners[$type] = array_values(array_filter($list, static fn ($l) => $l != $listener));
+        self::$listening[$type] = max(0, (self::$listening[$type] ?? 0) - $before + count($this->listeners[$type] ?? []));
     }
 
     public function hasEventListener(string $type): bool

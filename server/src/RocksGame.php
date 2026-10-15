@@ -384,8 +384,9 @@ final class RocksGame
     private function drop(Observer $by): void
     {
         $now = microtime(true);
-        // each ragdoll in flight costs the world some 18 ms a second (probing its limbs), 30 about half a core
-        if ($now - $by->droppedAt < 0.1 || $by->ragdolls >= 10 || count($this->ragdolls) >= 30) {
+        // each ragdoll in flight costs the world some 7 ms a second (probing its limbs); 20 thrown into one spot
+        // still keep up, 30 make the world fall behind for a moment where they cross the rocks together
+        if ($now - $by->droppedAt < 0.1 || $by->ragdolls >= 10 || count($this->ragdolls) >= 20) {
             return;
         }
         $by->droppedAt = $now;

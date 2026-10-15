@@ -9,6 +9,7 @@ use Phame\Display\DisplayObjectContainer;
 use Phame\Display\Stage;
 use Phame\Events\EnterFrameEvent;
 use Phame\Events\Event;
+use Phame\Events\EventDispatcher;
 use Phame\Events\KeyEvent;
 use Phame\Events\Owner;
 
@@ -346,7 +347,9 @@ final class World
         }
         $delta = $this->clock->delta;
         $this->juggler->advanceTime($delta);
-        DisplayObjectContainer::broadcast($this->stage, new EnterFrameEvent($delta));
+        if ((EventDispatcher::$listening[Event::ENTER_FRAME] ?? 0) > 0) {   // else every tick would walk every node for nobody
+            DisplayObjectContainer::broadcast($this->stage, new EnterFrameEvent($delta));
+        }
         if ($this->watchCount > 0) {
             // conditions are checked here, so their coroutines sleep until there is something to do; nothing moves
             // meanwhile, so screen boxes for collision tests are computed once per object

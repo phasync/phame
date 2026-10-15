@@ -46,6 +46,23 @@ final class EngineLoopTest extends GlTestCase
         $this->assertEqualsWithDelta(0.3, $total, 1e-9);
     }
 
+    public function testEnterFrameStillReachesAListenerWhenAnotherObjectStopsListening(): void
+    {
+        // the world skips the enter-frame walk when nobody listens: removing one object's listener must not stop it
+        $listening = new Quad(1, 1);
+        $leaving = new Quad(1, 1);
+        $this->engine->stage->addChild($listening);
+        $this->engine->stage->addChild($leaving);
+        $frames = 0;
+        $listening->addEventListener(Event::ENTER_FRAME, function () use (&$frames) { ++$frames; });
+        $leaving->addEventListener(Event::ENTER_FRAME, $gone = static function () {});
+        $leaving->removeEventListener(Event::ENTER_FRAME, $gone);
+        $leaving->removeEventListener(Event::ENTER_FRAME);   // twice: the count must not go below what is left
+        $this->engine->maxFrames = 3;
+        $this->engine->run();
+        $this->assertSame(3, $frames);
+    }
+
     public function testAwaitFrameResumesOncePerFrameBeforeRender(): void
     {
         $seen = [];

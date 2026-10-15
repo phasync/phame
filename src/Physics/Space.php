@@ -8,9 +8,11 @@ use Phame\World;
 
 /**
  * Event-driven collision detection for the spheres of one Scene3D (event-driven molecular dynamics). Bodies move in
- * straight lines between events, so the time of every contact is computed, not searched for: each body keeps only
- * its earliest event (touching another sphere, reaching a wall of the scene's box, or crossing into another cell of
- * the grid), and the events are handled in time order. Handling an event means calling the world's collision
+ * straight lines between events, so the time of every contact is computed, not searched for: each body keeps its
+ * earliest contact, its next wall and its next crossing into another cell of the grid, and waits in a heap under the
+ * earliest of the three (one place per body, updated in place: nothing stale piles up). Events are handled in time
+ * order. Crossing into a cell looks only at the cells that just came within reach: the earliest contact with the
+ * others is already known. Handling an event means calling the world's collision
  * handler at the exact time of the contact; the handler and the objects decide what happens (new motion
  * descriptions), and the bodies involved predict again. Nothing is checked between events.
  *
@@ -71,26 +73,23 @@ final class Space
     private static array $partX = [];
     private static array $partY = [];
     private static array $partZ = [];
-    private static int $placed = 0;
     // which compound they are, when, and at which of its counters: placing again at the same moment gives the same
     private static ?Node3D $placedFor = null;
     private static float $placedAt = NAN;
     private static int $placedCounter = -1;
-    /** @var list<\Phame\Math\Matrix4> one world transform per depth of a tree, reused by placeParts() */
-    private static array $levels = [];
     /**
-     * @var array<int, array{int, ?list<float>}> by compound: at which of its counters, and the parts' offsets in the
-     * root's space (x, y, z flat), or null while something below the root moves
+     * @var array<int, array{int, list<?array{float, float, float}>, array<int, true>}> by compound: at which of its
+     * counters; each part's centre in the root's space while the joints above it are still (null while one turns);
+     * and the nodes on the way down to the moving parts, the only ones a placement walks through
      */
     private array $offsets = [];
-    private static ?\Phame\Math\Matrix4 $identity = null;
-    // the event heap, as parallel arrays: time, body, other body (or wall code), kind, and both bodies' counters
-    private array $time = [];
-    private array $body = [];
-    private array $other = [];
-    private array $kind = [];
-    private array $countA = [];
-    private array $countB = [];
+    /** @var array<int, int> by part: its index among its compound's parts */
+    private array $partIndex = [];
+    /** @var list<\Phame\Math\Matrix4> one transform per depth of a tree, for placement walks */
+    private static array $levels = [];
+    private static ?\Phame\Math\Matrix4 $scratch = null;
+    /** @var list<?Node3D> the bodies, each once, as a heap by the time of their next event (Node3D::$physicsAt) */
+    private array $heap = [];
     private int $count = 0;
 
     public function __construct(private readonly World $world, public readonly Scene3D $scene, public float $cellSize = 4.0)
@@ -124,6 +123,7 @@ final class Space
         foreach ($node->children as $child) {
             $child->physicsCompound = $root;
             if ($child->radius > 0.0) {
+                $this->partIndex[spl_object_id($child)] = count($parts);
                 $parts[] = $child;
                 $levers = [];
                 $chain = 0.0;
@@ -163,12 +163,14 @@ final class Space
         if (isset($this->parts[$id])) {
             foreach ($this->parts[$id] as $part) {
                 $part->physicsCompound = null;
-                unset($this->levers[spl_object_id($part)]);
+                unset($this->levers[spl_object_id($part)], $this->partIndex[spl_object_id($part)]);
             }
             unset($this->parts[$id], $this->lastTouch[$id], $this->offsets[$id]);
         }
+        $this->unschedule($b);
         $b->physicsSpace = null;
-        ++$b->physicsCounter;   // its pending events are stale now
+        $b->physicsPair = null;
+        ++$b->physicsCounter;   // what others predicted with it is stale now
     }
 
     /**
@@ -217,28 +219,29 @@ final class Space
     {
         $clock = $this->world->clock;
         $this->settle();   // what game code changed since the last time
-        while ($this->count > 0 && $this->time[0] <= $until + 1e-12) {
-            $t = $this->time[0];
-            $a = $this->body[0];
-            $b = $this->other[0];
-            $kind = $this->kind[0];
-            $ca = $this->countA[0];
-            $cb = $this->countB[0];
-            $this->pop();
-            if ($a->physicsSpace !== $this || $a->physicsCounter !== $ca) {
-                continue;   // a has newer events
-            }
+        while ($this->count > 0 && $this->heap[0]->physicsAt <= $until + 1e-12) {
+            $a = $this->heap[0];
+            $t = $a->physicsAt;
             $clock->travelTo($t);
-            if (($kind === self::PAIR || $kind === self::TETHER || $kind === self::PROBE) && ($b->physicsSpace !== $this || $b->physicsCounter !== $cb)) {
+            if ($a->physicsCellAt <= $a->physicsWallAt && $a->physicsCellAt <= $a->physicsPairAt) {
+                $this->crossCell($a);
+                continue;
+            }
+            if ($a->physicsWallAt <= $a->physicsPairAt) {
+                $code = $a->physicsWall;
+                $this->world->collide($this->contact($t, $a, Wall::side(intdiv($code, 2), $code % 2 === 1 ? 1 : -1)));
+                if ($a->physicsSpace === $this) {
+                    $this->changed($a);
+                }
+                $this->settle();
+                continue;
+            }
+            $b = $a->physicsPair;
+            if ($b->physicsSpace !== $this || $b->physicsCounter !== $a->physicsPairSeen) {
                 $this->predict($a);   // b changed since: a's prediction no longer holds
                 continue;
             }
-            if ($kind === self::CELL) {
-                $this->moveToCell($a);
-                $this->predict($a);
-                continue;
-            }
-            if ($kind === self::PROBE) {
+            if ($a->physicsPairKind === self::PROBE) {
                 [$compound, $other] = $a->compound ? [$a, $b] : [$b, $a];
                 $contact = $this->touching($t, $compound, $other);
                 if ($contact === null) {
@@ -257,22 +260,72 @@ final class Space
                 $this->settle();
                 continue;
             }
-            $contact = $this->contact($t, $a, $kind === self::WALL ? Wall::side(intdiv($b, 2), $b % 2 === 1 ? 1 : -1) : $b);
-            if ($kind === self::TETHER) {
+            $contact = $this->contact($t, $a, $b);
+            if ($a->physicsPairKind === self::TETHER) {
                 $contact->tether = true;
                 [$contact->nx, $contact->ny, $contact->nz, $contact->normalSpeed] = [-$contact->nx, -$contact->ny, -$contact->nz, -$contact->normalSpeed];
             }
             $this->world->collide($contact);
-            if ($a->physicsSpace === $this) {
-                $this->changed($a);
-            }
-            if ($kind !== self::WALL && $b->physicsSpace === $this) {
-                $this->changed($b);
+            foreach ([$a, $b] as $body) {
+                if ($body->physicsSpace === $this) {
+                    $this->changed($body);
+                }
             }
             $this->settle();
         }
         $clock->travelTo($until);
         $this->settle();
+    }
+
+    /**
+     * The body crossed into another cell: only the cells that just came within reach are new (it can meet nothing
+     * else without crossing again, and its earliest contact with the rest is known). A full look when that contact
+     * no longer holds, at corners, and for large bodies, whose reach is wider.
+     */
+    private function crossCell(Node3D $a): void
+    {
+        $old = $a->physicsCell;
+        $this->moveToCell($a);
+        $new = $a->physicsCell;
+        $d = [($new >> 42) - ($old >> 42), (($new >> 21) & 0x1FFFFF) - (($old >> 21) & 0x1FFFFF), ($new & 0x1FFFFF) - ($old & 0x1FFFFF)];
+        $pair = $a->physicsPair;
+        if ($a->compound || $a->radius > $this->cellSize / 2 || abs($d[0]) + abs($d[1]) + abs($d[2]) !== 1
+            || ($pair !== null && ($pair->physicsSpace !== $this || $pair->physicsCounter !== $a->physicsPairSeen))) {
+            $this->predict($a);
+            return;
+        }
+        $now = $this->world->clock->time;
+        $vx = $a->mvx;
+        $vy = $a->mvy;
+        $vz = $a->mvz;
+        $age = $now - $a->mt;
+        $x = $a->mx + $vx * $age;
+        $y = $a->my + $vy * $age;
+        $z = $a->mz + $vz * $age;
+        $r = $a->radius;
+        $half = $this->cellSize / 2;
+        $axis = $d[0] !== 0 ? 0 : ($d[1] !== 0 ? 1 : 2);
+        for ($u = -1; $u <= 1; ++$u) {
+            for ($w = -1; $w <= 1; ++$w) {
+                // the far face of the new neighbourhood, one cell on along the axis it crossed
+                $o = [0, 0, 0];
+                $o[$axis] = $d[$axis];
+                $o[($axis + 1) % 3] = $u;
+                $o[($axis + 2) % 3] = $w;
+                foreach ($this->cells[$new + ($o[0] << 42) + ($o[1] << 21) + $o[2]] ?? [] as $b) {
+                    if ($b === $a || $b->radius > $half) {
+                        continue;
+                    }
+                    $bAge = $now - $b->mt;
+                    $t = $now + self::sphereImpact($b->mx + $b->mvx * $bAge - $x, $b->my + $b->mvy * $bAge - $y, $b->mz + $b->mvz * $bAge - $z, $b->mvx - $vx, $b->mvy - $vy, $b->mvz - $vz, $r + $b->radius);
+                    if ($t < $a->physicsPairAt) {
+                        [$a->physicsPairAt, $a->physicsPair, $a->physicsPairKind, $a->physicsPairSeen] = [$t, $b, self::PAIR, $b->physicsCounter];
+                    }
+                }
+            }
+        }
+        $a->physicsCellAt = $now + $this->cellExit($a->physicsCell, $x, $y, $z, $vx, $vy, $vz);
+        $this->schedule($a);
     }
 
     private function contact(float $t, Node3D $a, Node3D|Wall $b): Contact
@@ -297,12 +350,11 @@ final class Space
     }
 
     /**
-     * Finds the body's earliest event and pushes it. Older events of an unchanged body stay valid: they are still
-     * true predictions (the counters only move when motion changes), so re-predicting never invalidates a partner.
+     * Works out the body's earliest contact, wall and cell crossing, and puts it in the heap under the earliest. What
+     * others predicted with it stays valid while its counter does (the counters only move when motion changes).
      */
     private function predict(Node3D $a): void
     {
-        $counter = $a->physicsCounter;
         $now = $this->world->clock->time;
         if ($a->compound) {
             $this->inside = [];
@@ -317,21 +369,23 @@ final class Space
         $z = $a->mz + $vz * $age;
         $r = $a->radius;
         $best = INF;
-        $bestKind = -1;
+        $bestKind = self::PAIR;
         $bestOther = null;
 
         // walls of the scene's box
+        $wall = INF;
+        $wallCode = 0;
         $scene = $this->scene;
         foreach (!$a->confined ? [] : [[0, $x, $vx, $scene->worldMinX, $scene->worldMaxX], [1, $y, $vy, $scene->worldMinY, $scene->worldMaxY], [2, $z, $vz, $scene->worldMinZ, $scene->worldMaxZ]] as [$axis, $p, $v, $min, $max]) {
             if ($v > 0.0 && $max < INF && $p + $r <= $max + 1e-9) {
                 $t = ($max - $r - $p) / $v;
-                if ($t < $best) {
-                    [$best, $bestKind, $bestOther] = [max(0.0, $t), self::WALL, $axis * 2 + 1];
+                if ($t < $wall) {
+                    [$wall, $wallCode] = [max(0.0, $t), $axis * 2 + 1];
                 }
             } elseif ($v < 0.0 && $min > -INF && $p - $r >= $min - 1e-9) {
                 $t = ($min + $r - $p) / $v;
-                if ($t < $best) {
-                    [$best, $bestKind, $bestOther] = [max(0.0, $t), self::WALL, $axis * 2];
+                if ($t < $wall) {
+                    [$wall, $wallCode] = [max(0.0, $t), $axis * 2];
                 }
             }
         }
@@ -391,24 +445,26 @@ final class Space
             }
         }
 
-        // leaving the cell: the neighbourhood changes
+        $a->physicsWallAt = $now + $wall;
+        $a->physicsWall = $wallCode;
+        [$a->physicsPairAt, $a->physicsPair, $a->physicsPairKind, $a->physicsPairSeen] = [$now + $best, $bestOther, $bestKind, $bestOther?->physicsCounter ?? 0];
+        $a->physicsCellAt = $now + $this->cellExit($cell, $x, $y, $z, $vx, $vy, $vz);
+        $this->schedule($a);
+    }
+
+    /** Seconds until a point moving at v leaves the cell (just past its edge, so that it is in the next one). */
+    private function cellExit(int $cell, float $x, float $y, float $z, float $vx, float $vy, float $vz): float
+    {
         $s = $this->cellSize;
+        $exit = INF;
         foreach ([[$x, $vx, ($cell >> 42) - 0x100000], [$y, $vy, (($cell >> 21) & 0x1FFFFF) - 0x100000], [$z, $vz, ($cell & 0x1FFFFF) - 0x100000]] as [$p, $v, $c]) {
             if ($v > 0.0) {
-                $t = (($c + 1) * $s - $p) / $v;
+                $exit = min($exit, max(0.0, (($c + 1) * $s - $p) / $v) + 1e-9);
             } elseif ($v < 0.0) {
-                $t = ($c * $s - $p) / $v;
-            } else {
-                continue;
-            }
-            if ($t < $best) {
-                [$best, $bestKind, $bestOther] = [max(0.0, $t) + 1e-9, self::CELL, null];
+                $exit = min($exit, max(0.0, ($c * $s - $p) / $v) + 1e-9);
             }
         }
-
-        if ($bestKind >= 0) {
-            $this->push($now + $best, $a, $bestOther, $bestKind, $counter, $bestOther instanceof Node3D ? $bestOther->physicsCounter : 0);
-        }
+        return $exit;
     }
 
     /**
@@ -558,62 +614,76 @@ final class Space
         [self::$placedFor, self::$placedAt, self::$placedCounter] = [$compound, $now, $compound->physicsCounter];
         $id = spl_object_id($compound);
         if (($this->offsets[$id][0] ?? -1) !== $compound->physicsCounter) {
-            // until it next changes: if nothing below the root moves, the parts sit still in the root's space
-            $this->offsets[$id] = [$compound->physicsCounter, self::stillBelow($compound) ? $this->offsetsOf($compound) : null];
+            $this->offsets[$id] = [$compound->physicsCounter, ...$this->offsetsOf($compound)];   // until it next changes
         }
-        $offsets = $this->offsets[$id][1];
-        if ($offsets === null) {
-            self::$placed = 0;
-            $this->placeBelow($compound, $compound->getWorldMatrix(), 0);
-            return;
+        $m = $compound->getWorldMatrix();   // the root's transform now: a still part is one turn and shift
+        [, $offsets, $walk] = $this->offsets[$id];
+        if ($walk !== []) {
+            $this->placeMoving($compound, $m, $walk, 0);   // the moving parts: one walk down their branches
         }
-        $m = $compound->getWorldMatrix();   // the root's transform now: one turn and shift per part
-        for ($i = 0, $n = count($offsets); $i < $n; $i += 3) {
-            [$x, $y, $z] = [$offsets[$i], $offsets[$i + 1], $offsets[$i + 2]];
-            $k = intdiv($i, 3);
-            self::$partX[$k] = $m->m0 * $x + $m->m4 * $y + $m->m8 * $z + $m->m12;
-            self::$partY[$k] = $m->m1 * $x + $m->m5 * $y + $m->m9 * $z + $m->m13;
-            self::$partZ[$k] = $m->m2 * $x + $m->m6 * $y + $m->m10 * $z + $m->m14;
-        }
-    }
-
-    private static function stillBelow(Node3D $node): bool
-    {
-        foreach ($node->children as $child) {
-            if ($child->mvx != 0.0 || $child->mvy != 0.0 || $child->mvz != 0.0 || $child->mwx != 0.0 || $child->mwy != 0.0 || $child->mwz != 0.0 || !self::stillBelow($child)) {
-                return false;
+        foreach ($offsets as $i => $offset) {
+            if ($offset === null) {
+                continue;
             }
+            [$x, $y, $z] = $offset;
+            self::$partX[$i] = $m->m0 * $x + $m->m4 * $y + $m->m8 * $z + $m->m12;
+            self::$partY[$i] = $m->m1 * $x + $m->m5 * $y + $m->m9 * $z + $m->m13;
+            self::$partZ[$i] = $m->m2 * $x + $m->m6 * $y + $m->m10 * $z + $m->m14;
         }
-        return true;
     }
 
-    /** @return list<float> the parts' centres in the root's space, flat */
-    private function offsetsOf(Node3D $compound): array
-    {
-        self::$placed = 0;
-        $this->placeBelow($compound, self::$identity ??= \Phame\Math\Matrix4::get()->identity(), 0);
-        $out = [];
-        for ($i = 0; $i < self::$placed; ++$i) {
-            array_push($out, self::$partX[$i], self::$partY[$i], self::$partZ[$i]);
-        }
-        return $out;
-    }
-
-    private function placeBelow(Node3D $node, \Phame\Math\Matrix4 $world, int $depth): void
+    /** Places the parts below moving nodes: down through the nodes in $walk only, one product per node. */
+    private function placeMoving(Node3D $node, \Phame\Math\Matrix4 $world, array $walk, int $depth): void
     {
         $m = self::$levels[$depth] ??= \Phame\Math\Matrix4::get();
         foreach ($node->children as $child) {
+            if (!isset($walk[spl_object_id($child)])) {
+                continue;
+            }
             $m->product($world, $child->getLocalMatrix());
             if ($child->radius > 0.0) {
-                self::$partX[self::$placed] = $m->m12;
-                self::$partY[self::$placed] = $m->m13;
-                self::$partZ[self::$placed] = $m->m14;
-                ++self::$placed;
+                $i = $this->partIndex[spl_object_id($child)];
+                [self::$partX[$i], self::$partY[$i], self::$partZ[$i]] = [$m->m12, $m->m13, $m->m14];
             }
             if ($child->children !== []) {
-                $this->placeBelow($child, $m, $depth + 1);
+                $this->placeMoving($child, $m, $walk, $depth + 1);
             }
         }
+    }
+
+    /**
+     * Each part's centre in the root's space, where every node between them is still (it then stays there until the
+     * compound next changes); null where one moves. And the nodes from the root down to the moving parts.
+     *
+     * @return array{list<?array{float, float, float}>, array<int, true>}
+     */
+    private function offsetsOf(Node3D $compound): array
+    {
+        $out = [];
+        $walk = [];
+        $m = self::$scratch ??= \Phame\Math\Matrix4::get();
+        foreach ($this->parts[spl_object_id($compound)] as $part) {
+            $still = true;
+            for ($n = $part; $n !== $compound; $n = $n->parent) {
+                if ($n->mvx != 0.0 || $n->mvy != 0.0 || $n->mvz != 0.0 || $n->mwx != 0.0 || $n->mwy != 0.0 || $n->mwz != 0.0) {
+                    $still = false;
+                    break;
+                }
+            }
+            if (!$still) {
+                $out[] = null;
+                for ($n = $part; $n !== $compound; $n = $n->parent) {
+                    $walk[spl_object_id($n)] = true;
+                }
+                continue;
+            }
+            $m->copyFrom($part->getLocalMatrix());
+            for ($n = $part->parent; $n !== $compound; $n = $n->parent) {
+                $m->product($n->getLocalMatrix(), $m);
+            }
+            $out[] = [$m->m12, $m->m13, $m->m14];
+        }
+        return [$out, $walk];
     }
 
     /** Whether the body and the nearest part (see nearestGap()) close in, by the part's world velocity. */
@@ -669,70 +739,85 @@ final class Space
         $this->cells[$cell][$id] = $b;
     }
 
-    /** The time of the earliest pending event (possibly stale), or INF. */
+    /** The time of the earliest event, or INF. */
     public function nextTime(): float
     {
-        return $this->count > 0 ? $this->time[0] : INF;
+        return $this->count > 0 ? $this->heap[0]->physicsAt : INF;
     }
 
-    private function push(float $time, Node3D $a, mixed $other, int $kind, int $ca, int $cb): void
+    /** Puts the body in the heap, or moves it, by the earliest of its contact, wall and cell crossing. */
+    private function schedule(Node3D $a): void
     {
-        $this->world->notifyEvent($time);
-        $i = $this->count++;
-        while ($i > 0) {
-            $p = ($i - 1) >> 1;
-            if ($this->time[$p] <= $time) {
-                break;
-            }
-            $this->time[$i] = $this->time[$p];
-            $this->body[$i] = $this->body[$p];
-            $this->other[$i] = $this->other[$p];
-            $this->kind[$i] = $this->kind[$p];
-            $this->countA[$i] = $this->countA[$p];
-            $this->countB[$i] = $this->countB[$p];
-            $i = $p;
+        $at = min($a->physicsPairAt, $a->physicsWallAt, $a->physicsCellAt);
+        $a->physicsAt = $at;
+        if ($at < INF) {
+            $this->world->notifyEvent($at);
         }
-        $this->time[$i] = $time;
-        $this->body[$i] = $a;
-        $this->other[$i] = $other;
-        $this->kind[$i] = $kind;
-        $this->countA[$i] = $ca;
-        $this->countB[$i] = $cb;
+        if ($a->physicsSlot < 0) {
+            $a->physicsSlot = $this->count;
+            $this->heap[$this->count++] = $a;
+        }
+        $this->siftUp($a->physicsSlot);
+        $this->siftDown($a->physicsSlot);
     }
 
-    private function pop(): void
+    private function unschedule(Node3D $a): void
     {
-        $n = --$this->count;
-        [$time, $body, $other, $kind, $ca, $cb] = [$this->time[$n], $this->body[$n], $this->other[$n], $this->kind[$n], $this->countA[$n], $this->countB[$n]];
-        $this->body[$n] = $this->other[$n] = null;
-        if ($n === 0) {
+        $i = $a->physicsSlot;
+        if ($i < 0) {
             return;
         }
-        $i = 0;
+        $a->physicsSlot = -1;
+        $last = $this->heap[--$this->count];
+        $this->heap[$this->count] = null;
+        if ($last !== $a) {
+            $this->heap[$i] = $last;
+            $last->physicsSlot = $i;
+            $this->siftUp($i);
+            $this->siftDown($last->physicsSlot);
+        }
+    }
+
+    private function siftUp(int $i): void
+    {
+        $a = $this->heap[$i];
+        $at = $a->physicsAt;
+        while ($i > 0) {
+            $p = ($i - 1) >> 1;
+            $q = $this->heap[$p];
+            if ($q->physicsAt <= $at) {
+                break;
+            }
+            $this->heap[$i] = $q;
+            $q->physicsSlot = $i;
+            $i = $p;
+        }
+        $this->heap[$i] = $a;
+        $a->physicsSlot = $i;
+    }
+
+    private function siftDown(int $i): void
+    {
+        $a = $this->heap[$i];
+        $at = $a->physicsAt;
+        $n = $this->count;
         while (true) {
             $c = 2 * $i + 1;
             if ($c >= $n) {
                 break;
             }
-            if ($c + 1 < $n && $this->time[$c + 1] < $this->time[$c]) {
+            if ($c + 1 < $n && $this->heap[$c + 1]->physicsAt < $this->heap[$c]->physicsAt) {
                 ++$c;
             }
-            if ($this->time[$c] >= $time) {
+            $q = $this->heap[$c];
+            if ($q->physicsAt >= $at) {
                 break;
             }
-            $this->time[$i] = $this->time[$c];
-            $this->body[$i] = $this->body[$c];
-            $this->other[$i] = $this->other[$c];
-            $this->kind[$i] = $this->kind[$c];
-            $this->countA[$i] = $this->countA[$c];
-            $this->countB[$i] = $this->countB[$c];
+            $this->heap[$i] = $q;
+            $q->physicsSlot = $i;
             $i = $c;
         }
-        $this->time[$i] = $time;
-        $this->body[$i] = $body;
-        $this->other[$i] = $other;
-        $this->kind[$i] = $kind;
-        $this->countA[$i] = $ca;
-        $this->countB[$i] = $cb;
+        $this->heap[$i] = $a;
+        $a->physicsSlot = $i;
     }
 }

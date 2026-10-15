@@ -65,6 +65,24 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
     public ?\Phame\Physics\Space $physicsSpace = null;
     /** @internal */
     public int $physicsCounter = 0;
+    /** @internal Its next physics event (the earliest of the three below), and its place in the space's heap. */
+    public float $physicsAt = INF;
+    /** @internal */
+    public int $physicsSlot = -1;
+    /** @internal Its earliest contact: when, with whom, of which kind (Space::PAIR, TETHER, PROBE), the other's counter then. */
+    public float $physicsPairAt = INF;
+    /** @internal */
+    public ?Node3D $physicsPair = null;
+    /** @internal */
+    public int $physicsPairKind = 0;
+    /** @internal */
+    public int $physicsPairSeen = 0;
+    /** @internal When it reaches a wall of the scene's box, and which (axis * 2, + 1 for the high side). */
+    public float $physicsWallAt = INF;
+    /** @internal */
+    public int $physicsWall = 0;
+    /** @internal When it leaves its grid cell. */
+    public float $physicsCellAt = INF;
     /** @internal The cell of the physics grid it is in, packed (see Space). */
     public int $physicsCell = 0;
 
