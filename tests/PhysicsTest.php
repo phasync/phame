@@ -168,4 +168,108 @@ final class PhysicsTest extends TestCase
         $this->assertEqualsWithDelta(20.0, $ball->x, 1e-9);
         $world->dispose();
     }
+
+    public function testATautTetherPullsTwoBodiesBack(): void
+    {
+        $world = new World();
+        $scene = $world->stage->addChild(new Scene3D(100, 100));
+        $tethers = 0;
+        $world->onCollision(function (TestRock $a, TestRock $b, Contact $c) use (&$tethers) {
+            $j = $c->impulse(1.0);
+            $a->bounceOff($c, $j, $c->sign($a));
+            $b->bounceOff($c, $j, $c->sign($b));
+            $tethers += $c->tether ? 1 : 0;
+        });
+        $a = new TestRock();
+        $b = new TestRock();
+        foreach ([[$a, -1.0], [$b, 1.0]] as [$rock, $side]) {
+            $rock->moveTo($side, 0.0, 0.0);
+            $rock->setVelocity($side, 0.3, 0.0);   // apart, and drifting: the pair moves on as it bounces
+            $rock->radius = 0.5;
+            $scene->root->addChild($rock);
+        }
+        $world->physics($scene)->tether($a, $b, 5.0);
+        $worst = 0.0;
+        \phasync::run(static fn () => $world->run(static function (World $w) use ($a, $b, &$worst) {
+            for ($i = 0; $i < 200; ++$i) {
+                $w->tick(0.05);
+                $worst = max($worst, sqrt(($b->x - $a->x) ** 2 + ($b->y - $a->y) ** 2 + ($b->z - $a->z) ** 2));
+            }
+        }));
+        $this->assertGreaterThan(2, $tethers, 'held more than once: apart, together, apart');
+        $this->assertLessThanOrEqual(5.0 + 1e-6, $worst, 'never further apart than the tether');
+        $this->assertEqualsWithDelta(0.3, $a->velocityY, 1e-9, 'the pull is along the tether only');
+        $this->assertEqualsWithDelta(2.0 * 1.0 ** 2, $a->velocityX ** 2 + $b->velocityX ** 2, 1e-9, 'an elastic hold keeps the energy');
+        $world->dispose();
+    }
+
+    public function testATetheredChainKeepsItsLengthsWithoutRunningAway(): void
+    {
+        mt_srand(5);
+        $world = new World();
+        $scene = $world->stage->addChild(new Scene3D(100, 100));
+        $events = 0;
+        $world->onCollision(function (TestRock $a, TestRock $b, Contact $c) use (&$events) {
+            $j = $c->impulse(1.0);
+            $a->bounceOff($c, $j, $c->sign($a));
+            $b->bounceOff($c, $j, $c->sign($b));
+            ++$events;
+        });
+        $chain = [];
+        for ($i = 0; $i < 5; ++$i) {
+            $rock = new TestRock();
+            $rock->moveTo($i * 2.0, 0.0, 0.0);
+            $rock->setVelocity(mt_rand(-30, 30) / 10, mt_rand(-30, 30) / 10, mt_rand(-30, 30) / 10);
+            $rock->radius = 0.4;
+            $scene->root->addChild($rock);
+            if ($chain !== []) {
+                $world->physics($scene)->tether(end($chain), $rock, 2.1);
+            }
+            $chain[] = $rock;
+        }
+        $worst = 0.0;
+        \phasync::run(static fn () => $world->run(static function (World $w) use ($chain, &$worst) {
+            for ($i = 0; $i < 200; ++$i) {
+                $w->tick(0.05);
+                for ($k = 1; $k < 5; ++$k) {
+                    [$p, $q] = [$chain[$k - 1], $chain[$k]];
+                    $worst = max($worst, sqrt(($q->x - $p->x) ** 2 + ($q->y - $p->y) ** 2 + ($q->z - $p->z) ** 2));
+                }
+            }
+        }));
+        $this->assertLessThanOrEqual(2.1 + 1e-6, $worst);
+        $this->assertGreaterThan(10, $events);
+        $this->assertLessThan(20000, $events, 'a few hundred per second at most, not an endless run of instant events');
+        $world->dispose();
+    }
+
+    public function testEveryChangeInATickIsPublishedWithItsOwnDescription(): void
+    {
+        // a ball between walls 1 apart at 10 per second turns every 0.1 s: one tick of 0.25 s holds three, and a
+        // viewer needs both, each at its moment, or it draws the old path past the first turn and then jumps
+        $world = new World();
+        $scene = $world->stage->addChild(new Scene3D(100, 100));
+        [$scene->worldMinX, $scene->worldMinY, $scene->worldMinZ] = [-1.0, -10.0, -10.0];
+        [$scene->worldMaxX, $scene->worldMaxY, $scene->worldMaxZ] = [1.0, 10.0, 10.0];
+        $world->onCollision(function (TestRock $rock, Wall $wall, Contact $c) {
+            $rock->mirror($wall);
+        });
+        $ball = new TestRock();
+        $ball->radius = 0.5;
+        $scene->root->addChild($ball);
+        $ball->published = true;
+        $ball->setVelocity(10.0, 0.0, 0.0);
+        $changes = [];
+        \phasync::run(static function () use ($world, &$changes) {
+            $world->run(static function (World $w) use (&$changes) {
+                $w->takeChangedDescriptions();   // the start
+                $w->tick(0.25);
+                $changes = $w->takeChangedDescriptions();
+            });
+        });
+        $this->assertCount(3, $changes);
+        $this->assertEqualsWithDelta([0.05, 0.15, 0.25], array_map(static fn ($c) => $c[1][0], $changes), 1e-9, 'each turn at its moment');
+        $this->assertSame([-10.0, 10.0, -10.0], array_map(static fn ($c) => $c[1][4], $changes), 'with the velocity it turned to');
+        $world->dispose();
+    }
 }

@@ -43,6 +43,8 @@ final class World
     public float $frameRate = 60.0;
     /** What the evented driver sleeps until; -INF while it is awake (it looks again before it sleeps). */
     private float $sleepingUntil = -INF;
+    /** When (hrtime) runEvented() last brought game time up to real time. */
+    private int|float $eventedAt = 0;
 
     /** The exception that escaped a coroutine and stopped the world, if any. */
     public private(set) ?\Throwable $failure = null;
@@ -73,8 +75,10 @@ final class World
     private array $handlers = [];
     /** @var array<string, array{?\Closure, bool, bool}> resolved per class pair: handler, swapped, wants the world */
     private array $handlerCache = [];
-    /** @var list<?\Phame\Scene\Node3D> published nodes whose description changed, for viewers */
+    /** @var list<?\Phame\Scene\Node3D> published nodes whose description changed, for viewers, one per change */
     private array $published = [];
+    /** @var list<?list<float>> the description each change gave its node, as describe() returned it then */
+    private array $publishedDescriptions = [];
     private int $publishedCount = 0;
     /** @var \WeakMap<Kinetic\Group, array<int, Wake\Waiter>> waiters whose conditions watch a group */
     private \WeakMap $dependents;
@@ -229,9 +233,9 @@ final class World
      */
     public function runEvented(?\Closure $afterStep = null): void
     {
-        $last = hrtime(true);
+        $this->eventedAt = hrtime(true);
         while (!$this->stopped) {
-            $wait = $this->nextEventTime() - $this->clock->time - ((hrtime(true) - $last) / 1e9);
+            $wait = $this->nextEventTime() - $this->clock->time - ((hrtime(true) - $this->eventedAt) / 1e9);
             if ($wait > 0.0) {
                 $this->sleepingUntil = $this->clock->time + $wait;
                 try {
@@ -242,18 +246,39 @@ final class World
                 $this->sleepingUntil = -INF;
             }
             $now = hrtime(true);
-            $this->tick(($now - $last) / 1e9);
-            $last = $now;
+            $seconds = ($now - $this->eventedAt) / 1e9;
+            $this->eventedAt = $now;
+            $this->tick($seconds);
             if ($afterStep !== null) {
                 $afterStep($this);
             }
         }
     }
 
-    /** Ends the world's run: its driver stops at the end of the current tick. */
+    /**
+     * Brings game time up to real time while runEvented() sleeps, handling what fell due on the way. Between events
+     * the clock stands at the last one, so code acting on something from outside the world (a message from a player,
+     * a phasync timer of its own) calls this first: what it changes then starts now, as browsers see it, not at the
+     * world's last event. Does nothing while the world is awake (a tick, a handler) or under other drivers.
+     */
+    public function sync(): void
+    {
+        if ($this->sleepingUntil === -INF) {
+            return;
+        }
+        $this->sleepingUntil = -INF;   // awake for this catch-up: a sync inside it does nothing
+        $now = hrtime(true);
+        $seconds = ($now - $this->eventedAt) / 1e9;
+        $this->eventedAt = $now;   // first: this time is counted once, whoever ticks next
+        $this->advance($seconds);   // not tick(): it lets other coroutines run, the driver among them, mid-catch-up
+        phasync::raiseFlag($this->wakeFlag);   // the driver works out its next event again
+    }
+
+    /** Ends the world's run: its driver stops at the end of the current tick (a sleeping evented driver wakes for it). */
     public function stop(): void
     {
         $this->stopped = true;
+        phasync::raiseFlag($this->wakeFlag);
     }
 
     /** Takes the failure that stopped the world, if any, so that it can be rethrown once. */
@@ -779,28 +804,38 @@ final class World
         }
     }
 
-    /** @internal A published node's description changed: it goes to viewers with the next batch. */
+    /**
+     * @internal A published node's description changed: it goes to viewers with the next batch. Every change keeps
+     * its own description, since a viewer switches to each at its moment; changes at the same moment (moveTo, then
+     * setVelocity) make one.
+     */
     public function descriptionChanged(\Phame\Scene\Node3D $node): void
     {
-        if (!$node->publishQueued) {
-            $node->publishQueued = true;
-            $this->published[$this->publishedCount++] = $node;
+        $description = $node->describe();
+        $slot = $node->publishSlot;
+        if ($slot >= 0 && $this->publishedDescriptions[$slot][0] === $description[0]) {
+            $this->publishedDescriptions[$slot] = $description;
+            return;
         }
+        $node->publishSlot = $this->publishedCount;
+        $this->published[$this->publishedCount] = $node;
+        $this->publishedDescriptions[$this->publishedCount++] = $description;
     }
 
     /**
-     * Takes the published nodes whose description changed since the last call, for a viewer stream.
+     * Takes the description changes of published nodes since the last call, in the order they happened, for a viewer
+     * stream: a node that changed twice comes twice, each with the description it had from that moment.
      *
-     * @return list<\Phame\Scene\Node3D>
+     * @return list<array{\Phame\Scene\Node3D, list<float>}>
      */
     public function takeChangedDescriptions(): array
     {
         $out = [];
         for ($i = 0; $i < $this->publishedCount; ++$i) {
             $node = $this->published[$i];
-            $this->published[$i] = null;
-            $node->publishQueued = false;
-            $out[] = $node;
+            $out[] = [$node, $this->publishedDescriptions[$i]];
+            $node->publishSlot = -1;
+            $this->published[$i] = $this->publishedDescriptions[$i] = null;
         }
         $this->publishedCount = 0;
         return $out;

@@ -15,6 +15,11 @@ final class Contact
     public float $nz = 0.0;
     /** The velocity of $b relative to $a along the normal (negative: they approach). */
     public float $normalSpeed = 0.0;
+    /**
+     * A tether between $a and $b went taut (see Space::tether()): the normal points from $b to $a, so a bounce, as for
+     * any contact, pulls them back together.
+     */
+    public bool $tether = false;
 
     public function __construct(
         /** Game time of the contact. */

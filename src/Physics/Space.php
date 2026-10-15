@@ -18,19 +18,26 @@ use Phame\World;
  * again until they have separated. A body wider than half a cell is large: every body checks the large ones wherever
  * they are, and a large body looks as many cells out as its reach needs, so a contact is never missed for size.
  * Bodies that are not confined ignore the walls.
+ *
+ * Two bodies can be tethered: free within a distance, held at it. A tether going taut is one more event, at its exact
+ * time, reported as a contact with the normal reversed: the handler's bounce pulls them together. Chains of tethered
+ * spheres make ropes and ragdolls without a single force, in the same straight lines between events.
  */
 final class Space
 {
     public const PAIR = 0;
     public const WALL = 1;
     public const CELL = 2;
+    public const TETHER = 3;
 
     /** @var array<int, Node3D> */
     private array $bodies = [];
-    /** @var array<string, array<int, Node3D>> */
+    /** @var array<int, array<int, Node3D>> by cell: x, y and z as 21-bit fields, offset by 2^20 (see cellOf()) */
     private array $cells = [];
     /** @var array<int, Node3D> the bodies with a radius above half a cell */
     private array $large = [];
+    /** @var array<int, array<int, array{Node3D, float}>> by body: the bodies it is tethered to, and the lengths */
+    private array $tethers = [];
     // the event heap, as parallel arrays: time, body, other body (or wall code), kind, and both bodies' counters
     private array $time = [];
     private array $body = [];
@@ -61,9 +68,25 @@ final class Space
         $this->predict($b);
     }
 
+    /**
+     * Ties two bodies of this space together: they move freely while closer than $length, and are held at it. Holding
+     * is the collision handler's job, as for any contact: the contact it gets has $tether set.
+     */
+    public function tether(Node3D $a, Node3D $b, float $length): void
+    {
+        $this->tethers[spl_object_id($a)][spl_object_id($b)] = [$b, $length];
+        $this->tethers[spl_object_id($b)][spl_object_id($a)] = [$a, $length];
+        $this->changed($a);
+        $this->changed($b);
+    }
+
     public function remove(Node3D $b): void
     {
         $id = spl_object_id($b);
+        foreach ($this->tethers[$id] ?? [] as $other => $_) {
+            unset($this->tethers[$other][$id]);
+        }
+        unset($this->tethers[$id]);
         unset($this->bodies[$id], $this->cells[$b->physicsCell][$id], $this->large[$id]);
         if (($this->cells[$b->physicsCell] ?? null) === []) {
             unset($this->cells[$b->physicsCell]);
@@ -104,7 +127,7 @@ final class Space
                 continue;   // a has newer events
             }
             $clock->travelTo($t);
-            if ($kind === self::PAIR && ($b->physicsSpace !== $this || $b->physicsCounter !== $cb)) {
+            if (($kind === self::PAIR || $kind === self::TETHER) && ($b->physicsSpace !== $this || $b->physicsCounter !== $cb)) {
                 $this->predict($a);   // b changed since: a's prediction no longer holds
                 continue;
             }
@@ -113,11 +136,16 @@ final class Space
                 $this->predict($a);
                 continue;
             }
-            $this->world->collide($this->contact($t, $a, $kind === self::PAIR ? $b : Wall::side(intdiv($b, 2), $b % 2 === 1 ? 1 : -1)));
+            $contact = $this->contact($t, $a, $kind === self::WALL ? Wall::side(intdiv($b, 2), $b % 2 === 1 ? 1 : -1) : $b);
+            if ($kind === self::TETHER) {
+                $contact->tether = true;
+                [$contact->nx, $contact->ny, $contact->nz, $contact->normalSpeed] = [-$contact->nx, -$contact->ny, -$contact->nz, -$contact->normalSpeed];
+            }
+            $this->world->collide($contact);
             if ($a->physicsSpace === $this) {
                 $this->changed($a);
             }
-            if ($kind === self::PAIR && $b->physicsSpace === $this) {
+            if ($kind !== self::WALL && $b->physicsSpace === $this) {
                 $this->changed($b);
             }
         }
@@ -153,12 +181,14 @@ final class Space
     {
         $counter = $a->physicsCounter;
         $now = $this->world->clock->time;
-        $x = $a->x;
-        $y = $a->y;
-        $z = $a->z;
-        $vx = $a->velocityX;
-        $vy = $a->velocityY;
-        $vz = $a->velocityZ;
+        // the motion descriptions, evaluated here: this loop is the engine's hottest, so no property hooks
+        $vx = $a->mvx;
+        $vy = $a->mvy;
+        $vz = $a->mvz;
+        $age = $now - $a->mt;
+        $x = $a->mx + $vx * $age;
+        $y = $a->my + $vy * $age;
+        $z = $a->mz + $vz * $age;
         $r = $a->radius;
         $best = INF;
         $bestKind = -1;
@@ -182,16 +212,19 @@ final class Space
 
         // other spheres in the cells within reach: two small ones touch from neighbouring cells at most, a large one
         // reaches further (the small ones find it in the list of large ones below)
-        [$cx, $cy, $cz] = explode(',', $a->physicsCell);
-        $reach = $r > $this->cellSize / 2 ? (int) ceil(($r + $this->cellSize / 2) / $this->cellSize) : 1;
+        $cell = $a->physicsCell;
+        $half = $this->cellSize / 2;
+        $reach = $r > $half ? (int) ceil(($r + $half) / $this->cellSize) : 1;
         for ($i = -$reach; $i <= $reach; ++$i) {
             for ($j = -$reach; $j <= $reach; ++$j) {
+                $row = $cell + ($i << 42) + ($j << 21);
                 for ($k = -$reach; $k <= $reach; ++$k) {
-                    foreach ($this->cells[($cx + $i) . ',' . ($cy + $j) . ',' . ($cz + $k)] ?? [] as $b) {
-                        if ($b === $a || ($b->radius > $this->cellSize / 2)) {   // large ones: below
+                    foreach ($this->cells[$row + $k] ?? [] as $b) {
+                        if ($b === $a || $b->radius > $half) {   // large ones: below
                             continue;
                         }
-                        $t = self::sphereImpact($b->x - $x, $b->y - $y, $b->z - $z, $b->velocityX - $vx, $b->velocityY - $vy, $b->velocityZ - $vz, $r + $b->radius);
+                        $bAge = $now - $b->mt;
+                        $t = self::sphereImpact($b->mx + $b->mvx * $bAge - $x, $b->my + $b->mvy * $bAge - $y, $b->mz + $b->mvz * $bAge - $z, $b->mvx - $vx, $b->mvy - $vy, $b->mvz - $vz, $r + $b->radius);
                         if ($t < $best) {
                             [$best, $bestKind, $bestOther] = [$t, self::PAIR, $b];
                         }
@@ -202,16 +235,25 @@ final class Space
 
         foreach ($this->large as $b) {
             if ($b !== $a) {
-                $t = self::sphereImpact($b->x - $x, $b->y - $y, $b->z - $z, $b->velocityX - $vx, $b->velocityY - $vy, $b->velocityZ - $vz, $r + $b->radius);
+                $bAge = $now - $b->mt;
+                $t = self::sphereImpact($b->mx + $b->mvx * $bAge - $x, $b->my + $b->mvy * $bAge - $y, $b->mz + $b->mvz * $bAge - $z, $b->mvx - $vx, $b->mvy - $vy, $b->mvz - $vz, $r + $b->radius);
                 if ($t < $best) {
                     [$best, $bestKind, $bestOther] = [$t, self::PAIR, $b];
                 }
             }
         }
 
+        foreach ($this->tethers[spl_object_id($a)] ?? [] as [$b, $length]) {
+            $bAge = $now - $b->mt;
+            $t = self::tetherTaut($b->mx + $b->mvx * $bAge - $x, $b->my + $b->mvy * $bAge - $y, $b->mz + $b->mvz * $bAge - $z, $b->mvx - $vx, $b->mvy - $vy, $b->mvz - $vz, $length);
+            if ($t < $best) {
+                [$best, $bestKind, $bestOther] = [$t, self::TETHER, $b];
+            }
+        }
+
         // leaving the cell: the neighbourhood changes
         $s = $this->cellSize;
-        foreach ([[$x, $vx, (int) $cx], [$y, $vy, (int) $cy], [$z, $vz, (int) $cz]] as [$p, $v, $c]) {
+        foreach ([[$x, $vx, ($cell >> 42) - 0x100000], [$y, $vy, (($cell >> 21) & 0x1FFFFF) - 0x100000], [$z, $vz, ($cell & 0x1FFFFF) - 0x100000]] as [$p, $v, $c]) {
             if ($v > 0.0) {
                 $t = (($c + 1) * $s - $p) / $v;
             } elseif ($v < 0.0) {
@@ -251,15 +293,39 @@ final class Space
         return ($c / (-$b + sqrt($disc)));   // = (-b - sqrt(disc)) / a, stable for small a
     }
 
-    private function cellOf(float $x, float $y, float $z): string
+    /**
+     * Seconds until two tethered bodies are $length apart and moving apart: the other at offset d, with relative
+     * velocity v. 0 if they are there now; INF if they never get there.
+     */
+    private static function tetherTaut(float $dx, float $dy, float $dz, float $vx, float $vy, float $vz, float $length): float
+    {
+        $a = $vx * $vx + $vy * $vy + $vz * $vz;
+        if ($a === 0.0) {
+            return INF;
+        }
+        $b = $dx * $dx + $dy * $dy + $dz * $dz - $length * $length;   // below 0: slack
+        $d = $dx * $vx + $dy * $vy + $dz * $vz;                          // above 0: moving apart
+        if ($b >= 0.0 && $d > 0.0) {
+            return 0.0;
+        }
+        $disc = $d * $d - $a * $b;
+        if ($disc < 0.0) {
+            return INF;   // beyond the length (rounding) and closing in, never to reach it again: a bounce would not help
+        }
+        return (-$d + sqrt($disc)) / $a;   // the later root: where the slack runs out
+    }
+
+    /** The grid cell of a point, packed in one integer: x, y and z cell numbers as 21-bit fields, offset by 2^20. */
+    private function cellOf(float $x, float $y, float $z): int
     {
         $s = $this->cellSize;
-        return (int) floor($x / $s) . ',' . (int) floor($y / $s) . ',' . (int) floor($z / $s);
+        return (((int) floor($x / $s) + 0x100000) << 42) | (((int) floor($y / $s) + 0x100000) << 21) | ((int) floor($z / $s) + 0x100000);
     }
 
     private function moveToCell(Node3D $b): void
     {
-        $cell = $this->cellOf($b->x + $b->velocityX * 1e-6, $b->y + $b->velocityY * 1e-6, $b->z + $b->velocityZ * 1e-6);
+        $age = $this->world->clock->time - $b->mt + 1e-6;   // just ahead: on a cell's edge, the cell it moves into
+        $cell = $this->cellOf($b->mx + $b->mvx * $age, $b->my + $b->mvy * $age, $b->mz + $b->mvz * $age);
         if ($cell === $b->physicsCell) {
             return;
         }

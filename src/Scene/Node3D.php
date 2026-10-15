@@ -16,20 +16,21 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
 
     /*
      * Motion description, as for DisplayObject: position and rotation at game time $mt plus their rates per second.
-     * The getters read it at the current game time; every change rebases it and tells the world once.
+     * The getters read it at the current game time; every change rebases it and tells the world once. Readable from
+     * outside (Physics\Space evaluates it inline in its hot loop), written only here.
      */
-    private float $mx = 0.0;
-    private float $my = 0.0;
-    private float $mz = 0.0;
+    public private(set) float $mx = 0.0;
+    public private(set) float $my = 0.0;
+    public private(set) float $mz = 0.0;
     /** Orientation at $mt, a unit quaternion. */
     private float $mqx = 0.0;
     private float $mqy = 0.0;
     private float $mqz = 0.0;
     private float $mqw = 1.0;
-    private float $mt = 0.0;
-    private float $mvx = 0.0;
-    private float $mvy = 0.0;
-    private float $mvz = 0.0;
+    public private(set) float $mt = 0.0;
+    public private(set) float $mvx = 0.0;
+    public private(set) float $mvy = 0.0;
+    public private(set) float $mvz = 0.0;
     /** Angular velocity in the parent's space: the axis is its direction, the speed (rad/s) its length. */
     private float $mwx = 0.0;
     private float $mwy = 0.0;
@@ -57,8 +58,8 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
     public ?\Phame\Physics\Space $physicsSpace = null;
     /** @internal */
     public int $physicsCounter = 0;
-    /** @internal */
-    public string $physicsCell = '';
+    /** @internal The cell of the physics grid it is in, packed (see Space). */
+    public int $physicsCell = 0;
 
     /** @internal Joins or leaves the scene's physics space, as radius and position in the tree say. */
     public function syncPhysics(): void
@@ -241,8 +242,8 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
 
     /** @internal Whether changes of the description are streamed to viewers (see World::descriptionChanged()). */
     public bool $published = false;
-    /** @internal */
-    public bool $publishQueued = false;
+    /** @internal Where its latest change waits in the world's publish queue, or -1. */
+    public int $publishSlot = -1;
 
     /**
      * The motion description as sent to browsers: [t0, x, y, z, vx, vy, vz, qx, qy, qz, qw, wx, wy, wz]. t0 is when it
