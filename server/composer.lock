@@ -66,11 +66,11 @@
         },
         {
             "name": "frodeborli/phame",
-            "version": "dev-main",
+            "version": "dev-master",
             "dist": {
                 "type": "path",
                 "url": "..",
-                "reference": "8949c3b681a96e957f69dc0b3f17aaa46bd64e6c"
+                "reference": "5fc706ebb092bb0b77ee39e60360fbf182c3c219"
             },
             "require": {
                 "ext-ffi": "*",
@@ -161,12 +161,12 @@
             "source": {
                 "type": "git",
                 "url": "https://github.com/phasync/phasync.git",
-                "reference": "b1425c7e92108b533bce821929ae5f980ae3c71f"
+                "reference": "4af5e345948c1adce652dfe7d0ced04a54f907b2"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/phasync/phasync/zipball/b1425c7e92108b533bce821929ae5f980ae3c71f",
-                "reference": "b1425c7e92108b533bce821929ae5f980ae3c71f",
+                "url": "https://api.github.com/repos/phasync/phasync/zipball/4af5e345948c1adce652dfe7d0ced04a54f907b2",
+                "reference": "4af5e345948c1adce652dfe7d0ced04a54f907b2",
                 "shasum": ""
             },
             "require": {
@@ -229,7 +229,7 @@
                 "issues": "https://github.com/phasync/phasync/issues",
                 "source": "https://github.com/phasync/phasync/tree/main"
             },
-            "time": "2026-10-15T15:03:03+00:00"
+            "time": "2026-10-15T16:32:28+00:00"
         },
         {
             "name": "phasync/swerve",
@@ -237,7 +237,7 @@
             "dist": {
                 "type": "path",
                 "url": "/home/frode/dev/swerve",
-                "reference": "2095885ab26a583fba23f195157050175e611b8b"
+                "reference": "a975edbfea72e0713ddb70eeb2f6a14ad80e439d"
             },
             "require": {
                 "ext-pcntl": "*",
