@@ -21,19 +21,19 @@ return new RequestHandler(function (ClientRequest $request) {
                 if (($message['type'] ?? '') === 'ping' && $epoch !== null) {
                     $ws->send(json_encode(['type' => 'pong', 'c' => $message['c'], 's' => microtime(true) - $epoch, 'w' => getmypid()]));
                 } elseif (($message['type'] ?? '') === 'drop') {
-                    Swerve::publish('phame:rocks:in', json_encode(['type' => 'drop', 'client' => $client]));
+                    Swerve::publishRaw('phame:rocks:in', json_encode(['type' => 'drop', 'client' => $client]));
                 } elseif (($message['type'] ?? '') === 'camera') {   // input: to the game, wherever it runs
-                    Swerve::publish('phame:rocks:in', json_encode(['type' => 'camera', 'client' => $client, 'p' => $message['p'], 'q' => $message['q']]));
+                    Swerve::publishRaw('phame:rocks:in', json_encode(['type' => 'camera', 'client' => $client, 'p' => $message['p'], 'q' => $message['q']]));
                 }
             });
             RocksGame::ensureRunning();
             $mine = Swerve::subscribe("phame:rocks:client:$client", heartbeat: 1.0);   // subscribe first: no history is kept
             $state = Swerve::subscribe('phame:rocks:out', heartbeat: 2.0);
-            Swerve::publish('phame:rocks:in', json_encode(['type' => 'join', 'client' => $client]));
+            Swerve::publishRaw('phame:rocks:in', json_encode(['type' => 'join', 'client' => $client]));
             try {
                 foreach ($mine as $snapshot) {
                     if ($snapshot === null) {   // a second without an answer: the game may be starting, or moving to another worker
-                        Swerve::publish('phame:rocks:in', json_encode(['type' => 'join', 'client' => $client]));
+                        Swerve::publishRaw('phame:rocks:in', json_encode(['type' => 'join', 'client' => $client]));
                         continue;
                     }
                     $part = json_decode($snapshot, true);
@@ -46,16 +46,21 @@ return new RequestHandler(function (ClientRequest $request) {
                 $spoke = microtime(true);
                 foreach ($state as $delta) {
                     if (microtime(true) - $spoke >= 2.0) {   // still here: the game drops viewers it stops hearing from
-                        Swerve::publish('phame:rocks:in', json_encode(['type' => 'alive', 'client' => $client]));
+                        Swerve::publishRaw('phame:rocks:in', json_encode(['type' => 'alive', 'client' => $client]));
                         $spoke = microtime(true);
                     }
-                    if ($delta !== null) {   // null: a heartbeat, two quiet seconds
+                    if ($delta === null) {   // a heartbeat: two quiet seconds
+                        continue;
+                    }
+                    if ($delta[0] === '{') {   // JSON (an add, a remove), or binary (a batch of descriptions)
                         $ws->send($delta);
+                    } else {
+                        $ws->sendBinary($delta);
                     }
                 }
             } finally {   // the tab is gone (swerve cancels this when the client leaves): its camera leaves the world
                 // shielded: a cancelled coroutine's waits throw at once, and publishing may have to wait
-                \phasync::shielded(fn () => Swerve::publish('phame:rocks:in', json_encode(['type' => 'leave', 'client' => $client])));
+                \phasync::shielded(fn () => Swerve::publishRaw('phame:rocks:in', json_encode(['type' => 'leave', 'client' => $client])));
             }
         });
         return;

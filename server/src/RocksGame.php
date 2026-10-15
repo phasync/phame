@@ -188,6 +188,8 @@ final class RocksGame
     public const MARBLES = 12;
     /** How late a contact can be published (phasync's timer resolution): the browsers' margin. */
     public const TICK = 0.01;
+    /** How long descriptions collect before they go out together: fewer, larger messages, for that much latency. */
+    public const BATCH = 0.01;
     private static ?self $instance = null;
     /** @var resource|null the lock that makes this worker the game's only owner */
     private static $lock = null;
@@ -197,6 +199,11 @@ final class RocksGame
     public readonly Scene3D $scene;
     /** @var array<int, Ball> */
     private array $rocks = [];
+    /** @var list<int|float> the descriptions of the batch being collected, flat: id, then describe()'s 14 values */
+    private array $batch = [];
+    private int $batched = 0;
+    /** Raised when a batch starts: the flusher sleeps on it while nothing changes. */
+    private object $batchStarted;
     /** @var array<string, Observer> by client */
     private array $observers = [];
     private float $started;
@@ -246,6 +253,7 @@ final class RocksGame
     private function __construct()
     {
         $this->started = microtime(true);
+        $this->batchStarted = new \stdClass();
         $this->world = new World();
         $this->scene = $this->world->stage->addChild(new Scene3D(100, 100));
         $s = self::SIZE;
@@ -312,7 +320,7 @@ final class RocksGame
                         case 'join':
                             $observer = $this->observers[$client] ??= $this->observe($client);
                             foreach ($this->snapshot($observer) as $part) {
-                                Swerve::publish('phame:rocks:client:' . $client, $part);
+                                Swerve::publishRaw('phame:rocks:client:' . $client, $part);
                             }
                             break;
                         case 'camera':
@@ -344,18 +352,57 @@ final class RocksGame
             // game time is real time since this moment: browsers sync to it through the epoch, so it must match the
             // world's clock exactly (setting the world up took time that the clock did not count)
             $this->started = microtime(true) - $world->clock->time;
-            // no ticks: sleep until the next contact (or until something changes), handle it, publish what changed
+            // what changed goes out in batches, BATCH seconds after the first change of each: idle, nothing wakes
+            $world->go(function () {
+                while (true) {
+                    \phasync::awaitFlag($this->batchStarted);
+                    \phasync::sleep(self::BATCH);
+                    $this->flush();
+                }
+            });
+            // no ticks: sleep until the next contact (or until something changes), handle it, queue what changed
             $world->runEvented(function (World $world) {
                 $changed = $world->takeChangedDescriptions();
-                if ($changed !== []) {
-                    $bodies = [];
-                    foreach ($changed as $node) {
-                        $bodies[] = [spl_object_id($node), ...$node->describe()];
-                    }
-                    Swerve::publish('phame:rocks:out', json_encode(['type' => 'delta', 't' => $world->clock->time, 'bodies' => $bodies]));
+                if ($changed === []) {
+                    return;
+                }
+                if ($this->batched === 0) {
+                    \phasync::raiseFlag($this->batchStarted);
+                }
+                foreach ($changed as $node) {
+                    array_push($this->batch, spl_object_id($node), ...$node->describe());
+                    ++$this->batched;
+                }
+                if ($this->batched >= 2000) {   // a message is at most 128 KiB: 64 bytes each
+                    $this->flush();
                 }
             });
         });
+    }
+
+    /**
+     * Sends the batch: one binary message, a type byte (1) and the game time, then 64 bytes per description: the
+     * body's id (uint32), the time it starts (float64), and position, velocity, orientation and spin (13 float32s),
+     * all little-endian. The browser reads it with a DataView, nothing to parse.
+     */
+    private function flush(): void
+    {
+        if ($this->batched === 0) {
+            return;
+        }
+        Swerve::publishRaw('phame:rocks:out', pack('Ce' . str_repeat('Veg13', $this->batched), 1, $this->world->clock->time, ...$this->batch));
+        $this->batch = [];
+        $this->batched = 0;
+    }
+
+    /**
+     * A JSON message to every viewer (an add, a remove), after the batch so far: a description must not arrive after
+     * its body was removed, and land on a new body that got the same id.
+     */
+    private function announce(array $message): void
+    {
+        $this->flush();
+        Swerve::publishRaw('phame:rocks:out', json_encode($message));
     }
 
     /** A viewer drops a boulder: from just in front of their camera, the way it looks, gone again after 10 seconds. */
@@ -375,13 +422,13 @@ final class RocksGame
         $this->scene->root->addChild($boulder);
         $id = spl_object_id($boulder);
         $this->rocks[$id] = $boulder;
-        Swerve::publish('phame:rocks:out', json_encode(['type' => 'add', 'body' => [$id, $boulder->radius, $boulder->color, 3, ...$boulder->describe()]]));
+        $this->announce(['type' => 'add', 'body' => [$id, $boulder->radius, $boulder->color, 3, ...$boulder->describe()]]);
         $this->world->go(function () use ($boulder, $id) {
             \phasync::sleep(10.0);
             $this->scene->root->removeChild($boulder);
             unset($this->rocks[$id]);
             --$boulder->by->boulders;
-            Swerve::publish('phame:rocks:out', json_encode(['type' => 'remove', 'id' => $id]));
+            $this->announce(['type' => 'remove', 'id' => $id]);
         });
     }
 
@@ -393,7 +440,7 @@ final class RocksGame
         $observer = $this->observers[$client];
         unset($this->observers[$client]);
         $this->scene->root->removeChild($observer);
-        Swerve::publish('phame:rocks:out', json_encode(['type' => 'remove', 'id' => spl_object_id($observer)]));
+        $this->announce(['type' => 'remove', 'id' => spl_object_id($observer)]);
         error_log("phame rocks (worker " . getmypid() . "): viewer $client $why, " . count($this->observers) . ' watching');
     }
 
@@ -406,7 +453,7 @@ final class RocksGame
         $observer->published = true;
         $this->scene->root->addChild($observer);
         error_log("phame rocks (worker " . getmypid() . "): viewer $client joined, " . (count($this->observers) + 1) . ' watching');
-        Swerve::publish('phame:rocks:out', json_encode(['type' => 'add', 'body' => [spl_object_id($observer), 4.0, $observer->color, 2, ...$observer->describe()]]));
+        $this->announce(['type' => 'add', 'body' => [spl_object_id($observer), 4.0, $observer->color, 2, ...$observer->describe()]]);
         return $observer;
     }
 
@@ -433,7 +480,7 @@ final class RocksGame
             }
             $parts[] = json_encode([
                 'type' => 'snapshot', 'part' => $i, 'parts' => count($chunks), 't' => $this->world->clock->time,
-                'epoch' => $this->started, 'tick' => self::TICK, 'size' => self::SIZE, 'bodies' => $bodies,
+                'epoch' => $this->started, 'tick' => self::TICK + self::BATCH, 'size' => self::SIZE, 'bodies' => $bodies,
             ] + ($i === 0 ? [   // how things look, written in PHP: the browser compiles it, games write no JavaScript
                 'you' => spl_object_id($you),
                 'environment' => $this->scene->environment,

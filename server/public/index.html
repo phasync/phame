@@ -208,6 +208,7 @@ const kindOf = new Map();
 let snapshotTime = -Infinity, size = 30, timeBase = 0;
 function writeBody(id, d, radius, color, kind) {
   if (kind !== undefined) kindOf.set(id, kind);
+  else if (!kindOf.has(id)) return;   // a description of a body this view does not have (yet, or any more)
   const k = materials[kindOf.get(id) ?? 0]?.batch;
   if (!k) return;
   let i = k.index.get(id);
@@ -249,10 +250,12 @@ const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.hos
 let ws, bytes = 0, lastStats = performance.now(), bps = 0, updates = 0, ups = 0;
 function connect() {
   ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
   ws.onopen = () => { hud.textContent = 'Joining…'; ping(); };
   clearInterval(window.pinger); window.pinger = setInterval(ping, 1000);
   ws.onclose = () => { hud.textContent = 'Disconnected. Reconnecting…'; setTimeout(connect, 1500); };
   ws.onmessage = (e) => {
+    if (typeof e.data !== 'string') { bytes += e.data.byteLength; descriptions(new DataView(e.data)); return; }
     bytes += e.data.length;
     const m = JSON.parse(e.data);
     if (m.type === 'pong') {
@@ -273,16 +276,22 @@ function connect() {
       writeBody(m.body[0], m.body.slice(4), m.body[1], m.body[2], m.body[3]);
     } else if (m.type === 'remove') {
       removeBody(m.id);
-    } else if (m.type === 'delta' && m.t > snapshotTime) {
-      // how late did this arrive? if its moment is already on screen, the old path was drawn past it
-      const shown = serverNow() - delay;
-      for (const b of m.bodies) {
-        const late = shown - b[1];   // b[1] is the description's t0: the moment it takes effect
-        if (late > 0) { lateCount++; lateNow = Math.max(lateNow, late); }
-        pending.push(b); updates++;
-      }
     }
   };
+}
+// a batch of descriptions, binary: a type byte (1) and the game time (float64), then 64 bytes each: id (uint32), the
+// moment it starts (float64), position, velocity, orientation and spin (13 float32s), little-endian
+function descriptions(v) {
+  if (v.getUint8(0) !== 1 || v.getFloat64(1, true) <= snapshotTime) return;
+  const shown = serverNow() - delay;
+  for (let o = 9; o + 64 <= v.byteLength; o += 64) {
+    const b = [v.getUint32(o, true), v.getFloat64(o + 4, true)];
+    for (let k = 0; k < 13; k++) b.push(v.getFloat32(o + 12 + 4 * k, true));
+    // how late did this arrive? if its moment is already on screen, the old path was drawn past it
+    const late = shown - b[1];
+    if (late > 0) { lateCount++; lateNow = Math.max(lateNow, late); }
+    pending.push(b); updates++;
+  }
 }
 function ping() { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'ping', c: performance.now() / 1000 })); }
 connect();
