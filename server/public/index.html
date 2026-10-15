@@ -18,7 +18,7 @@
 <body>
 <canvas id="c"></canvas>
 <div id="hud">Connecting…</div>
-<div id="help">drag to orbit · wheel to zoom · space or double-click to throw a ragdoll</div>
+<div id="help">drag to orbit · wheel or pinch to zoom · double-click, double-tap or space to throw a ragdoll</div>
 <script>
 'use strict';
 // The Phame browser client: the same for every game. The game, in PHP, sends what exists (motion descriptions) and
@@ -430,12 +430,43 @@ connect();
 // ---------- camera
 let yaw = Math.random() * 2 * Math.PI, pitch = 0.32,   // a random side, so two new tabs do not sit inside each other
     distance = 150, drag = null;
-canvas.addEventListener('pointerdown', e => { drag = [e.clientX, e.clientY]; canvas.setPointerCapture(e.pointerId); });
-canvas.addEventListener('pointermove', e => { if (!drag) return; yaw -= (e.clientX - drag[0]) * 0.005; pitch = Math.max(-1.45, Math.min(1.45, pitch + (e.clientY - drag[1]) * 0.005)); drag = [e.clientX, e.clientY]; });
-canvas.addEventListener('pointerup', () => { drag = null; });
+// one pointer orbits, two pinch to zoom; a touch screen double-taps to throw (it gets no dblclick: touch-action is
+// none, so that the page does not zoom instead)
+const pointers = new Map();
+let pinch = null, lastTap = null;
+canvas.addEventListener('pointerdown', e => {
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, t0: performance.now() });
+  canvas.setPointerCapture(e.pointerId);
+  drag = pointers.size === 1 ? [e.clientX, e.clientY] : null;
+  pinch = null;
+});
+canvas.addEventListener('pointermove', e => {
+  const p = pointers.get(e.pointerId);
+  if (!p) return;
+  p.x = e.clientX; p.y = e.clientY;
+  if (pointers.size === 2) {
+    const [a, b] = [...pointers.values()], span = Math.hypot(a.x - b.x, a.y - b.y);
+    if (pinch) distance = Math.max(25, Math.min(450, distance * pinch / span));
+    pinch = span;
+  } else if (drag) {
+    yaw -= (e.clientX - drag[0]) * 0.005; pitch = Math.max(-1.45, Math.min(1.45, pitch + (e.clientY - drag[1]) * 0.005)); drag = [e.clientX, e.clientY];
+  }
+});
+function pointerEnd(e) {
+  const p = pointers.get(e.pointerId);
+  pointers.delete(e.pointerId);
+  drag = null; pinch = null;
+  if (!p || e.pointerType === 'mouse' || e.type === 'pointercancel') return;
+  const now = performance.now();
+  if (now - p.t0 > 300 || Math.hypot(e.clientX - p.x0, e.clientY - p.y0) > 12) { lastTap = null; return; }   // a drag, not a tap
+  if (lastTap && now - lastTap.t < 350 && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 40) { lastTap = null; drop(); return; }
+  lastTap = { t: now, x: e.clientX, y: e.clientY };
+}
+canvas.addEventListener('pointerup', pointerEnd);
+canvas.addEventListener('pointercancel', pointerEnd);
 // dropping a ball is input like the camera: the game decides where it starts and how it flies
 function drop() { if (ws && ws.readyState === 1 && you !== null) ws.send(JSON.stringify({ type: 'drop' })); }
-canvas.addEventListener('dblclick', drop);
+canvas.addEventListener('dblclick', drop);   // a mouse; touch double-taps above
 addEventListener('keydown', e => { if (e.code === 'Space' && !e.repeat) { e.preventDefault(); drop(); } });
 canvas.addEventListener('wheel', e => { e.preventDefault(); distance = Math.max(25, Math.min(450, distance * Math.exp(e.deltaY * 0.001))); }, { passive: false });
 
