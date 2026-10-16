@@ -76,7 +76,7 @@ final class SolarGame
                         continue;
                     }
                     $client = (string) ($request['client'] ?? '');
-                    Swerve::publishRaw('phame:solar:client:' . $client, json_encode(['v' => 1, 'type' => 'epoch', 'epoch' => $this->started]));
+                    Swerve::publishRaw('phame:solar:client:' . $client, json_encode(['v' => View::PROTOCOL_VERSION, 'type' => 'epoch', 'epoch' => $this->started]));
                     $this->view->join('phame:solar:client:' . $client);
                 }
             });

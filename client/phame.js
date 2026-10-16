@@ -28,7 +28,7 @@
 // simpler than asking every game page to carry that import-map boilerplate just for this.
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.module.js';
 
-const PROTOCOL_VERSION = 1;
+const PROTOCOL_VERSION = 2;
 const KIND_PLAIN = 0, KIND_MESH = 1, KIND_LIGHT = 2, KIND_LABEL = 3;
 
 // ---------- GLSL: the browser's equivalent of Phame\Rendering\MeshShader's contract (src/Rendering/MeshShader.php).
@@ -310,8 +310,8 @@ export function connect(url, opts = {}) {
       if (node.group) { node.group.free(node.slot); node.group = null; }
       assignToGroup(node, materialId, geometryId);
     } else if (kind === KIND_LIGHT) {
-      const [color, intensity, range, ...desc] = rest;
-      node.desc = desc; node.lightColor = colorToRgb(color); node.intensity = intensity; node.range = range;
+      const [color, intensity, range, lightRadius, ...desc] = rest;
+      node.desc = desc; node.lightColor = colorToRgb(color); node.intensity = intensity; node.range = range; node.lightRadius = lightRadius;
       if (!lights.has(id)) lights.set(id, node);
     } else if (kind === KIND_LABEL) {
       const [text, color, ...desc] = rest;
@@ -407,7 +407,15 @@ export function connect(url, opts = {}) {
     for (const rec of m.nodes) applyNodeRecord(rec);
     if ((m.part ?? 0) === (m.parts ?? 1) - 1) { emit('snapshot'); }
   }
-  function applyAdd(m) { for (const rec of m.nodes) { const n = applyNodeRecord(rec); emit('add', n); } }
+  // An add is not part/parts-numbered like a snapshot (see docs/REMOTE-VIEW.md): a subtree too big for one message
+  // arrives as several independent add messages, each already self-contained (any geometry/material a node in it
+  // needs - a thrown ragdoll's limbs bringing their own the first time this channel has seen them - travels in the
+  // same message, before the nodes that reference it), so each is applied as it arrives, nothing is buffered.
+  function applyAdd(m) {
+    if (m.geometries) for (const g of m.geometries) ensureGeometry(g);
+    if (m.materials) for (const mt of m.materials) ensureMaterial(mt);
+    for (const rec of m.nodes) { const n = applyNodeRecord(rec); emit('add', n); }
+  }
   function applyRemove(m) { for (const id of m.ids) { emit('remove', id); removeNode(id); } }
   function applyBatch(v) {
     if (v.getUint8(0) !== PROTOCOL_VERSION) { console.error('[phame] protocol version mismatch, refusing to render'); return; }
