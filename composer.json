@@ -1,6 +1,6 @@
 {
     "name": "frodeborli/phame",
-    "description": "Phame: a Starling-style 2D engine for PHP. OpenGL through FFI, game logic in phasync coroutines.",
+    "description": "An experiment: an event-driven game engine in PHP (scene graph, exact physics, remote views), built to stress-test phasync and Swerve.",
     "type": "library",
     "license": "MIT",
     "authors": [{"name": "Frode Børli", "email": "frode@ennerd.com"}],
