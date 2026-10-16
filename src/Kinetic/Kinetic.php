@@ -21,6 +21,10 @@ final class Kinetic
     public static float $vx = 0.0;
     public static float $vy = 0.0;
     public static float $vz = 0.0;
+    /** World acceleration of the reference point (the body's own, plus any Node3D::$gravity it sits under). */
+    public static float $ax = 0.0;
+    public static float $ay = 0.0;
+    public static float $az = 0.0;
     /**
      * How long the straight line in the fields stays within the box: INF for exact linear motion, a short window for
      * bodies on rotating parents (their paths are arcs: the box is grown to hold the arc for that long).
@@ -56,13 +60,13 @@ final class Kinetic
     public static function state(Body $body): void
     {
         if (self::$pass >= 0 && $body->kineticPass === self::$pass) {
-            [self::$x0, self::$y0, self::$z0, self::$x1, self::$y1, self::$z1, self::$vx, self::$vy, self::$vz, self::$horizon] = $body->kineticCache;
+            [self::$x0, self::$y0, self::$z0, self::$x1, self::$y1, self::$z1, self::$vx, self::$vy, self::$vz, self::$horizon, self::$ax, self::$ay, self::$az] = $body->kineticCache;
             return;
         }
         $body->kineticState();
         if (self::$pass >= 0) {
             $body->kineticPass = self::$pass;
-            $body->kineticCache ??= [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];   // written in place from here on
+            $body->kineticCache ??= [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];   // written in place from here on
             $body->kineticCache[0] = self::$x0;
             $body->kineticCache[1] = self::$y0;
             $body->kineticCache[2] = self::$z0;
@@ -73,6 +77,9 @@ final class Kinetic
             $body->kineticCache[7] = self::$vy;
             $body->kineticCache[8] = self::$vz;
             $body->kineticCache[9] = self::$horizon;
+            $body->kineticCache[10] = self::$ax;
+            $body->kineticCache[11] = self::$ay;
+            $body->kineticCache[12] = self::$az;
         }
     }
 

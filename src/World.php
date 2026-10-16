@@ -89,6 +89,9 @@ final class World
     private array $heapWaiter = [];
     private array $heapGeneration = [];
     private int $heapCount = 0;
+    /** @var list<?\Phame\Scene\Node3D> Node3D::$validUntil expiry, a binary min-heap by Node3D::$expirySlot (as Physics\Space's physics heap). */
+    private array $expireHeap = [];
+    private int $expireCount = 0;
     private \Closure $guarded;
     private \Closure $ownerLoop;
     private bool $started = false;
@@ -210,6 +213,9 @@ final class World
             return $now;
         }
         $next = $this->heapCount > 0 ? $this->heapTime[0] : INF;
+        if ($this->expireCount > 0) {
+            $next = min($next, $this->expireHeap[0]->validUntil);
+        }
         foreach ($this->spaces as $space) {
             $next = min($next, $space->nextTime());
         }
@@ -383,6 +389,12 @@ final class World
                     $this->schedule($waiter);
                 }
             }
+        }
+        while ($this->expireCount > 0 && $this->expireHeap[0]->validUntil <= $now) {
+            $node = $this->expireHeap[0];
+            $this->cancelExpiry($node);
+            $node->validUntil = \INF;   // holds indefinitely again until a handler sets a new one
+            $node->dispatchEvent(new Event(Event::EXPIRE));
         }
     }
 
@@ -707,6 +719,86 @@ final class World
         $this->heapGeneration[$i] = $generation;
     }
 
+    /**
+     * @internal Node3D::$validUntil changed: reschedules the node in the expiry heap (by Node3D::$expirySlot, as
+     * Physics\Space::schedule() does for its own heap), or takes it out if the new value is INF.
+     */
+    public function expiryChanged(\Phame\Scene\Node3D $node): void
+    {
+        if ($node->validUntil === \INF) {
+            $this->cancelExpiry($node);
+            return;
+        }
+        $this->notifyEvent($node->validUntil);
+        if ($node->expirySlot < 0) {
+            $node->expirySlot = $this->expireCount;
+            $this->expireHeap[$this->expireCount++] = $node;
+        }
+        $this->expireSiftUp($node->expirySlot);
+        $this->expireSiftDown($node->expirySlot);
+    }
+
+    /** @internal Takes the node out of the expiry heap: it left the world, or its validUntil no longer matters. */
+    public function cancelExpiry(\Phame\Scene\Node3D $node): void
+    {
+        $i = $node->expirySlot;
+        if ($i < 0) {
+            return;
+        }
+        $node->expirySlot = -1;
+        $last = $this->expireHeap[--$this->expireCount];
+        $this->expireHeap[$this->expireCount] = null;
+        if ($last !== $node) {
+            $this->expireHeap[$i] = $last;
+            $last->expirySlot = $i;
+            $this->expireSiftUp($i);
+            $this->expireSiftDown($last->expirySlot);
+        }
+    }
+
+    private function expireSiftUp(int $i): void
+    {
+        $node = $this->expireHeap[$i];
+        $at = $node->validUntil;
+        while ($i > 0) {
+            $p = ($i - 1) >> 1;
+            $q = $this->expireHeap[$p];
+            if ($q->validUntil <= $at) {
+                break;
+            }
+            $this->expireHeap[$i] = $q;
+            $q->expirySlot = $i;
+            $i = $p;
+        }
+        $this->expireHeap[$i] = $node;
+        $node->expirySlot = $i;
+    }
+
+    private function expireSiftDown(int $i): void
+    {
+        $node = $this->expireHeap[$i];
+        $at = $node->validUntil;
+        $n = $this->expireCount;
+        while (true) {
+            $c = 2 * $i + 1;
+            if ($c >= $n) {
+                break;
+            }
+            if ($c + 1 < $n && $this->expireHeap[$c + 1]->validUntil < $this->expireHeap[$c]->validUntil) {
+                ++$c;
+            }
+            $q = $this->expireHeap[$c];
+            if ($q->validUntil >= $at) {
+                break;
+            }
+            $this->expireHeap[$i] = $q;
+            $q->expirySlot = $i;
+            $i = $c;
+        }
+        $this->expireHeap[$i] = $node;
+        $node->expirySlot = $i;
+    }
+
     /** A process-wide counter, so that cached boxes of different worlds never share a stamp. */
     private static int $checkPhase = 0;
 
@@ -758,7 +850,9 @@ final class World
         if (count($params) < 2) {
             throw new \InvalidArgumentException('A collision handler takes two typed bodies and the Contact');
         }
-        if ($r->getClosureThis() === null && !$r->isStatic()) {
+        if ($r->getClosureScopeClass() === null) {
+            // only a closure with no class of its own (one written free, outside any method) is bound to the world:
+            // one declared in a static method, say, keeps its own scope, so its self:: still resolves there
             $handler = \Closure::bind($handler, $this, self::class);
         }
         $this->handlers[] = [$type(0), $type(1), $handler, count($params) >= 4];

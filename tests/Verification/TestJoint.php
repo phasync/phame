@@ -19,8 +19,9 @@ final class TestJoint extends Node3D
         public readonly float $ax,
         public readonly float $ay,
         public readonly float $az,
-        public readonly float $min,
-        public readonly float $max,
+        // named limitMin/limitMax, not min/max: Node3D now has its own $max (the x of its acceleration, see setAcceleration())
+        public readonly float $limitMin,
+        public readonly float $limitMax,
         public readonly float $bounce = 0.0,
     ) {
     }
@@ -33,8 +34,8 @@ final class TestJoint extends Node3D
     /** Turns at this rate (rad/s) from now; at a limit it can only turn back. */
     public function setRate(float $rate): void
     {
-        $angle = max($this->min, min($this->max, $this->angleNow()));
-        if (($angle >= $this->max && $rate > 0.0) || ($angle <= $this->min && $rate < 0.0)) {
+        $angle = max($this->limitMin, min($this->limitMax, $this->angleNow()));
+        if (($angle >= $this->limitMax && $rate > 0.0) || ($angle <= $this->limitMin && $rate < 0.0)) {
             $rate = 0.0;
         }
         [$this->angle, $this->since, $this->rate] = [$angle, $this->clock->time, $rate];
@@ -49,7 +50,7 @@ final class TestJoint extends Node3D
         if ($this->rate === 0.0) {
             return INF;
         }
-        return max(0.0, (($this->rate > 0.0 ? $this->max : $this->min) - $this->angleNow()) / $this->rate);
+        return max(0.0, (($this->rate > 0.0 ? $this->limitMax : $this->limitMin) - $this->angleNow()) / $this->rate);
     }
 
     /** At a limit: turns back with $bounce of its speed, or stops when that is too slow to matter. */

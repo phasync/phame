@@ -16,10 +16,17 @@ use Phame\World;
  */
 final class Harness
 {
+    /** A sanity cap on contacts in one run: past this, something (almost certainly an engine regression, not a real scene) is re-triggering the same contact forever, and the test should fail cleanly instead of hanging. */
+    private const MAX_EVENTS = 5000;
+
     /**
+     * $afterBuild (Phase 1): runs right after the scene is built, e.g. to put an accelerated body's own acceleration
+     * on the scene root instead - the metamorphic "gravity on an ancestor" check needs a scene the plain per-body
+     * spec does not describe, built from a spec with that body's own acceleration zeroed instead.
+     *
      * @return array{events: list<array{time: float, kind: string, a: string, b: string}>, samples: list<array{0: float, 1: array<string, array{0: float, 1: float, 2: float}>}>}
      */
-    public static function run(SceneSpec $spec, float $until, float $sampleEvery): array
+    public static function run(SceneSpec $spec, float $until, float $sampleEvery, ?\Closure $afterBuild = null): array
     {
         $world = new World();
         $scene = $world->stage->addChild(new Scene3D(100, 100));
@@ -30,12 +37,16 @@ final class Harness
         $scene->worldMaxY = $spec->maxY;
         $scene->worldMaxZ = $spec->maxZ;
         $built = EngineBuilder::build($spec, $world, $scene);
+        $afterBuild?->__invoke($scene, $built);
         $id = self::idMap($built['bodies'], $built['nodes']);
 
         $events = [];
         // the engine applies nothing itself (see Physics\Contact): these handlers are the "game", matching exactly
         // the response rules Oracle\Oracle::apply() uses, so the two trajectories can be compared at all
         $world->onCollision(function (Node3D $a, Node3D $b, Contact $c) use (&$events, $id) {
+            if (count($events) >= self::MAX_EVENTS) {
+                throw new \RuntimeException('more than ' . self::MAX_EVENTS . ' contacts: likely the same one re-triggering forever, not a real scene');
+            }
             $events[] = ['time' => $c->time, 'kind' => $c->tether ? 'tether' : 'pair', 'a' => $id[spl_object_id($a)], 'b' => $id[spl_object_id($b)]];
             if ($a->physicsCompound !== null || $b->physicsCompound !== null) {
                 [$free, $part, $sign] = $a->physicsCompound !== null ? [$b, $a, -1.0] : [$a, $b, 1.0];
@@ -54,6 +65,9 @@ final class Harness
             $b->setVelocity($b->velocityX + $kb * $c->nx, $b->velocityY + $kb * $c->ny, $b->velocityZ + $kb * $c->nz);
         });
         $world->onCollision(function (Node3D $rock, Wall $wall, Contact $c) use (&$events, $id) {
+            if (count($events) >= self::MAX_EVENTS) {
+                throw new \RuntimeException('more than ' . self::MAX_EVENTS . ' contacts: likely the same one re-triggering forever, not a real scene');
+            }
             $events[] = ['time' => $c->time, 'kind' => 'wall', 'a' => $id[spl_object_id($rock)], 'b' => 'wall' . $wall->axis . ($wall->side > 0 ? '+' : '-')];
             match ($wall->axis) {
                 0 => $rock->velocityX = -$rock->velocityX,

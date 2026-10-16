@@ -69,8 +69,9 @@ $mutants = [
         'replace' => 'foreach ([] as [$b, $length]) {',
     ],
     'change a PROBE_TOLERANCE comparison from <= to <: a part contact right at the tolerance boundary is missed' => [
-        'search' => '/if \(\$gap <= self::PROBE_TOLERANCE \|\| \$gap > 2\.0 \* self::PROBE_TOLERANCE \|\| !\$this->closing\(\$body\)\) \{/',
-        'replace' => 'if ($gap < self::PROBE_TOLERANCE || $gap > 2.0 * self::PROBE_TOLERANCE || !$this->closing($body)) {',
+        'search' => '/\$gap <= self::PROBE_TOLERANCE \|\| \$gap > 2\.0 \* self::PROBE_TOLERANCE \|\| !\$this->closing\(\$body\)/',
+        'replace' => '$gap < self::PROBE_TOLERANCE || $gap > 2.0 * self::PROBE_TOLERANCE || !$this->closing($body)',
+        'limit' => 1,
     ],
     'skip the cell-crossing rescan: a body that crosses into a new cell never looks for neighbours there' => [
         'search' => '/foreach \(\$this->cells\[\$new \+ \(\$o\[0\] << 42\) \+ \(\$o\[1\] << 21\) \+ \$o\[2\]\] \?\? \[\] as \$b\) \{/',
@@ -80,6 +81,10 @@ $mutants = [
         'search' => '/\$age = \$now - \$a->mt;/',
         'replace' => '$age = 0.0;',
         'limit' => 1,
+    ],
+    'aim the compound probe step at the edge of the contact zone instead of its middle: a head-on approach with an exact speed bound lands on PROBE_TOLERANCE and is missed' => [
+        'search' => '/1\.5 \* self::PROBE_TOLERANCE - \$g/',
+        'replace' => 'self::PROBE_TOLERANCE - $g',
     ],
 ];
 

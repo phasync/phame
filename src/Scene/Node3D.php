@@ -31,10 +31,37 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
     public private(set) float $mvx = 0.0;
     public private(set) float $mvy = 0.0;
     public private(set) float $mvz = 0.0;
+    /** Constant acceleration in the parent's space, from $mt on. */
+    public private(set) float $accX = 0.0;
+    public private(set) float $accY = 0.0;
+    public private(set) float $accZ = 0.0;
     /** Angular velocity in the parent's space: the axis is its direction, the speed (rad/s) its length. */
     public private(set) float $mwx = 0.0;
     public private(set) float $mwy = 0.0;
     public private(set) float $mwz = 0.0;
+    /**
+     * A uniform acceleration field in this node's space, inherited by every descendant (not by this node itself) at
+     * no per-body cost: set gravity once on an ancestor (the scene root, say) instead of calling setAcceleration()
+     * on each body. See Physics\Space and Kinetic\Kinetic::$ax for where it is picked up.
+     */
+    public float $gravityX = 0.0 { set { $this->gravityX = $value; $this->gravityChanged(); } }
+    public float $gravityY = 0.0 { set { $this->gravityY = $value; $this->gravityChanged(); } }
+    public float $gravityZ = 0.0 { set { $this->gravityZ = $value; $this->gravityChanged(); } }
+    /**
+     * Game time until which this description holds by itself. Reaching it dispatches Event::EXPIRE on the node (see
+     * World::expiryChanged()) so a handler can refit it, then resets to INF. Local: nothing an ancestor does changes
+     * it.
+     */
+    public float $validUntil = INF {
+        set {
+            $this->validUntil = $value;
+            if ($this->clock !== null) {
+                $this->world()->expiryChanged($this);
+            }
+        }
+    }
+    /** @internal Its place in the world's expiry heap, or -1. */
+    public int $expirySlot = -1;
     /** @internal The clock of the world the node is in, for reading the description. */
     public ?\Phame\Clock $clock = null;
     /** @internal The Scene3D whose root this node is. */
@@ -95,11 +122,31 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
             $space?->add($this);
         }
     }
+
+    /**
+     * The field changed: every body already predicted under the old one needs to predict again (Physics\Space's
+     * bodies are its scene root's direct children, so this does nothing unless $this is that root).
+     */
+    private function gravityChanged(): void
+    {
+        if ($this->scene !== null && $this->clock !== null) {
+            $this->world()->physics($this->scene)->refresh();
+        }
+    }
     private float $localTime = -1.0;
 
-    public float $x { get => $this->mvx == 0.0 ? $this->mx : $this->mx + $this->mvx * $this->age(); set { $this->rebase(); $this->mx = $value; $this->edited(); } }
-    public float $y { get => $this->mvy == 0.0 ? $this->my : $this->my + $this->mvy * $this->age(); set { $this->rebase(); $this->my = $value; $this->edited(); } }
-    public float $z { get => $this->mvz == 0.0 ? $this->mz : $this->mz + $this->mvz * $this->age(); set { $this->rebase(); $this->mz = $value; $this->edited(); } }
+    public float $x {
+        get { $a = $this->accX + $this->gravityAX(); return $this->mvx == 0.0 && $a == 0.0 ? $this->mx : $this->mx + ($this->mvx + 0.5 * $a * $this->age()) * $this->age(); }
+        set { $this->rebase(); $this->mx = $value; $this->edited(); }
+    }
+    public float $y {
+        get { $a = $this->accY + $this->gravityAY(); return $this->mvy == 0.0 && $a == 0.0 ? $this->my : $this->my + ($this->mvy + 0.5 * $a * $this->age()) * $this->age(); }
+        set { $this->rebase(); $this->my = $value; $this->edited(); }
+    }
+    public float $z {
+        get { $a = $this->accZ + $this->gravityAZ(); return $this->mvz == 0.0 && $a == 0.0 ? $this->mz : $this->mz + ($this->mvz + 0.5 * $a * $this->age()) * $this->age(); }
+        set { $this->rebase(); $this->mz = $value; $this->edited(); }
+    }
     /**
      * Euler angles (radians, applied to a point in the order z, x, y): a view of the orientation, which is a
      * quaternion. Setting one turns the node (the others are kept, its spin goes on).
@@ -187,9 +234,14 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
     }
 
     /** Units per second of game time, in the parent's space. */
-    public float $velocityX { get => $this->mvx; set { $this->rebase(); $this->mvx = $value; $this->edited(); } }
-    public float $velocityY { get => $this->mvy; set { $this->rebase(); $this->mvy = $value; $this->edited(); } }
-    public float $velocityZ { get => $this->mvz; set { $this->rebase(); $this->mvz = $value; $this->edited(); } }
+    public float $velocityX { get { $a = $this->accX + $this->gravityAX(); return $a == 0.0 ? $this->mvx : $this->mvx + $a * $this->age(); } set { $this->rebase(); $this->mvx = $value; $this->edited(); } }
+    public float $velocityY { get { $a = $this->accY + $this->gravityAY(); return $a == 0.0 ? $this->mvy : $this->mvy + $a * $this->age(); } set { $this->rebase(); $this->mvy = $value; $this->edited(); } }
+    public float $velocityZ { get { $a = $this->accZ + $this->gravityAZ(); return $a == 0.0 ? $this->mvz : $this->mvz + $a * $this->age(); } set { $this->rebase(); $this->mvz = $value; $this->edited(); } }
+
+    /** Units per second squared of game time, in the parent's space. Does not include the inherited Node3D::$gravity. */
+    public float $accelerationX { get => $this->accX; set { $this->rebase(); $this->accX = $value; $this->edited(); } }
+    public float $accelerationY { get => $this->accY; set { $this->rebase(); $this->accY = $value; $this->edited(); } }
+    public float $accelerationZ { get => $this->accZ; set { $this->rebase(); $this->accZ = $value; $this->edited(); } }
 
     /** Teleports: puts the node at the point and stops it there. */
     public function moveTo(float $x, float $y, float $z): void
@@ -199,6 +251,7 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
         $this->my = $y;
         $this->mz = $z;
         $this->mvx = $this->mvy = $this->mvz = 0.0;
+        $this->accX = $this->accY = $this->accZ = 0.0;
         $this->edited();
     }
 
@@ -209,6 +262,16 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
         $this->mvx = $vx;
         $this->mvy = $vy;
         $this->mvz = $vz;
+        $this->edited();
+    }
+
+    /** Constant acceleration from now on, in units per second squared (the parent's space). */
+    public function setAcceleration(float $ax, float $ay, float $az): void
+    {
+        $this->rebase();
+        $this->accX = $ax;
+        $this->accY = $ay;
+        $this->accZ = $az;
         $this->edited();
     }
 
@@ -226,7 +289,9 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
     }
 
     public bool $isMoving {
-        get => $this->mvx != 0.0 || $this->mvy != 0.0 || $this->mvz != 0.0 || $this->mwx != 0.0 || $this->mwy != 0.0 || $this->mwz != 0.0;
+        get => $this->mvx != 0.0 || $this->mvy != 0.0 || $this->mvz != 0.0 || $this->mwx != 0.0 || $this->mwy != 0.0 || $this->mwz != 0.0
+            || $this->accX != 0.0 || $this->accY != 0.0 || $this->accZ != 0.0
+            || $this->gravityAX() != 0.0 || $this->gravityAY() != 0.0 || $this->gravityAZ() != 0.0;
     }
 
     private function age(): float
@@ -234,14 +299,41 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
         return ($this->clock?->time ?? 0.0) - $this->mt;
     }
 
+    /**
+     * The parent's Node3D::$gravity, in this node's parent's space (the same space $accX/$accY/$accZ are in): the one
+     * ancestor Physics\Space itself needs, since every body there is a direct child of the scene's root.
+     */
+    private function gravityAX(): float
+    {
+        return $this->parent?->gravityX ?? 0.0;
+    }
+
+    private function gravityAY(): float
+    {
+        return $this->parent?->gravityY ?? 0.0;
+    }
+
+    private function gravityAZ(): float
+    {
+        return $this->parent?->gravityZ ?? 0.0;
+    }
+
     private function rebase(): void
     {
         $t = $this->clock?->time ?? 0.0;
         if ($t != $this->mt) {
             $dt = $t - $this->mt;
-            $this->mx += $this->mvx * $dt;
-            $this->my += $this->mvy * $dt;
-            $this->mz += $this->mvz * $dt;
+            // the inherited field (see Node3D::$gravity) is baked into mvx/mvy/mvz here, same as the node's own
+            // acceleration always was: from the new $mt on, age() starts at 0 again, so nothing is added twice
+            $ax = $this->accX + $this->gravityAX();
+            $ay = $this->accY + $this->gravityAY();
+            $az = $this->accZ + $this->gravityAZ();
+            $this->mx += ($this->mvx + 0.5 * $ax * $dt) * $dt;
+            $this->my += ($this->mvy + 0.5 * $ay * $dt) * $dt;
+            $this->mz += ($this->mvz + 0.5 * $az * $dt) * $dt;
+            $this->mvx += $ax * $dt;
+            $this->mvy += $ay * $dt;
+            $this->mvz += $az * $dt;
             if ($this->mwx != 0.0 || $this->mwy != 0.0 || $this->mwz != 0.0) {
                 $this->orientationNow();   // still relative to the old start time here
                 $this->mqx = self::$qx;
@@ -270,15 +362,16 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
     public int $publishSlot = -1;
 
     /**
-     * The motion description as sent to browsers: [t0, x, y, z, vx, vy, vz, qx, qy, qz, qw, wx, wy, wz]. t0 is when it
-     * last changed (the moment of a collision, say), not now: a browser switches to it exactly then, and evaluates it
-     * at any later time as the server does.
+     * The motion description as sent to browsers: [t0, x, y, z, vx, vy, vz, qx, qy, qz, qw, wx, wy, wz, ax, ay, az].
+     * t0 is when it last changed (the moment of a collision, say), not now: a browser switches to it exactly then,
+     * and evaluates it at any later time as the server does. Does not include Node3D::$gravity (inherited, so every
+     * ancestor would have to resend it) or $validUntil (not part of the trajectory, see Event::EXPIRE).
      *
      * @return list<float>
      */
     public function describe(): array
     {
-        return [$this->mt, $this->mx, $this->my, $this->mz, $this->mvx, $this->mvy, $this->mvz, $this->mqx, $this->mqy, $this->mqz, $this->mqw, $this->mwx, $this->mwy, $this->mwz];
+        return [$this->mt, $this->mx, $this->my, $this->mz, $this->mvx, $this->mvy, $this->mvz, $this->mqx, $this->mqy, $this->mqz, $this->mqw, $this->mwx, $this->mwy, $this->mwz, $this->accX, $this->accY, $this->accZ];
     }
 
     /** @internal Joins (or leaves) a world's clock without moving the node. */
@@ -365,20 +458,40 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
         // world velocity of the reference point: every ancestor's velocity plus every turning ancestor's omega x r;
         // arcs are followed along their tangent for a short window, with the box grown to hold them
         $vx = $vy = $vz = 0.0;
+        $ax = $ay = $az = 0.0;
         $margin = 0.0;
         $horizon = INF;
         $window = \Phame\Kinetic\Kinetic::$arcHorizon;
         for ($n = $this; $n !== null; $n = $n->parent) {
             $p = $n->parent?->getWorldMatrix();
-            if ($n->mvx != 0.0 || $n->mvy != 0.0 || $n->mvz != 0.0) {
+            // the getters, not mvx/mvy/mvz directly: an accelerating (or gravity-fed) ancestor's velocity is not
+            // constant, and mvx/mvy/mvz are only its value as of its own last rebase (see Node3D::rebase())
+            [$nvx, $nvy, $nvz] = [$n->velocityX, $n->velocityY, $n->velocityZ];
+            if ($nvx != 0.0 || $nvy != 0.0 || $nvz != 0.0) {
                 if ($p === null) {
-                    $vx += $n->mvx;
-                    $vy += $n->mvy;
-                    $vz += $n->mvz;
+                    $vx += $nvx;
+                    $vy += $nvy;
+                    $vz += $nvz;
                 } else {
-                    $vx += $p->m0 * $n->mvx + $p->m4 * $n->mvy + $p->m8 * $n->mvz;
-                    $vy += $p->m1 * $n->mvx + $p->m5 * $n->mvy + $p->m9 * $n->mvz;
-                    $vz += $p->m2 * $n->mvx + $p->m6 * $n->mvy + $p->m10 * $n->mvz;
+                    $vx += $p->m0 * $nvx + $p->m4 * $nvy + $p->m8 * $nvz;
+                    $vy += $p->m1 * $nvx + $p->m5 * $nvy + $p->m9 * $nvz;
+                    $vz += $p->m2 * $nvx + $p->m6 * $nvy + $p->m10 * $nvz;
+                }
+            }
+            // its own acceleration, and (strict ancestors only: gravity does not apply to the node that defines it)
+            // the field it sits in, both carried into world space the same way its velocity is above
+            $fx = $n->accX + ($n === $this ? 0.0 : $n->gravityX);
+            $fy = $n->accY + ($n === $this ? 0.0 : $n->gravityY);
+            $fz = $n->accZ + ($n === $this ? 0.0 : $n->gravityZ);
+            if ($fx != 0.0 || $fy != 0.0 || $fz != 0.0) {
+                if ($p === null) {
+                    $ax += $fx;
+                    $ay += $fy;
+                    $az += $fz;
+                } else {
+                    $ax += $p->m0 * $fx + $p->m4 * $fy + $p->m8 * $fz;
+                    $ay += $p->m1 * $fx + $p->m5 * $fy + $p->m9 * $fz;
+                    $az += $p->m2 * $fx + $p->m6 * $fy + $p->m10 * $fz;
                 }
             }
             if ($n !== $this && ($n->mwx != 0.0 || $n->mwy != 0.0 || $n->mwz != 0.0)) {
@@ -399,6 +512,12 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
                 $horizon = $window;
             }
         }
+        if ($ax != 0.0 || $ay != 0.0 || $az != 0.0) {
+            // the box assumes a straight line at the current velocity; a parabola departs from it by at most
+            // 0.5 * |a| * t^2 over the window, same treatment as an arc's deviation from its tangent above
+            $margin += 0.5 * sqrt($ax * $ax + $ay * $ay + $az * $az) * $window * $window;
+            $horizon = min($horizon, $window);
+        }
         \Phame\Kinetic\Kinetic::$x0 = $x0 - $margin;
         \Phame\Kinetic\Kinetic::$y0 = $y0 - $margin;
         \Phame\Kinetic\Kinetic::$z0 = $z0 - $margin;
@@ -408,6 +527,9 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
         \Phame\Kinetic\Kinetic::$vx = $vx;
         \Phame\Kinetic\Kinetic::$vy = $vy;
         \Phame\Kinetic\Kinetic::$vz = $vz;
+        \Phame\Kinetic\Kinetic::$ax = $ax;
+        \Phame\Kinetic\Kinetic::$ay = $ay;
+        \Phame\Kinetic\Kinetic::$az = $az;
         \Phame\Kinetic\Kinetic::$horizon = $horizon;
     }
 
@@ -593,6 +715,9 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
     private function takeApart(): void
     {
         $this->cancelCoroutines();
+        if ($this->expirySlot >= 0 && $this->clock !== null) {
+            $this->world()->cancelExpiry($this);
+        }
         foreach ($this->children as $child) {
             $child->parent = null;
             $child->takeApart();

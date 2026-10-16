@@ -342,7 +342,8 @@ final class RocksGame
                     \phasync::raiseFlag($this->batchStarted);
                 }
                 foreach ($changed as [$node, $description]) {
-                    array_push($this->batch, spl_object_id($node), ...$description);
+                    // the client's record has no acceleration yet (nothing here accelerates): the first 14 floats
+                    array_push($this->batch, spl_object_id($node), ...array_slice($description, 0, 14));
                     ++$this->batched;
                 }
                 if ($this->batched >= 2000) {   // a message is at most 128 KiB: 64 bytes each

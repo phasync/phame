@@ -3,16 +3,17 @@
 namespace Phame\Tests\Verification\Oracle;
 
 /**
- * The reference oracle (see docs/PHYSICS-PLAN.md, "Phase 0"): a dense fixed-step simulation of a {@see SceneSpec},
- * sharing no code with the engine (its own 3x3 matrices, not Phame\Math\Matrix4 or quaternions; its own impulse
- * formulas, not Phame\Physics\Contact). Spheres, axis-aligned walls, tethers and turning compound trees, all parts
- * against all parts, no grid.
+ * The reference oracle (see docs/PHYSICS-PLAN.md, "Phase 0" and "Phase 1"): a dense fixed-step simulation of a
+ * {@see SceneSpec}, sharing no code with the engine (its own 3x3 matrices, not Phame\Math\Matrix4 or quaternions; its
+ * own impulse formulas, not Phame\Physics\Contact). Spheres, axis-aligned walls, tethers and turning compound trees,
+ * all parts against all parts, no grid.
  *
- * Positions and orientations are always exact closed-form functions of time (straight lines between velocity
- * changes, exact rotation matrices from a spin schedule): the step size $dt only controls how finely new contacts
- * are searched for, by sampling the gap between every pair at each step's ends and bisecting into any step where it
- * crossed from positive to non-positive. A compound's parts are kinematic: a contact can change a free body's
- * velocity, never a part's, so the tree's own motion needs no re-derivation after a hit (see docs/VERIFICATION.md).
+ * Positions and orientations are always exact closed-form functions of time (parabolas between velocity changes, a
+ * body's or node's own acceleration constant for the whole run - Phase 1 - exact rotation matrices from a spin
+ * schedule): the step size $dt only controls how finely new contacts are searched for (see findCrossing()). A
+ * compound's parts are kinematic: a contact can change a free body's velocity, never a part's, so the tree's own
+ * motion needs no re-derivation after a hit (see docs/VERIFICATION.md) - a part may still fall or be thrown within
+ * its compound on its own constant velocity and acceleration, just never because of a collision.
  *
  * @phpstan-type Event array{time: float, kind: string, a: string, b: string}
  */
@@ -109,7 +110,7 @@ final class Oracle
                 $fresh = !isset($resolved['wall:' . "B{$i}" . ',' . $wallId]);
                 $from = $fresh ? $windowStart0 : $cursor;
                 $gapAt = fn (float $t) => $side * ($this->bodyState($i, $t)[$axis] - $bound) - $r;
-                $speed = abs($this->bodyState($i, $from)[3 + $axis]);   // exact: a free body's velocity is constant over this bracket
+                $speed = $this->speedBound("B{$i}", $from, $t1 - $from);
                 $at = $this->findCrossing($from, $t1, $gapAt, $speed);
                 if ($at !== null && $at < $bestAt) {
                     [$bestAt, $best] = [$at, [$at, 'wall', "B{$i}", $wallId]];
@@ -122,7 +123,7 @@ final class Oracle
             $fresh = !isset($resolved[$kind . ':' . $idA . ',' . $idB]);
             $from = $fresh ? $windowStart0 : $cursor;
             $gapAt = fn (float $t) => $this->gap($kind, $idA, $idB, $extra, $t);
-            $speed = $this->speedBound($idA, $from) + $this->speedBound($idB, $from);
+            $speed = $this->speedBound($idA, $from, $t1 - $from) + $this->speedBound($idB, $from, $t1 - $from);
             $at = $this->findCrossing($from, $t1, $gapAt, $speed);
             if ($at !== null) {
                 if ($kind === 'tether' && !$this->separating($idA, $idB, $at)) {
@@ -151,53 +152,87 @@ final class Oracle
      * exactly the case a simple "step by gap / speed" march gets stuck on, taking ever-smaller steps that approach
      * but never reach the dip. Each halving that cannot be ruled out still costs only one more gapAt() call per side.
      */
+    /**
+     * Bounds the total work findCrossing() can do searching one window: an exact tangency (the gap touches zero but
+     * never goes negative - a true double root, measure zero in practice) prunes on neither side near the touch, so
+     * without a budget the halving would branch into both halves every time, forever. Once the budget runs out the
+     * remaining sub-window is reported as no crossing, which is the correct answer for a tangency anyway (the gap
+     * never actually reaches non-positive there) and a one-window-late answer in the vanishingly unlikely case it
+     * was a genuine, exactly-zero-width crossing.
+     */
+    private int $isolateBudget = 0;
+
     private function findCrossing(float $from, float $t1, \Closure $gapAt, float $speed): ?float
     {
         $g0 = $gapAt($from);
         if ($g0 <= self::GAP_EPS) {
             return null;
         }
-        return $this->isolate($from, $t1, $gapAt, $speed, $g0, $gapAt($t1), 0);
+        $this->isolateBudget = 2000;
+        return $this->isolate($from, $t1, $gapAt, $speed, $g0, $gapAt($t1));
     }
 
-    private function isolate(float $a, float $b, \Closure $gapAt, float $speed, float $ga, float $gb, int $depth): ?float
+    private function isolate(float $a, float $b, \Closure $gapAt, float $speed, float $ga, float $gb): ?float
     {
         if ($ga > 0.0 && $gb <= 0.0) {
             return $this->bisect($a, $b, $gapAt);   // a clean bracket: finish with ordinary bisection
         }
-        if ($b - $a <= self::BISECT_EPS) {
+        if ($b - $a <= self::BISECT_EPS || --$this->isolateBudget <= 0) {
             return $gb <= 0.0 ? $b : null;
         }
-        if (min($ga, $gb) - $speed * ($b - $a) > 0.0 || $depth > 200) {
-            return null;   // provably could not have reached zero anywhere in [a, b] at this speed (or gave up: see below)
+        if (min($ga, $gb) - $speed * ($b - $a) > 0.0) {
+            return null;   // provably could not have reached zero anywhere in [a, b] at this speed
         }
         $mid = ($a + $b) / 2;
         $gm = $gapAt($mid);
-        return $this->isolate($a, $mid, $gapAt, $speed, $ga, $gm, $depth + 1)
-            ?? $this->isolate($mid, $b, $gapAt, $speed, $gm, $gb, $depth + 1);
+        return $this->isolate($a, $mid, $gapAt, $speed, $ga, $gm)
+            ?? $this->isolate($mid, $b, $gapAt, $speed, $gm, $gb);
     }
 
-    /** A conservative bound on how fast an entity's world position can move, for march(): exact for a free body (its velocity is constant over the bracket in question), an over-estimate for a part (its own translation plus every ancestor's angular speed times a lever long enough to cover any of them, so it is always safe, if sometimes loose). */
-    private function speedBound(string $id, float $t): float
+    /**
+     * A conservative bound on how fast an entity's world position can move over [t, t + width], for findCrossing():
+     * the entity's exact speed right now (a body's is exact; a part's is an over-estimate - its own and every
+     * ancestor's translation, plus every ancestor's angular speed times a lever long enough to cover any of them)
+     * plus accelBound() times $width, the most that acceleration (Phase 1: constant for the whole run, on any body or
+     * node in the chain) could still add within the window. Safe, if sometimes loose.
+     */
+    private function speedBound(string $id, float $t, float $width): float
     {
         if ($id[0] === 'B') {
             $b = $this->bodyState((int) substr($id, 1), $t);
-            return sqrt($b[3] ** 2 + $b[4] ** 2 + $b[5] ** 2);
+            return sqrt($b[3] ** 2 + $b[4] ** 2 + $b[5] ** 2) + $this->accelBound($id) * $width;
         }
         $spec = $this->spec;
         $j = (int) substr($id, 1);
         $angular = 0.0;
+        $ownSpeed = 0.0;
         for ($n = $j;; $n = $spec->nodeParentIndex[$n]) {
             $w = $this->activeSpin($spec->nodeSpinStart[$n], $spec->nodeSpinX[$n], $spec->nodeSpinY[$n], $spec->nodeSpinZ[$n], $t);
             $angular += sqrt($w[0] ** 2 + $w[1] ** 2 + $w[2] ** 2);
+            $ownSpeed += sqrt($spec->nodeVX[$n] ** 2 + $spec->nodeVY[$n] ** 2 + $spec->nodeVZ[$n] ** 2);
             if ($spec->nodeParentIsBody[$n]) {
                 $body = $spec->nodeParentIndex[$n];
                 $bw = $this->activeSpin($spec->bodySpinStart[$body], $spec->bodySpinX[$body], $spec->bodySpinY[$body], $spec->bodySpinZ[$body], $t);
                 $angular += sqrt($bw[0] ** 2 + $bw[1] ** 2 + $bw[2] ** 2);
                 $b = $this->bodyState($body, $t);
-                return sqrt($b[3] ** 2 + $b[4] ** 2 + $b[5] ** 2) + $this->leverSum[$j] * $angular;
+                $bodySpeed = sqrt($b[3] ** 2 + $b[4] ** 2 + $b[5] ** 2);
+                return $bodySpeed + $ownSpeed + $this->leverSum[$j] * $angular + $this->accelBound($id) * $width;
             }
         }
+    }
+
+    /** A safe over-estimate of an entity's total world acceleration magnitude: its own, plus every ancestor's (summed, not composed - loose but always safe), up to its body. Spin never accelerates (Phase 1 keeps it a constant rate), so only translation needs this. */
+    private function accelBound(string $id): float
+    {
+        $spec = $this->spec;
+        if ($id[0] === 'B') {
+            $i = (int) substr($id, 1);
+            return sqrt($spec->bodyAX[$i] ** 2 + $spec->bodyAY[$i] ** 2 + $spec->bodyAZ[$i] ** 2);
+        }
+        $j = (int) substr($id, 1);
+        $own = sqrt($spec->nodeAX[$j] ** 2 + $spec->nodeAY[$j] ** 2 + $spec->nodeAZ[$j] ** 2);
+        $parentId = ($spec->nodeParentIsBody[$j] ? 'B' : 'N') . $spec->nodeParentIndex[$j];
+        return $own + $this->accelBound($parentId);
     }
 
     /**
@@ -254,7 +289,12 @@ final class Oracle
         return [$s[0], $s[1], $s[2], $this->spec->nodeRadius[$i]];
     }
 
-    /** @return array{0: float, 1: float, 2: float, 3: float, 4: float, 5: float, 6: Mat3, 7: float, 8: float, 9: float} x, y, z, vx, vy, vz, world rotation, world angular velocity */
+    /**
+     * @return array{0: float, 1: float, 2: float, 3: float, 4: float, 5: float, 6: Mat3, 7: float, 8: float, 9: float}
+     * x, y, z, vx, vy, vz, world rotation, world angular velocity. Position and velocity follow p0 + v0*age +
+     * ½*a*age² and v0 + a*age from the body's last velocity change (a collision never changes its acceleration,
+     * Node3D::setAcceleration()'s constant for the whole run - see SceneSpec's class docblock).
+     */
     private function bodyState(int $i, float $t): array
     {
         $segments = $this->history[$i];
@@ -267,16 +307,27 @@ final class Oracle
         }
         [$t0, $x, $y, $z, $vx, $vy, $vz] = $seg;
         $age = $t - $t0;
+        [$ax, $ay, $az] = [$this->spec->bodyAX[$i], $this->spec->bodyAY[$i], $this->spec->bodyAZ[$i]];
         $rot = $this->scheduleRotation($this->spec->bodySpinStart[$i], $this->spec->bodySpinX[$i], $this->spec->bodySpinY[$i], $this->spec->bodySpinZ[$i], $t);
         $w = $this->activeSpin($this->spec->bodySpinStart[$i], $this->spec->bodySpinX[$i], $this->spec->bodySpinY[$i], $this->spec->bodySpinZ[$i], $t);
-        return [$x + $vx * $age, $y + $vy * $age, $z + $vz * $age, $vx, $vy, $vz, $rot, $w[0], $w[1], $w[2]];
+        return [
+            $x + $vx * $age + 0.5 * $ax * $age * $age, $y + $vy * $age + 0.5 * $ay * $age * $age, $z + $vz * $age + 0.5 * $az * $age * $age,
+            $vx + $ax * $age, $vy + $ay * $age, $vz + $az * $age,
+            $rot, $w[0], $w[1], $w[2],
+        ];
     }
 
     /**
      * Forward kinematics of node $j at $t, walking up to its compound body (a short chain, not every node in the
      * scene - march() calls this often, for one pair at a time, so staying off the O(every body/node) bulk methods
-     * above matters): world position, world velocity (v = v_parent + ω_parent × r), the node's own world rotation
-     * and world angular velocity (for a further child of its own, recursively).
+     * above matters): world position, world velocity, the node's own world rotation and world angular velocity (for
+     * a further child of its own, recursively).
+     *
+     * Unlike a body, a node never rebases (nothing here ever changes its own velocity: it is kinematic, Phase 0's
+     * design choice, see docs/VERIFICATION.md), so its local offset is simply offset0 + v0*t + ½*a0*t² and its local
+     * velocity v0 + a0*t, both constant-acceleration formulas straight from t = 0. World velocity adds the parent's
+     * own velocity, the parent's world rotation applied to this local velocity (the local motion's own direction, as
+     * seen from outside the parent's turning frame), and ω_parent × r (a point carried by a turning parent).
      *
      * @return array{0: float, 1: float, 2: float, 3: float, 4: float, 5: float, 6: Mat3, 7: float, 8: float, 9: float}
      */
@@ -286,14 +337,19 @@ final class Oracle
         [$px, $py, $pz, $pvx, $pvy, $pvz, $prot, $pwx, $pwy, $pwz] = $spec->nodeParentIsBody[$j] ? $this->bodyState($spec->nodeParentIndex[$j], $t) : $this->nodeState($spec->nodeParentIndex[$j], $t);
         $local = $this->scheduleRotation($spec->nodeSpinStart[$j], $spec->nodeSpinX[$j], $spec->nodeSpinY[$j], $spec->nodeSpinZ[$j], $t);
         $rot = $prot->multiply($local);
-        [$ox, $oy, $oz] = $prot->apply($spec->nodeOffsetX[$j], $spec->nodeOffsetY[$j], $spec->nodeOffsetZ[$j]);
+        [$lvx, $lvy, $lvz] = [$spec->nodeVX[$j] + $spec->nodeAX[$j] * $t, $spec->nodeVY[$j] + $spec->nodeAY[$j] * $t, $spec->nodeVZ[$j] + $spec->nodeAZ[$j] * $t];
+        $lox = $spec->nodeOffsetX[$j] + $spec->nodeVX[$j] * $t + 0.5 * $spec->nodeAX[$j] * $t * $t;
+        $loy = $spec->nodeOffsetY[$j] + $spec->nodeVY[$j] * $t + 0.5 * $spec->nodeAY[$j] * $t * $t;
+        $loz = $spec->nodeOffsetZ[$j] + $spec->nodeVZ[$j] * $t + 0.5 * $spec->nodeAZ[$j] * $t * $t;
+        [$ox, $oy, $oz] = $prot->apply($lox, $loy, $loz);
         [$x, $y, $z] = [$px + $ox, $py + $oy, $pz + $oz];
         $ownSpin = $this->activeSpin($spec->nodeSpinStart[$j], $spec->nodeSpinX[$j], $spec->nodeSpinY[$j], $spec->nodeSpinZ[$j], $t);
         [$wx, $wy, $wz] = $prot->apply($ownSpin[0], $ownSpin[1], $ownSpin[2]);
+        [$lvwx, $lvwy, $lvwz] = $prot->apply($lvx, $lvy, $lvz);
         [$rx, $ry, $rz] = [$x - $px, $y - $py, $z - $pz];
-        $vx = $pvx + $pwy * $rz - $pwz * $ry;
-        $vy = $pvy + $pwz * $rx - $pwx * $rz;
-        $vz = $pvz + $pwx * $ry - $pwy * $rx;
+        $vx = $pvx + $lvwx + $pwy * $rz - $pwz * $ry;
+        $vy = $pvy + $lvwy + $pwz * $rx - $pwx * $rz;
+        $vz = $pvz + $lvwz + $pwx * $ry - $pwy * $rx;
         return [$x, $y, $z, $vx, $vy, $vz, $rot, $wx, $wy, $wz];
     }
 

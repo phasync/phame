@@ -119,6 +119,62 @@ Of 6 mutants, 5 are killed (one of the tests fails). One survives: changing the 
 `touching()` from `<=` to `<` - an off-by-one at a boundary so narrow (0.02 units) that landing on it exactly is
 essentially never hit by a random or hand-built scene. Reported here, not yet turned into a test.
 
+## Phase 1
+
+Acceleration in descriptions, a validity end, gravity as a frame field (docs/PHYSICS-PLAN.md, "Phase 1"). The gate
+tests live in `tests/Verification/PhaseOneTest.php`, under `#[Group('phase1')]` (excluded from the default run in
+phpunit.xml, like `soak`): run them explicitly, once told the engine side is ready, with `--group phase1`.
+
+**Oracle/SceneSpec support**, already in place and exercised by the Phase 0 tests too (acceleration defaults to 0.0
+everywhere there, so none of them depend on anything Phase 1 added): a body's or node's own constant acceleration
+(`SceneSpec::addBody()`/`addNode()`'s trailing `ax, ay, az`), a node's own constant linear velocity (previously always
+0, now a part can fall or be thrown within its compound, not just turn), and positions/velocities follow p0 + v0·age +
+½a·age² throughout (`Oracle::bodyState()`/`nodeState()`). `findCrossing()`'s speed bound widens by accelBound() x
+width (a safe sum of every accelerating ancestor's magnitude, up the chain) on top of the Phase 0 bound, since
+velocity is no longer constant within a step - exactly the `|Δv| + |Δa|·width` the plan calls for. No new engine
+API was needed to validate this (it is pure Oracle math), but the hand-built near-graze scene (see below) checks it
+against a case designed to stress it.
+
+**Gate tests**: a projectile's apex and landing time against the closed form; a ball bouncing under gravity with
+heights scaling by e² per bounce (run to 90% of the closed-form time it takes the bounces to pile up to rest, not a
+fixed duration - see "Zeno tails" below); two bodies under the same acceleration colliding exactly when they would
+without it (gravity cancels in their relative motion); `validUntil` staying put while its parent is accelerated and
+spun hard, with `expire` firing exactly once; gravity on a falling compound reaching its part exactly like the
+oracle; two free bodies under different (one falling, one not; opposite) accelerations, including a near-graze close
+to a true double root (see below); gravity on the scene root (`Node3D::$gravityX/Y/Z`) and the same acceleration
+given to every body directly giving identical trajectories (checked against one oracle run, built from the per-body
+form); gravity added to `spheresInBox`/`openWorld` (both gained an optional `$gravity` parameter).
+
+**A near-exact double root is ill-conditioned, so the graze test is a near-graze.** Two bodies with constant but
+different x-accelerations have a relative x position that is a parabola in time; its vertex is where relative
+x-velocity is exactly 0. Choosing the starting separation puts that vertex at relative x = 0 exactly - an exact
+tangency if the transverse offset also exactly equals the sum of the radii. That configuration is a genuine double
+root, but it is also where a sign change (what both this oracle and a plain root search look for) may never be
+observed in floating point: the gap can read a hair positive on both sides of the touch forever, by rounding alone.
+`findCrossing()` on an exact tangency like that explores every halving down to BISECT_EPS on both sides near the
+touch (neither side can be pruned, since the true closing rate is 0 right at the point) - `isolateBudget` bounds that
+to a fixed number of calls, which is correctly "no crossing" for a mathematically exact tangency, but would be a
+one-window-late answer for a genuine, exactly-zero-width crossing (a configuration with no physical reason to exist).
+The gate test offsets the transverse distance a hair under the radius sum instead, keeping the double root's
+numerical character (very low effective closing rate, almost all of it tangential) while making it an unambiguous,
+brief, real contact - the same technique as the Phase 0 "graze" tunnelling scenes.
+
+**Zeno tails are physics, not a hang.** A ball bouncing inelastically (e < 1) under gravity on a flat floor bounces
+infinitely often before coming to rest, in finite time (resting contact is Phase 4, not modelled here) - the bounce
+intervals shrink geometrically, summing to a finite total. A test that just ticks a fixed duration will try to
+process that whole infinite tail in one call. The bouncing-ball gate test instead computes the accumulation point in
+closed form (first impact at t1, bounce interval shrinking by e each time from T1 = 2·e·v1/g, so the tail after t1
+sums to T1/(1 − e)) and runs to 90% of the way there, checking both the heights and that there were as many bounces
+as the closed form predicts by then.
+
+**Hang guards.** Every gate test that can re-trigger events (any bounce response) caps the number it will accept and
+fails with a clear message instead of hanging if an engine regression re-triggers the same contact forever -
+`Harness::run()`'s own two handlers (used by the falling-container, near-graze, root-gravity and generator-gravity
+tests) and the three hand-built scenes in `PhaseOneTest` all do this. This exists because of a real regression caught
+while writing these tests: `Space::smallestRoot()`'s root acceptance tolerance briefly let a just-resolved wall
+contact re-trigger itself every instant, forever, on the simplest possible bouncing-ball scene - fixed in the engine,
+not here, but the guard stays as a safety net for the next such regression.
+
 ## Running it
 
 ```

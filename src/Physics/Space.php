@@ -67,7 +67,7 @@ final class Space
     private array $inside = [];
     /** @var array<int, Node3D> compounds that changed and predict again once the burst of changes is over */
     private array $unsettled = [];
-    /** @var array<int, array{int, float}> by compound body: the body it touched last, and when */
+    /** @var array<int, int> by compound body: the body it is currently touching, until the gap reopens past 2 * PROBE_TOLERANCE */
     private array $lastTouch = [];
     /** @var list<float> where placeParts() found the parts' centres, in the order of $parts */
     private static array $partX = [];
@@ -98,6 +98,14 @@ final class Space
 
     public int $bodyCount {
         get => count($this->bodies);
+    }
+
+    /** The scene root's Node3D::$gravity changed: every body's prediction assumed the old field, so all predict again. */
+    public function refresh(): void
+    {
+        foreach ($this->bodies as $b) {
+            $this->changed($b);
+        }
     }
 
     public function add(Node3D $b): void
@@ -295,13 +303,20 @@ final class Space
             return;
         }
         $now = $this->world->clock->time;
-        $vx = $a->mvx;
-        $vy = $a->mvy;
-        $vz = $a->mvz;
+        $root = $this->scene->root;
+        $gx = $root->gravityX;
+        $gy = $root->gravityY;
+        $gz = $root->gravityZ;
+        $ax = $a->accX + $gx;
+        $ay = $a->accY + $gy;
+        $az = $a->accZ + $gz;
         $age = $now - $a->mt;
-        $x = $a->mx + $vx * $age;
-        $y = $a->my + $vy * $age;
-        $z = $a->mz + $vz * $age;
+        $x = $a->mx + ($a->mvx + 0.5 * $ax * $age) * $age;
+        $y = $a->my + ($a->mvy + 0.5 * $ay * $age) * $age;
+        $z = $a->mz + ($a->mvz + 0.5 * $az * $age) * $age;
+        $vx = $a->mvx + $ax * $age;
+        $vy = $a->mvy + $ay * $age;
+        $vz = $a->mvz + $az * $age;
         $r = $a->radius;
         $half = $this->cellSize / 2;
         $axis = $d[0] !== 0 ? 0 : ($d[1] !== 0 ? 1 : 2);
@@ -316,15 +331,21 @@ final class Space
                     if ($b === $a || $b->radius > $half) {
                         continue;
                     }
+                    $bax = $b->accX + $gx;
+                    $bay = $b->accY + $gy;
+                    $baz = $b->accZ + $gz;
                     $bAge = $now - $b->mt;
-                    $t = $now + self::sphereImpact($b->mx + $b->mvx * $bAge - $x, $b->my + $b->mvy * $bAge - $y, $b->mz + $b->mvz * $bAge - $z, $b->mvx - $vx, $b->mvy - $vy, $b->mvz - $vz, $r + $b->radius);
+                    $bvx = $b->mvx + $bax * $bAge;
+                    $bvy = $b->mvy + $bay * $bAge;
+                    $bvz = $b->mvz + $baz * $bAge;
+                    $t = $now + self::sphereImpact($b->mx + ($b->mvx + 0.5 * $bax * $bAge) * $bAge - $x, $b->my + ($b->mvy + 0.5 * $bay * $bAge) * $bAge - $y, $b->mz + ($b->mvz + 0.5 * $baz * $bAge) * $bAge - $z, $bvx - $vx, $bvy - $vy, $bvz - $vz, $r + $b->radius, $bax - $ax, $bay - $ay, $baz - $az);
                     if ($t < $a->physicsPairAt) {
                         [$a->physicsPairAt, $a->physicsPair, $a->physicsPairKind, $a->physicsPairSeen] = [$t, $b, self::PAIR, $b->physicsCounter];
                     }
                 }
             }
         }
-        $a->physicsCellAt = $now + $this->cellExit($a->physicsCell, $x, $y, $z, $vx, $vy, $vz);
+        $a->physicsCellAt = $now + $this->cellExit($a->physicsCell, $x, $y, $z, $vx, $vy, $vz, $ax, $ay, $az);
         $this->schedule($a);
     }
 
@@ -359,33 +380,44 @@ final class Space
         if ($a->compound) {
             $this->inside = [];
         }
-        // the motion descriptions, evaluated here: this loop is the engine's hottest, so no property hooks
-        $vx = $a->mvx;
-        $vy = $a->mvy;
-        $vz = $a->mvz;
+        // the motion descriptions, evaluated here: this loop is the engine's hottest, so no property hooks. Gravity
+        // (Node3D::$gravity on the scene's root) is a frame field: every body here is its direct child, so it is
+        // simply added to each body's own acceleration, no ancestor walk needed (see Node3D::kineticState() for the
+        // general case, used elsewhere).
+        $scene = $this->scene;
+        $gx = $scene->root->gravityX;
+        $gy = $scene->root->gravityY;
+        $gz = $scene->root->gravityZ;
+        $ax = $a->accX + $gx;
+        $ay = $a->accY + $gy;
+        $az = $a->accZ + $gz;
         $age = $now - $a->mt;
-        $x = $a->mx + $vx * $age;
-        $y = $a->my + $vy * $age;
-        $z = $a->mz + $vz * $age;
+        $x = $a->mx + ($a->mvx + 0.5 * $ax * $age) * $age;
+        $y = $a->my + ($a->mvy + 0.5 * $ay * $age) * $age;
+        $z = $a->mz + ($a->mvz + 0.5 * $az * $age) * $age;
+        $vx = $a->mvx + $ax * $age;
+        $vy = $a->mvy + $ay * $age;
+        $vz = $a->mvz + $az * $age;
         $r = $a->radius;
         $best = INF;
         $bestKind = self::PAIR;
         $bestOther = null;
 
-        // walls of the scene's box
+        // walls of the scene's box: both faces of each axis, since acceleration can turn an approach into a
+        // retreat and back (a throw that falls back down), unlike a body on a straight line
         $wall = INF;
         $wallCode = 0;
-        $scene = $this->scene;
-        foreach (!$a->confined ? [] : [[0, $x, $vx, $scene->worldMinX, $scene->worldMaxX], [1, $y, $vy, $scene->worldMinY, $scene->worldMaxY], [2, $z, $vz, $scene->worldMinZ, $scene->worldMaxZ]] as [$axis, $p, $v, $min, $max]) {
-            if ($v > 0.0 && $max < INF && $p + $r <= $max + 1e-9) {
-                $t = ($max - $r - $p) / $v;
+        foreach (!$a->confined ? [] : [[0, $x, $vx, $ax, $scene->worldMinX, $scene->worldMaxX], [1, $y, $vy, $ay, $scene->worldMinY, $scene->worldMaxY], [2, $z, $vz, $az, $scene->worldMinZ, $scene->worldMaxZ]] as [$axis, $p, $v, $acc, $min, $max]) {
+            if ($max < INF && $p + $r <= $max + 1e-9) {
+                $t = self::axisCrossing($p, $v, $acc, $max - $r, 1.0);
                 if ($t < $wall) {
-                    [$wall, $wallCode] = [max(0.0, $t), $axis * 2 + 1];
+                    [$wall, $wallCode] = [$t, $axis * 2 + 1];
                 }
-            } elseif ($v < 0.0 && $min > -INF && $p - $r >= $min - 1e-9) {
-                $t = ($min + $r - $p) / $v;
+            }
+            if ($min > -INF && $p - $r >= $min - 1e-9) {
+                $t = self::axisCrossing($p, $v, $acc, $min + $r, -1.0);
                 if ($t < $wall) {
-                    [$wall, $wallCode] = [max(0.0, $t), $axis * 2];
+                    [$wall, $wallCode] = [$t, $axis * 2];
                 }
             }
         }
@@ -410,8 +442,14 @@ final class Space
                             }
                             continue;
                         }
+                        $bax = $b->accX + $gx;
+                        $bay = $b->accY + $gy;
+                        $baz = $b->accZ + $gz;
                         $bAge = $now - $b->mt;
-                        $t = self::sphereImpact($b->mx + $b->mvx * $bAge - $x, $b->my + $b->mvy * $bAge - $y, $b->mz + $b->mvz * $bAge - $z, $b->mvx - $vx, $b->mvy - $vy, $b->mvz - $vz, $r + $b->radius);
+                        $bvx = $b->mvx + $bax * $bAge;
+                        $bvy = $b->mvy + $bay * $bAge;
+                        $bvz = $b->mvz + $baz * $bAge;
+                        $t = self::sphereImpact($b->mx + ($b->mvx + 0.5 * $bax * $bAge) * $bAge - $x, $b->my + ($b->mvy + 0.5 * $bay * $bAge) * $bAge - $y, $b->mz + ($b->mvz + 0.5 * $baz * $bAge) * $bAge - $z, $bvx - $vx, $bvy - $vy, $bvz - $vz, $r + $b->radius, $bax - $ax, $bay - $ay, $baz - $az);
                         if ($t < $best) {
                             [$best, $bestKind, $bestOther] = [$t, self::PAIR, $b];
                         }
@@ -429,8 +467,14 @@ final class Space
                     }
                 }
             } elseif ($b !== $a) {
+                $bax = $b->accX + $gx;
+                $bay = $b->accY + $gy;
+                $baz = $b->accZ + $gz;
                 $bAge = $now - $b->mt;
-                $t = self::sphereImpact($b->mx + $b->mvx * $bAge - $x, $b->my + $b->mvy * $bAge - $y, $b->mz + $b->mvz * $bAge - $z, $b->mvx - $vx, $b->mvy - $vy, $b->mvz - $vz, $r + $b->radius);
+                $bvx = $b->mvx + $bax * $bAge;
+                $bvy = $b->mvy + $bay * $bAge;
+                $bvz = $b->mvz + $baz * $bAge;
+                $t = self::sphereImpact($b->mx + ($b->mvx + 0.5 * $bax * $bAge) * $bAge - $x, $b->my + ($b->mvy + 0.5 * $bay * $bAge) * $bAge - $y, $b->mz + ($b->mvz + 0.5 * $baz * $bAge) * $bAge - $z, $bvx - $vx, $bvy - $vy, $bvz - $vz, $r + $b->radius, $bax - $ax, $bay - $ay, $baz - $az);
                 if ($t < $best) {
                     [$best, $bestKind, $bestOther] = [$t, self::PAIR, $b];
                 }
@@ -448,45 +492,197 @@ final class Space
         $a->physicsWallAt = $now + $wall;
         $a->physicsWall = $wallCode;
         [$a->physicsPairAt, $a->physicsPair, $a->physicsPairKind, $a->physicsPairSeen] = [$now + $best, $bestOther, $bestKind, $bestOther?->physicsCounter ?? 0];
-        $a->physicsCellAt = $now + $this->cellExit($cell, $x, $y, $z, $vx, $vy, $vz);
+        $a->physicsCellAt = $now + $this->cellExit($cell, $x, $y, $z, $vx, $vy, $vz, $ax, $ay, $az);
         $this->schedule($a);
     }
 
-    /** Seconds until a point moving at v leaves the cell (just past its edge, so that it is in the next one). */
-    private function cellExit(int $cell, float $x, float $y, float $z, float $vx, float $vy, float $vz): float
+    /** Seconds until a point moving at v and accelerating at a leaves the cell (just past whichever edge, either way). */
+    private function cellExit(int $cell, float $x, float $y, float $z, float $vx, float $vy, float $vz, float $ax = 0.0, float $ay = 0.0, float $az = 0.0): float
     {
         $s = $this->cellSize;
         $exit = INF;
-        foreach ([[$x, $vx, ($cell >> 42) - 0x100000], [$y, $vy, (($cell >> 21) & 0x1FFFFF) - 0x100000], [$z, $vz, ($cell & 0x1FFFFF) - 0x100000]] as [$p, $v, $c]) {
-            if ($v > 0.0) {
-                $exit = min($exit, max(0.0, (($c + 1) * $s - $p) / $v) + 1e-9);
-            } elseif ($v < 0.0) {
-                $exit = min($exit, max(0.0, ($c * $s - $p) / $v) + 1e-9);
-            }
+        foreach ([[$x, $vx, $ax, ($cell >> 42) - 0x100000], [$y, $vy, $ay, (($cell >> 21) & 0x1FFFFF) - 0x100000], [$z, $vz, $az, ($cell & 0x1FFFFF) - 0x100000]] as [$p, $v, $acc, $c]) {
+            $exit = min($exit, self::axisCrossing($p, $v, $acc, ($c + 1) * $s, 1.0), self::axisCrossing($p, $v, $acc, $c * $s, -1.0));
         }
-        return $exit;
+        return $exit === INF ? INF : $exit + 1e-9;
     }
 
     /**
      * Seconds until two spheres touch: one at the origin, the other at offset d moving at relative velocity v, the
-     * radii summing to $r. INF if they never do, or touch or overlap already (they first have to separate).
+     * radii summing to $r. INF if they never do, or touch or overlap already (they first have to separate). With no
+     * relative acceleration (both share the world's gravity, the common case, or neither accelerates) the gap is the
+     * exact quadratic below; a relative acceleration (ax, ay, az) makes it a quartic, solved by quarticRoot().
      */
-    private static function sphereImpact(float $dx, float $dy, float $dz, float $vx, float $vy, float $vz, float $r): float
+    private static function sphereImpact(float $dx, float $dy, float $dz, float $vx, float $vy, float $vz, float $r, float $ax = 0.0, float $ay = 0.0, float $az = 0.0): float
     {
-        $b = $dx * $vx + $dy * $vy + $dz * $vz;
-        if ($b >= 0.0) {
-            return INF;   // not approaching
+        if ($ax == 0.0 && $ay == 0.0 && $az == 0.0) {
+            $b = $dx * $vx + $dy * $vy + $dz * $vz;
+            if ($b >= 0.0) {
+                return INF;   // not approaching
+            }
+            $c = $dx * $dx + $dy * $dy + $dz * $dz - $r * $r;
+            if ($c <= 1e-9 * $r * $r) {
+                return INF;   // overlapping, or touching: a contact just handled that left them approaching
+            }
+            $a = $vx * $vx + $vy * $vy + $vz * $vz;
+            $disc = $b * $b - $a * $c;
+            if ($disc < 0.0) {
+                return INF;   // they pass each other
+            }
+            return ($c / (-$b + sqrt($disc)));   // = (-b - sqrt(disc)) / a, stable for small a
         }
-        $c = $dx * $dx + $dy * $dy + $dz * $dz - $r * $r;
-        if ($c <= 1e-9 * $r * $r) {
-            return INF;   // overlapping, or touching: a contact just handled that left them approaching
+        $c0 = $dx * $dx + $dy * $dy + $dz * $dz - $r * $r;
+        if ($c0 <= 1e-9 * $r * $r) {
+            return INF;   // as above: already touching or overlapping, wait for separation first
         }
-        $a = $vx * $vx + $vy * $vy + $vz * $vz;
-        $disc = $b * $b - $a * $c;
+        // |d + v*t + 0.5*a*t^2|^2 - r^2, a quartic in t (c4 > 0: at least one of ax, ay, az is not 0 here)
+        $Ax = 0.5 * $ax;
+        $Ay = 0.5 * $ay;
+        $Az = 0.5 * $az;
+        $c1 = 2.0 * ($dx * $vx + $dy * $vy + $dz * $vz);
+        $c2 = 2.0 * ($dx * $Ax + $dy * $Ay + $dz * $Az) + ($vx * $vx + $vy * $vy + $vz * $vz);
+        $c3 = 2.0 * ($vx * $Ax + $vy * $Ay + $vz * $Az);
+        $c4 = $Ax * $Ax + $Ay * $Ay + $Az * $Az;
+        return self::quarticRoot($c4, $c3, $c2, $c1, $c0);
+    }
+
+    /**
+     * The smallest t >= 0 where c4*t^4 + c3*t^3 + c2*t^2 + c1*t + c0 first reaches 0 or below (an approach), or INF
+     * if it never does. The caller has already ruled out c0 <= 0 (touching or overlapping at t = 0). f's critical
+     * points are the real roots of its derivative, a cubic solved in closed form (cubicRoots()); f is monotone
+     * between them, and strictly increasing past the last one since c4 > 0, so bisecting (to about 1e-12) the first
+     * of those intervals that turns non-positive gives the earliest root.
+     */
+    private static function quarticRoot(float $c4, float $c3, float $c2, float $c1, float $c0): float
+    {
+        $f = static fn (float $t): float => ((($c4 * $t + $c3) * $t + $c2) * $t + $c1) * $t + $c0;
+        $fp = static fn (float $t): float => ((4.0 * $c4 * $t + 3.0 * $c3) * $t + 2.0 * $c2) * $t + $c1;
+        $points = [0.0];
+        foreach (self::cubicRoots(4.0 * $c4, 3.0 * $c3, 2.0 * $c2, $c1) as $t) {
+            if ($t > 0.0) {
+                $points[] = $t;
+            }
+        }
+        sort($points);
+        $tail = end($points) + 1.0;
+        while ($f($tail) < 0.0) {   // c4 > 0: f -> +INF eventually, so this always terminates
+            $tail *= 2.0;
+        }
+        $points[] = $tail;
+        for ($i = 0, $n = count($points) - 1; $i < $n; ++$i) {
+            [$lo, $hi] = [$points[$i], $points[$i + 1]];
+            if ($f($hi) > 0.0) {
+                continue;   // monotone and still positive throughout: no root in this interval
+            }
+            for ($k = 0; $k < 100 && $hi - $lo > 1e-12; ++$k) {
+                $mid = ($lo + $hi) / 2.0;
+                if ($f($mid) > 0.0) {
+                    $lo = $mid;
+                } else {
+                    $hi = $mid;
+                }
+            }
+            if ($fp($hi) > 1e-9) {
+                continue;   // the gap is not actually closing here (floating residue at a boundary): not a contact
+            }
+            return $hi;
+        }
+        return INF;
+    }
+
+    /** Real roots of a*t^3 + b*t^2 + c*t + d = 0 (a may be 0: falls back to quadraticRoots()), in no particular order. */
+    private static function cubicRoots(float $a, float $b, float $c, float $d): array
+    {
+        if (abs($a) < 1e-14) {
+            return self::quadraticRoots($b, $c, $d);
+        }
+        $b /= $a;
+        $c /= $a;
+        $d /= $a;
+        $p = $c - $b * $b / 3.0;
+        $q = 2.0 * $b * $b * $b / 27.0 - $b * $c / 3.0 + $d;
+        $shift = -$b / 3.0;
+        $disc = $q * $q / 4.0 + $p * $p * $p / 27.0;
+        if ($disc > 0.0) {
+            $sq = sqrt($disc);
+            return [self::cbrt(-$q / 2.0 + $sq) + self::cbrt(-$q / 2.0 - $sq) + $shift];
+        }
+        if ($disc == 0.0) {
+            $u = self::cbrt(-$q / 2.0);
+            return [2.0 * $u + $shift, -$u + $shift];
+        }
+        $r = sqrt(-$p * $p * $p / 27.0);
+        $phi = acos(max(-1.0, min(1.0, -$q / (2.0 * $r))));
+        $m = 2.0 * sqrt(-$p / 3.0);
+        return [
+            $m * cos($phi / 3.0) + $shift,
+            $m * cos(($phi + 2.0 * M_PI) / 3.0) + $shift,
+            $m * cos(($phi + 4.0 * M_PI) / 3.0) + $shift,
+        ];
+    }
+
+    /** Real roots of a*t^2 + b*t + c = 0 (a may be 0: falls back to the linear root), in no particular order. */
+    private static function quadraticRoots(float $a, float $b, float $c): array
+    {
+        if (abs($a) < 1e-14) {
+            return abs($b) < 1e-14 ? [] : [-$c / $b];
+        }
+        $disc = $b * $b - 4.0 * $a * $c;
         if ($disc < 0.0) {
-            return INF;   // they pass each other
+            return [];
         }
-        return ($c / (-$b + sqrt($disc)));   // = (-b - sqrt(disc)) / a, stable for small a
+        $sq = sqrt($disc);
+        return [(-$b - $sq) / (2.0 * $a), (-$b + $sq) / (2.0 * $a)];
+    }
+
+    private static function cbrt(float $x): float
+    {
+        return $x >= 0.0 ? $x ** (1.0 / 3.0) : -((-$x) ** (1.0 / 3.0));
+    }
+
+    /**
+     * The smallest t >= 0 where p, moving at v and accelerating at a, reaches target while actually arriving there:
+     * $direction is +1 if target lies above (arriving while increasing) or -1 if below (arriving while decreasing).
+     * The quadratic's other root, where p merely touches target while already heading away, is not a crossing --
+     * without this, a body resting exactly on a boundary (after a bounce left it there, say) finds a spurious t = 0
+     * "contact" there forever, the wall equivalent of sphereImpact()'s "already touching" guard.
+     */
+    private static function axisCrossing(float $p, float $v, float $a, float $target, float $direction): float
+    {
+        $best = INF;
+        foreach (self::quadraticRoots(0.5 * $a, $v, $p - $target) as $t) {
+            if ($t < -1e-9 || $t >= $best || ($v + $a * $t) * $direction < -1e-9) {
+                continue;   // in the past, not the earliest found so far, or touching while heading away
+            }
+            $best = max($t, 0.0);
+        }
+        return $best;
+    }
+
+    /** The smaller non-negative root of a*t^2 + b*t + c = 0 (a may be 0: the linear root), or INF. */
+    private static function smallestRoot(float $a, float $b, float $c): float
+    {
+        if ($a == 0.0) {
+            if ($b == 0.0) {
+                return INF;
+            }
+            $t = -$c / $b;
+            return $t >= -1e-9 ? max($t, 0.0) : INF;
+        }
+        $disc = $b * $b - 4.0 * $a * $c;
+        if ($disc < 0.0) {
+            return INF;
+        }
+        $sq = sqrt($disc);
+        $t1 = (-$b - $sq) / (2.0 * $a);
+        $t2 = (-$b + $sq) / (2.0 * $a);
+        if ($t1 > $t2) {
+            [$t1, $t2] = [$t2, $t1];
+        }
+        if ($t1 >= -1e-9) {
+            return max($t1, 0.0);
+        }
+        return $t2 >= -1e-9 ? max($t2, 0.0) : INF;
     }
 
     /**
@@ -495,14 +691,19 @@ final class Space
      */
     private function entryTime(Node3D $compound, Node3D $body, float $now): float
     {
+        // both are direct children of the scene's root (Space's invariant): gravity is the same for each and
+        // cancels out of the relative acceleration below, leaving just their own (body->accX - compound->accX)
         $cAge = $now - $compound->mt;
         $bAge = $now - $body->mt;
-        $dx = $body->mx + $body->mvx * $bAge - $compound->mx - $compound->mvx * $cAge;
-        $dy = $body->my + $body->mvy * $bAge - $compound->my - $compound->mvy * $cAge;
-        $dz = $body->mz + $body->mvz * $bAge - $compound->mz - $compound->mvz * $cAge;
+        $dx = $body->mx + ($body->mvx + 0.5 * $body->accX * $bAge) * $bAge - $compound->mx - ($compound->mvx + 0.5 * $compound->accX * $cAge) * $cAge;
+        $dy = $body->my + ($body->mvy + 0.5 * $body->accY * $bAge) * $bAge - $compound->my - ($compound->mvy + 0.5 * $compound->accY * $cAge) * $cAge;
+        $dz = $body->mz + ($body->mvz + 0.5 * $body->accZ * $bAge) * $bAge - $compound->mz - ($compound->mvz + 0.5 * $compound->accZ * $cAge) * $cAge;
+        $vx = $body->mvx + $body->accX * $bAge - $compound->mvx - $compound->accX * $cAge;
+        $vy = $body->mvy + $body->accY * $bAge - $compound->mvy - $compound->accY * $cAge;
+        $vz = $body->mvz + $body->accZ * $bAge - $compound->mvz - $compound->accZ * $cAge;
         $reach = $compound->radius + $body->radius;
         if ($dx * $dx + $dy * $dy + $dz * $dz - $reach * $reach > 1e-9 * $reach * $reach) {
-            return self::sphereImpact($dx, $dy, $dz, $body->mvx - $compound->mvx, $body->mvy - $compound->mvy, $body->mvz - $compound->mvz, $reach);
+            return self::sphereImpact($dx, $dy, $dz, $vx, $vy, $vz, $reach, $body->accX - $compound->accX, $body->accY - $compound->accY, $body->accZ - $compound->accZ);
         }
         $this->inside[] = $body;
         return INF;
@@ -518,43 +719,63 @@ final class Space
     {
         $cAge = $now - $compound->mt;
         $bAge = $now - $body->mt;
-        $dx = $body->mx + $body->mvx * $bAge - $compound->mx - $compound->mvx * $cAge;
-        $dy = $body->my + $body->mvy * $bAge - $compound->my - $compound->mvy * $cAge;
-        $dz = $body->mz + $body->mvz * $bAge - $compound->mz - $compound->mvz * $cAge;
-        $vx = $body->mvx - $compound->mvx;
-        $vy = $body->mvy - $compound->mvy;
-        $vz = $body->mvz - $compound->mvz;
+        $dx = $body->mx + ($body->mvx + 0.5 * $body->accX * $bAge) * $bAge - $compound->mx - ($compound->mvx + 0.5 * $compound->accX * $cAge) * $cAge;
+        $dy = $body->my + ($body->mvy + 0.5 * $body->accY * $bAge) * $bAge - $compound->my - ($compound->mvy + 0.5 * $compound->accY * $cAge) * $cAge;
+        $dz = $body->mz + ($body->mvz + 0.5 * $body->accZ * $bAge) * $bAge - $compound->mz - ($compound->mvz + 0.5 * $compound->accZ * $cAge) * $cAge;
+        $vx = $body->mvx + $body->accX * $bAge - $compound->mvx - $compound->accX * $cAge;
+        $vy = $body->mvy + $body->accY * $bAge - $compound->mvy - $compound->accY * $cAge;
+        $vz = $body->mvz + $body->accZ * $bAge - $compound->mvz - $compound->accZ * $cAge;
+        $relAx = $body->accX - $compound->accX;   // gravity is the same for both (direct children of the root): cancels
+        $relAy = $body->accY - $compound->accY;
+        $relAz = $body->accZ - $compound->accZ;
         $reach = $compound->radius + $body->radius;
         if ($dx * $dx + $dy * $dy + $dz * $dz - $reach * $reach > 1e-9 * $reach * $reach) {
-            return self::sphereImpact($dx, $dy, $dz, $vx, $vy, $vz, $reach);   // outside: until it comes in
+            return self::sphereImpact($dx, $dy, $dz, $vx, $vy, $vz, $reach, $relAx, $relAy, $relAz);   // outside: until it comes in
         }
         // inside, or on the boundary (where it is when it comes in): probe the parts
-        // each part: its gap, and the fastest it can close in (the origins' relative speed, plus every node above
-        // it turning it on its lever); the next look is when the first could touch
+        // each part: its gap, and the fastest it can close in (the origins' relative speed and acceleration, plus
+        // every node above it turning it on its lever); the next look is when the first could touch
         $relative = sqrt($vx * $vx + $vy * $vy + $vz * $vz);
+        $relAccel = sqrt($relAx * $relAx + $relAy * $relAy + $relAz * $relAz);
         $step = INF;
         $gap = INF;
+        $gapSpeed = 0.0;   // the bound for whichever part turned out nearest (see $gap below)
         [$x, $y, $z] = [$body->x, $body->y, $body->z];
         $this->placeParts($compound);
         foreach ($this->parts[spl_object_id($compound)] ?? [] as $i => $part) {
             $g = sqrt(($x - self::$partX[$i]) ** 2 + ($y - self::$partY[$i]) ** 2 + ($z - self::$partZ[$i]) ** 2) - $part->radius - $body->radius;
-            $gap = min($gap, $g);
             $speed = $relative;
             foreach ($this->levers[spl_object_id($part)] as [$node, $lever]) {
                 $speed += sqrt($node->mwx * $node->mwx + $node->mwy * $node->mwy + $node->mwz * $node->mwz) * $lever;
             }
-            if ($speed > 0.0) {
-                $step = min($step, ($g - self::PROBE_TOLERANCE) / $speed);
+            if ($g < $gap) {
+                [$gap, $gapSpeed] = [$g, $speed];
+            }
+            // aims for the middle of the contact zone, not its near edge: an exact speed bound (no rotation, no
+            // overestimate at all) would otherwise land this step exactly on PROBE_TOLERANCE, which touching()
+            // excludes, and PROBE_PAUSE stepping from there never recovers (see EdgeCaseTest's former
+            // baseline-failure). The acceleration bound (|a| over the step) is folded in the same way a lever is: it
+            // can only close the gap faster than $speed alone predicts, never slower.
+            $t = self::smallestRoot(0.5 * $relAccel, $speed, 1.5 * self::PROBE_TOLERANCE - $g);
+            if ($t < $step) {
+                $step = $t;
             }
         }
-        if ($gap <= 2.0 * self::PROBE_TOLERANCE) {
-            // in the contact zone: a touch now if they close in (and did not just touch), else wait a little
-            $this->nearestGap($compound, $body);
-            $touched = $this->lastTouch[spl_object_id($compound)] ?? null;
-            $again = $touched !== null && $touched[0] === spl_object_id($body) && $touched[1] === $now;
-            return $gap > self::PROBE_TOLERANCE && !$again && $this->closing($body) ? 0.0 : self::PROBE_PAUSE;
+        if ($gap > 2.0 * self::PROBE_TOLERANCE) {
+            if (($this->lastTouch[spl_object_id($compound)] ?? null) === spl_object_id($body)) {
+                unset($this->lastTouch[spl_object_id($compound)]);   // separated: a later approach may touch again
+            }
+            return max($step, 0.0);
         }
-        return max($step, 0.0);
+        // in the contact zone: a touch now if they close in and are not already touching, else wait -- capped so
+        // that even a fast closing speed cannot cross the open window (tolerance, 2 * tolerance] in one pause
+        $this->nearestGap($compound, $body);
+        $again = ($this->lastTouch[spl_object_id($compound)] ?? null) === spl_object_id($body);
+        if ($gap > self::PROBE_TOLERANCE && !$again && $this->closing($body)) {
+            return 0.0;
+        }
+        $cap = self::smallestRoot(0.5 * $relAccel, $gapSpeed, -self::PROBE_TOLERANCE / 2.0);
+        return $cap === INF ? self::PROBE_PAUSE : min(self::PROBE_PAUSE, $cap);
     }
 
     /**
@@ -564,10 +785,11 @@ final class Space
     private function touching(float $t, Node3D $compound, Node3D $body): ?Contact
     {
         $gap = $this->nearestGap($compound, $body);
-        if ($gap <= self::PROBE_TOLERANCE || $gap > 2.0 * self::PROBE_TOLERANCE || !$this->closing($body)) {
-            return null;
+        if ($gap <= self::PROBE_TOLERANCE || $gap > 2.0 * self::PROBE_TOLERANCE || !$this->closing($body)
+            || ($this->lastTouch[spl_object_id($compound)] ?? null) === spl_object_id($body)) {
+            return null;   // already touching: no new contact until the gap reopens (see compoundTime())
         }
-        $this->lastTouch[spl_object_id($compound)] = [spl_object_id($body), $t];
+        $this->lastTouch[spl_object_id($compound)] = spl_object_id($body);
         $c = new Contact($t, self::$nearest, $body);
         [$c->nx, $c->ny, $c->nz, $c->normalSpeed] = [self::$nx, self::$ny, self::$nz, self::$normalSpeed];
         return $c;

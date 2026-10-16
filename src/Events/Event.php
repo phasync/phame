@@ -14,6 +14,7 @@ class Event
     public const KEY_DOWN = 'keyDown';
     public const KEY_UP = 'keyUp';
     public const COMPLETE = 'complete';
+    public const EXPIRE = 'expire';
 
     public ?EventDispatcher $target = null;
     public ?EventDispatcher $currentTarget = null;

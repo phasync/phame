@@ -11,8 +11,8 @@ use Phame\Tests\Verification\Oracle\SceneSpec;
  */
 final class SceneGenerator
 {
-    /** N spheres at random positions and velocities, confined to a box, no tethers or compounds. */
-    public static function spheresInBox(int $seed, int $n, float $half = 12.0): SceneSpec
+    /** N spheres at random positions and velocities, confined to a box, no tethers or compounds. $gravity (Phase 1): a downward (-y) acceleration on every body, 0.0 by default (Phase 0). */
+    public static function spheresInBox(int $seed, int $n, float $half = 12.0, float $gravity = 0.0): SceneSpec
     {
         mt_srand($seed);
         $spec = new SceneSpec();
@@ -32,7 +32,7 @@ final class SceneGenerator
                 }
             } while (!$free);
             $placed[] = [$x, $y, $z, $r];
-            $spec->addBody($x, $y, $z, mt_rand(-30, 30) / 10, mt_rand(-30, 30) / 10, mt_rand(-30, 30) / 10, $r, mt_rand(5, 20) / 10, true, false);
+            $spec->addBody($x, $y, $z, mt_rand(-30, 30) / 10, mt_rand(-30, 30) / 10, mt_rand(-30, 30) / 10, $r, mt_rand(5, 20) / 10, true, false, 0.0, 0.0, 0.0, 0.0, -$gravity, 0.0);
         }
         return $spec;
     }
@@ -90,8 +90,9 @@ final class SceneGenerator
      * An open world: no walls, unconfined bodies, sparse over a large volume, radii log-uniform from 0.01 to 1000,
      * most drifting at a walking pace and a few "bullets" at 200+ units/second - the scales a general engine (not
      * just the demo's rocks-in-a-box) has to get right. One slow target and one bullet are aimed to be sure to meet.
+     * $gravity (Phase 1): a downward (-y) acceleration on every body, 0.0 by default (Phase 0).
      */
-    public static function openWorld(int $seed, int $n, float $volume = 2000.0, int $bullets = 2): SceneSpec
+    public static function openWorld(int $seed, int $n, float $volume = 2000.0, int $bullets = 2, float $gravity = 0.0): SceneSpec
     {
         mt_srand($seed);
         $spec = new SceneSpec();   // minX..maxZ stay +/-INF: unconfined, no walls
@@ -107,7 +108,7 @@ final class SceneGenerator
             [$x, $y, $z] = [mt_rand(-$half, $half) / 10.0, mt_rand(-$half, $half) / 10.0, mt_rand(-$half, $half) / 10.0];
             $speed = $i < $bullets ? mt_rand(2000, 4000) / 10.0 : mt_rand(5, 20) / 10.0;
             [$dx, $dy, $dz] = $dir();
-            $spec->addBody($x, $y, $z, $dx * $speed, $dy * $speed, $dz * $speed, $r, mt_rand(5, 200) / 10.0, false, false);
+            $spec->addBody($x, $y, $z, $dx * $speed, $dy * $speed, $dz * $speed, $r, mt_rand(5, 200) / 10.0, false, false, 0.0, 0.0, 0.0, 0.0, -$gravity, 0.0);
         }
         $t = 1.2;
         $target = $spec->addBody(0.0, 0.0, 0.0, 0.5, -0.3, 0.2, 8.0, 10.0, false, false);

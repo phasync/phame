@@ -15,6 +15,13 @@ namespace Phame\Tests\Verification\Oracle;
  * Spin is a schedule, not a single rate, so a joint that turns back at a limit can be described exactly: parallel
  * segment arrays per body/node, each a start time (the first always 0.0) and the angular velocity from there until
  * the next start time (or forever, for the last).
+ *
+ * Phase 1 (docs/PHYSICS-PLAN.md): a body's or node's own acceleration is constant for the whole run, in its parent's
+ * space (Node3D::setAcceleration()) - never a schedule, unlike spin, since nothing here ever changes it mid-run.
+ * Gravity on an ancestor needs no field of its own: it is just the same acceleration given directly to every body it
+ * would reach (see docs/VERIFICATION.md, "Phase 1"), which is exactly what the engine computes once composed through
+ * the tree. A node, unlike in Phase 0, may also carry its own constant linear velocity, so a part can fall (or be
+ * thrown) within its compound, not just turn.
  */
 final class SceneSpec
 {
@@ -32,6 +39,10 @@ final class SceneSpec
     /** @var list<float> */ public array $bodyVX = [];
     /** @var list<float> */ public array $bodyVY = [];
     /** @var list<float> */ public array $bodyVZ = [];
+    /** @var list<float> constant for the whole run (Phase 1): see class docblock */
+    public array $bodyAX = [];
+    /** @var list<float> */ public array $bodyAY = [];
+    /** @var list<float> */ public array $bodyAZ = [];
     /** @var list<float> */ public array $bodyRadius = [];
     /** @var list<float> */ public array $bodyMass = [];
     /** @var list<bool> */ public array $bodyConfined = [];
@@ -48,6 +59,14 @@ final class SceneSpec
     /** @var list<float> */ public array $nodeOffsetX = [];
     /** @var list<float> */ public array $nodeOffsetY = [];
     /** @var list<float> */ public array $nodeOffsetZ = [];
+    /** @var list<float> constant for the whole run, in the parent's space (Phase 1): a part can fall within its compound */
+    public array $nodeVX = [];
+    /** @var list<float> */ public array $nodeVY = [];
+    /** @var list<float> */ public array $nodeVZ = [];
+    /** @var list<float> constant for the whole run (Phase 1): see class docblock */
+    public array $nodeAX = [];
+    /** @var list<float> */ public array $nodeAY = [];
+    /** @var list<float> */ public array $nodeAZ = [];
     /** @var list<float> */ public array $nodeRadius = [];
     /** @var list<list<float>> */ public array $nodeSpinStart = [];
     /** @var list<list<float>> */ public array $nodeSpinX = [];
@@ -59,8 +78,8 @@ final class SceneSpec
     /** @var list<int> */ public array $tetherB = [];
     /** @var list<float> */ public array $tetherLength = [];
 
-    /** Adds a body, with a constant spin (or none: the default) from t = 0. Returns its index. */
-    public function addBody(float $x, float $y, float $z, float $vx, float $vy, float $vz, float $radius, float $mass, bool $confined, bool $compound, float $spinX = 0.0, float $spinY = 0.0, float $spinZ = 0.0): int
+    /** Adds a body, with a constant spin and a constant acceleration (or none: the default) from t = 0. Returns its index. */
+    public function addBody(float $x, float $y, float $z, float $vx, float $vy, float $vz, float $radius, float $mass, bool $confined, bool $compound, float $spinX = 0.0, float $spinY = 0.0, float $spinZ = 0.0, float $ax = 0.0, float $ay = 0.0, float $az = 0.0): int
     {
         $i = count($this->bodyX);
         $this->bodyX[] = $x;
@@ -69,6 +88,9 @@ final class SceneSpec
         $this->bodyVX[] = $vx;
         $this->bodyVY[] = $vy;
         $this->bodyVZ[] = $vz;
+        $this->bodyAX[] = $ax;
+        $this->bodyAY[] = $ay;
+        $this->bodyAZ[] = $az;
         $this->bodyRadius[] = $radius;
         $this->bodyMass[] = $mass;
         $this->bodyConfined[] = $confined;
@@ -80,8 +102,11 @@ final class SceneSpec
         return $i;
     }
 
-    /** Adds a node under a body ($parentIsBody) or another node, with a constant spin from t = 0. Returns its index. */
-    public function addNode(bool $parentIsBody, int $parentIndex, float $ox, float $oy, float $oz, float $radius, float $spinX = 0.0, float $spinY = 0.0, float $spinZ = 0.0): int
+    /**
+     * Adds a node under a body ($parentIsBody) or another node, with a constant spin, a constant linear velocity and
+     * a constant acceleration (or none of those: the default) from t = 0. Returns its index.
+     */
+    public function addNode(bool $parentIsBody, int $parentIndex, float $ox, float $oy, float $oz, float $radius, float $spinX = 0.0, float $spinY = 0.0, float $spinZ = 0.0, float $vx = 0.0, float $vy = 0.0, float $vz = 0.0, float $ax = 0.0, float $ay = 0.0, float $az = 0.0): int
     {
         $i = count($this->nodeParentIsBody);
         $this->nodeParentIsBody[] = $parentIsBody;
@@ -89,6 +114,12 @@ final class SceneSpec
         $this->nodeOffsetX[] = $ox;
         $this->nodeOffsetY[] = $oy;
         $this->nodeOffsetZ[] = $oz;
+        $this->nodeVX[] = $vx;
+        $this->nodeVY[] = $vy;
+        $this->nodeVZ[] = $vz;
+        $this->nodeAX[] = $ax;
+        $this->nodeAY[] = $ay;
+        $this->nodeAZ[] = $az;
         $this->nodeRadius[] = $radius;
         $this->nodeSpinStart[] = [0.0];
         $this->nodeSpinX[] = [$spinX];

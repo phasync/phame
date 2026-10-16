@@ -3,11 +3,9 @@
 namespace Phame\Tests\Verification;
 
 use Phame\Physics\Contact;
-use Phame\Physics\Space;
 use Phame\Scene\Node3D;
 use Phame\Scene\Scene3D;
 use Phame\World;
-use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -178,20 +176,15 @@ final class EdgeCaseTest extends TestCase
         $world->dispose();
     }
 
-    #[Group('baseline-failure')]
     public function testAHeadOnApproachToACompoundPartIsReported(): void
     {
-        // BASELINE FAILURE (today's engine, not modified to fix it -- see docs/PHYSICS-PLAN.md Phase 0): a compound
-        // moving at a constant velocity, not spinning, with a part dead-centre in the path of an incoming body at a
-        // constant relative speed. Space::compoundTime()'s step formula, ($gap - PROBE_TOLERANCE) / $speed, predicts
-        // exactly when the gap will equal PROBE_TOLERANCE -- normally a slight overestimate of the true closing
-        // speed leaves slack, so the next probe lands inside Space::touching()'s open window
-        // (PROBE_TOLERANCE, 2*PROBE_TOLERANCE]. Here the bound is exact (no rotation, a straight line, no second
-        // velocity component to pad it), so the probe lands exactly ON the excluded boundary (gap == tolerance),
-        // touching() rejects it (<=), and then PROBE_PAUSE-sized steps (at this speed, 2x PROBE_TOLERANCE per step)
-        // jump clean over the open window. The bodies pass straight through one another, unreported, which is a
-        // reliability hole in event-driven compound detection -- confirmed by hand: the two spheres' centres
-        // coincide exactly at t = 5 (see the arithmetic below), yet no contact is ever raised.
+        // FIXED BASELINE FAILURE (see docs/PHYSICS-PLAN.md Phase 1): a compound moving at a constant velocity, not
+        // spinning, with a part dead-centre in the path of an incoming body at a constant relative speed. With no
+        // rotation and no second velocity component to pad it, Space::compoundTime()'s old step formula,
+        // ($gap - PROBE_TOLERANCE) / $speed, landed exactly ON the tolerance boundary, which Space::touching()
+        // excludes, and PROBE_PAUSE-sized steps from there never recovered: the bodies passed straight through one
+        // another, unreported. compoundTime() now aims each step at the middle of the contact zone
+        // (1.5 * PROBE_TOLERANCE), so an exact bound still lands inside the open window.
         $world = new World();
         $scene = $world->stage->addChild(new Scene3D(100, 100));
         $root = new Node3D();
@@ -209,8 +202,9 @@ final class EdgeCaseTest extends TestCase
         $rock->setVelocity(2.0, -2.0, 0.0);
         $scene->root->addChild($rock);
         $hits = [];
-        $world->onCollision(function (Node3D $a, Node3D $b, Contact $c) use (&$hits) {
+        $world->onCollision(function (Node3D $part, Node3D $rock, Contact $c) use (&$hits) {
             $hits[] = $c->time;
+            $rock->velocityY = -$rock->velocityY;   // separates them, or the probe keeps reporting the same overlap
         });
         \phasync::run(static function () use ($world, &$hits) {
             $world->run(static function (World $w) use (&$hits) {
@@ -219,10 +213,8 @@ final class EdgeCaseTest extends TestCase
                 }
             });
         });
-        // by hand: rock->y(t) = 10 - 2t reaches the part's y = 0 at t = 5, where rock->x(t) = 3 + 2t = part->x(t) =
-        // 2t + 3 for every t -- the centres coincide exactly at t = 5, well inside Space::PROBE_TOLERANCE * 2 on
-        // either side; today's engine reports nothing
-        // the surfaces meet when the centres are 1 apart: 10 - 2t = 1 at t = 4.5 (within the probe tolerance)
+        // by hand: the surfaces meet when the centres (1 apart in x and 0 in y initially... see above) are 1 apart:
+        // |10 - 2t| = 1 at t = 4.5, well inside the open window around Space::PROBE_TOLERANCE either side
         $this->assertCount(1, $hits, 'the head-on approach must be reported');
         $this->assertEqualsWithDelta(4.5, $hits[0], 0.02);
         $world->dispose();
