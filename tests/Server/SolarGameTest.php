@@ -59,12 +59,15 @@ class SolarGameTest extends TestCase
         $this->assertNotNull($moon, 'the Moon should be in the snapshot');
         $this->assertSame(SolarSystem::KIND_MOON, $byId[$moon]['kind']);
 
-        // Moon -> orbit frame -> Earth's anchor
+        // Moon -> orbit frame -> Earth's (unnamed) anchor, which also carries the named Earth body as a sibling
         $orbitFrameId = $byId[$moon]['parentId'];
         $this->assertSame(SolarSystem::KIND_ORBIT_FRAME, $byId[$orbitFrameId]['kind']);
         $earthAnchorId = $byId[$orbitFrameId]['parentId'];
-        $this->assertSame('Earth', $byId[$earthAnchorId]['name']);
+        $this->assertSame('', $byId[$earthAnchorId]['name'], 'the anchor itself is unnamed; the name is on the body');
         $this->assertSame(SolarSystem::KIND_ANCHOR, $byId[$earthAnchorId]['kind']);
+        $earthBody = array_filter($byId, static fn ($n) => $n['parentId'] === $earthAnchorId && $n['name'] === 'Earth');
+        $this->assertCount(1, $earthBody, "Earth's anchor should have exactly one child named Earth (its body)");
+        $this->assertSame(SolarSystem::KIND_PLANET, reset($earthBody)['kind']);
     }
 
     public function testSnapshotIncludesStarPlanetsAndAsteroids(): void

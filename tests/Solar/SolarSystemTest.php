@@ -70,8 +70,8 @@ class SolarSystemTest extends TestCase
     private function verifyMoonPosition(Scene3D $scene, World $w, float $tolerance): int
     {
         $moonNode = $scene->root->findByName('Moon');
-        $earthNode = $scene->root->findByName('Earth');
-        if ($moonNode === null || $earthNode === null) {
+        $earthBody = $scene->root->findByName('Earth');   // the name is on the visible body, not its anchor
+        if ($moonNode === null || $earthBody === null) {
             return 0;
         }
 
@@ -79,9 +79,10 @@ class SolarSystemTest extends TestCase
         [$mx_eph, $my_eph, $mz_eph] = Ephemeris::moonPositionGeocentric($unix);
 
         [$mx, $my, $mz] = $this->worldPosition($moonNode);
-        $dx = ($mx - $earthNode->x) - $mx_eph;
-        $dy = ($my - $earthNode->y) - $my_eph;
-        $dz = ($mz - $earthNode->z) - $mz_eph;
+        [$ex, $ey, $ez] = $this->worldPosition($earthBody);
+        $dx = ($mx - $ex) - $mx_eph;
+        $dy = ($my - $ey) - $my_eph;
+        $dz = ($mz - $ez) - $mz_eph;
         $dist = sqrt($dx*$dx + $dy*$dy + $dz*$dz);
 
         $this->assertLessThan($tolerance, $dist, "Moon position mismatch at t={$w->clock->time}: {$dist} km");
@@ -93,10 +94,8 @@ class SolarSystemTest extends TestCase
         $this->runTicked(604800.0, function (World $w, Scene3D $scene) {
             $system = new SolarSystem($scene, $this->epoch);
 
-            $earth = $scene->root->findByName('Earth');
-            $this->assertNotNull($earth, 'Earth anchor not found');
-            $bodyNode = $earth->children[0] ?? null;
-            $this->assertNotNull($bodyNode, 'Earth body node not found');
+            $bodyNode = $scene->root->findByName('Earth');   // the name is on the visible body, not its anchor
+            $this->assertNotNull($bodyNode, 'Earth body not found');
 
             [$initialPx, $initialPy, $initialPz] = $this->poleDirection($bodyNode);
 
@@ -130,11 +129,12 @@ class SolarSystemTest extends TestCase
             $system = new SolarSystem($scene, $this->epoch);
 
             foreach (['Mercury', 'Venus', 'Earth', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune'] as $planet) {
-                $node = $scene->root->findByName($planet);
-                $this->assertNotNull($node, "$planet anchor not found");
-                $body = $node->children[0] ?? null;
+                $body = $scene->root->findByName($planet);   // the name is on the visible body, not its anchor
                 $this->assertNotNull($body, "$planet body not found");
                 $this->assertGreaterThan(0, $body->radius, "$planet body radius not set");
+                $anchor = $body->parent;
+                $this->assertNotNull($anchor, "$planet anchor not found");
+                $this->assertSame('', $anchor->name, "$planet anchor should be unnamed");
             }
 
             $this->assertNotNull($scene->root->findByName('Moon'), 'Moon not found');
@@ -154,15 +154,16 @@ class SolarSystemTest extends TestCase
             for ($i = 0; $i < 7; $i++) {
                 Async::awaitFrame();
 
-                $earthNode = $scene->root->findByName('Earth');
-                $this->assertNotNull($earthNode, 'Earth anchor not found');
+                $earthBody = $scene->root->findByName('Earth');   // the name is on the visible body, not its anchor
+                $this->assertNotNull($earthBody, 'Earth body not found');
 
                 $unix = $this->epoch + $w->clock->time;
                 [$ex_eph, $ey_eph, $ez_eph] = array_slice(Ephemeris::planetPositionVelocity('Earth', $unix), 0, 3);
 
-                $dx = $earthNode->x - $ex_eph;
-                $dy = $earthNode->y - $ey_eph;
-                $dz = $earthNode->z - $ez_eph;
+                [$ex, $ey, $ez] = $this->worldPosition($earthBody);
+                $dx = $ex - $ex_eph;
+                $dy = $ey - $ey_eph;
+                $dz = $ez - $ez_eph;
                 $dist = sqrt($dx*$dx + $dy*$dy + $dz*$dz);
 
                 $this->assertLessThan($tolerance, $dist, "Earth position error at t={$w->clock->time}: {$dist} km");
@@ -180,15 +181,16 @@ class SolarSystemTest extends TestCase
             for ($i = 0; $i < 24; $i++) {
                 Async::awaitFrame();
 
-                $mars = $scene->root->findByName('Mars');
+                $mars = $scene->root->findByName('Mars');   // the name is on the visible body, not its anchor
                 $phobos = $scene->root->findByName('Phobos');
                 $this->assertNotNull($mars);
                 $this->assertNotNull($phobos);
 
+                [$mx, $my, $mz] = $this->worldPosition($mars);
                 [$phx, $phy, $phz] = $this->worldPosition($phobos);
-                $px_tree = $phx - $mars->x;
-                $py_tree = $phy - $mars->y;
-                $pz_tree = $phz - $mars->z;
+                $px_tree = $phx - $mx;
+                $py_tree = $phy - $my;
+                $pz_tree = $phz - $mz;
 
                 [$px_eph, $py_eph, $pz_eph] = $this->phobosReference($w->clock->time);
 
@@ -231,6 +233,7 @@ class SolarSystemTest extends TestCase
                 // many phases relative to a refit, including right before one (about to expire) and right after.
                 Async::awaitFrame();
 
+                // the name is on each visible body, not its anchor
                 $earth = $scene->root->findByName('Earth');
                 $moon = $scene->root->findByName('Moon');
                 $mars = $scene->root->findByName('Mars');
@@ -238,16 +241,18 @@ class SolarSystemTest extends TestCase
                 $t = $w->clock->time;
                 $unix = $this->epoch + $t;
 
+                [$earthX, $earthY, $earthZ] = $this->worldPosition($earth);
                 [$ex, $ey, $ez] = array_slice(Ephemeris::planetPositionVelocity('Earth', $unix), 0, 3);
-                $this->assertLessThan($tolerance, $this->dist3($earth->x, $earth->y, $earth->z, $ex, $ey, $ez), "Earth mismatch at t={$t}");
+                $this->assertLessThan($tolerance, $this->dist3($earthX, $earthY, $earthZ, $ex, $ey, $ez), "Earth mismatch at t={$t}");
 
                 [$mx, $my, $mz] = Ephemeris::moonPositionGeocentric($unix);
                 [$moonX, $moonY, $moonZ] = $this->worldPosition($moon);
-                $this->assertLessThan($tolerance, $this->dist3($moonX - $earth->x, $moonY - $earth->y, $moonZ - $earth->z, $mx, $my, $mz), "Moon mismatch at t={$t}");
+                $this->assertLessThan($tolerance, $this->dist3($moonX - $earthX, $moonY - $earthY, $moonZ - $earthZ, $mx, $my, $mz), "Moon mismatch at t={$t}");
 
+                [$marsX, $marsY, $marsZ] = $this->worldPosition($mars);
                 [$px, $py, $pz] = $this->phobosReference($t);
                 [$phobosX, $phobosY, $phobosZ] = $this->worldPosition($phobos);
-                $this->assertLessThan($tolerance, $this->dist3($phobosX - $mars->x, $phobosY - $mars->y, $phobosZ - $mars->z, $px, $py, $pz), "Phobos mismatch at t={$t}");
+                $this->assertLessThan($tolerance, $this->dist3($phobosX - $marsX, $phobosY - $marsY, $phobosZ - $marsZ, $px, $py, $pz), "Phobos mismatch at t={$t}");
                 $checks++;
             }
 
@@ -272,9 +277,10 @@ class SolarSystemTest extends TestCase
         $this->runTicked(1.0, function (World $w, Scene3D $scene) {
             $system = new SolarSystem($scene, $this->epoch);
 
-            $earth = $scene->root->findByName('Earth');
-            $this->assertNotNull($earth, 'Earth anchor not found');
-            $this->assertSame('Earth', $system->nearestNamed($earth->x, $earth->y, $earth->z), 'Earth should be nearest to itself');
+            $earth = $scene->root->findByName('Earth');   // the name is on the visible body, not its anchor
+            $this->assertNotNull($earth, 'Earth body not found');
+            [$ex, $ey, $ez] = $this->worldPosition($earth);
+            $this->assertSame('Earth', $system->nearestNamed($ex, $ey, $ez), 'Earth should be nearest to itself');
 
             $moon = $scene->root->findByName('Moon');
             $this->assertNotNull($moon, 'Moon not found');
