@@ -6,54 +6,552 @@
 <title>Solar system war</title>
 <style>
   :root { color-scheme: dark; }
-  html, body { margin: 0; height: 100%; background: #03040a; font: 13px/1.45 system-ui, sans-serif; color: #cfd3e6; }
-  #hud { position: fixed; left: 12px; top: 10px; padding: 8px 11px; border-radius: 8px; background: rgba(10, 12, 24, .7); white-space: pre; }
+  html, body { margin: 0; height: 100%; background: #000103; overflow: hidden; font: 13px/1.45 system-ui, sans-serif; color: #cfd3e6; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: grab; touch-action: none; }
+  canvas:active { cursor: grabbing; }
+  #hud { position: fixed; left: 12px; top: 10px; padding: 8px 11px; border-radius: 8px; background: rgba(10, 12, 24, .72); backdrop-filter: blur(6px); white-space: pre; pointer-events: none; min-width: 15rem; }
+  #hud b { color: #ffd77a; font-weight: 600; }
+  #hud .k { color: #8890b0; }
+  #labels { position: fixed; inset: 0; pointer-events: none; overflow: hidden; }
+  .label { position: absolute; transform: translate(-50%, -50%); font-size: 11px; color: #e4e8ff; text-shadow: 0 0 4px #000, 0 0 2px #000; white-space: nowrap; pointer-events: auto; cursor: pointer; padding: 2px 5px; }
+  .label:hover { color: #ffd77a; }
+  .label .dot { display: inline-block; width: 4px; height: 4px; border-radius: 50%; background: #e4e8ff; margin-right: 4px; vertical-align: middle; }
+  #panel { position: fixed; right: 10px; bottom: 10px; padding: 8px 10px; border-radius: 8px; background: rgba(10, 12, 24, .72); backdrop-filter: blur(6px); max-width: 280px; }
+  #panel .row { display: flex; align-items: center; gap: 6px; margin: 3px 0; }
+  #panel button { background: #1b2040; color: #cfd3e6; border: 1px solid #38406e; border-radius: 5px; padding: 3px 8px; font: inherit; cursor: pointer; }
+  #panel button:hover { background: #2a2f58; }
+  #panel input[type=range] { flex: 1; }
+  #panel .time { color: #8890b0; font-size: 11px; }
+  #help { position: fixed; left: 12px; bottom: 10px; color: #70769a; font-size: 11px; pointer-events: none; }
+  @media (max-width: 640px) {
+    #hud { font-size: 12px; min-width: 11rem; }
+    #panel { max-width: 46vw; font-size: 11px; }
+    #help { display: none; }
+  }
 </style>
 </head>
 <body>
+<canvas id="c"></canvas>
 <div id="hud">Connecting…</div>
+<div id="labels"></div>
+<div id="panel">
+  <div class="row"><b>Time</b> <span class="time" id="timeLabel">now</span></div>
+  <div class="row">
+    <button id="tMinusDay">-1d</button><button id="tMinusHour">-1h</button><button id="tNow">now</button><button id="tPlusHour">+1h</button><button id="tPlusDay">+1d</button>
+  </div>
+  <div class="row"><input id="tSlider" type="range" min="-720" max="720" step="1" value="0"></div>
+  <div class="row"><button id="eclipse" style="flex:1">Next lunar eclipse</button></div>
+</div>
+<div id="help">drag to orbit · wheel/pinch to zoom · 0-9 or Tab: pick target · click a label</div>
 <script>
 'use strict';
-// Placeholder client: confirms the socket and the wire protocol (see PhameServer\SolarGame's docblock) work.
-// The full WebGL renderer for this demo is a separate piece of work, built from that documented protocol.
+// The Solar System War observer client. Reads PhameServer\SolarGame's wire protocol (see its docblock): a snapshot
+// of the node tree, then binary description batches. Every node's world position/orientation is evaluated in
+// double-precision JS from its motion description (position = p0 + v*dt + 1/2*a*dt^2, orientation turned by a
+// constant spin, composed parent-to-child), then rendered relative to the camera (subtracting the camera's world
+// position in doubles before the float32 upload to the GPU) so nothing jitters at planetary distances. A
+// logarithmic depth trick (the Outerra w-based remap) lets a nearby moon and a planet billions of km away both
+// draw correctly. Shadows (for eclipses) are evaluated analytically per fragment against the nearest large bodies.
+
+const canvas = document.getElementById('c');
 const hud = document.getElementById('hud');
+const labelsEl = document.getElementById('labels');
+const gl = canvas.getContext('webgl2', { antialias: false });
+if (!gl) { hud.textContent = 'WebGL2 is not available in this browser.'; throw new Error('no webgl2'); }
+
+const AU = 1.495978707e8; // km
+
+// ---------- shaders
+const FAR = 2e11; // km, generous: covers the whole system and then some; only the log-depth remap uses it
+const SPHERE_VS = `#version 300 es
+  layout(location = 0) in vec3 aPos;
+  layout(location = 1) in vec3 aNormal;
+  layout(location = 2) in vec4 aCenterRadius;  // center.xyz (camera-relative, km), renderRadius (km)
+  layout(location = 3) in vec4 aColorFlag;     // color.rgb, isSun (0/1)
+  layout(location = 4) in vec4 aQuat;          // body orientation, camera-independent
+  uniform mat4 uViewProjection;
+  uniform float uFar;
+  out vec3 vNormal; out vec3 vWorldPos; out vec3 vColor; out float vIsSun; out vec3 vCenter; out float vRadius;
+  mat3 quatToMat3(vec4 q) {
+    float x = q.x, y = q.y, z = q.z, w = q.w;
+    return mat3(1.0 - 2.0*(y*y+z*z), 2.0*(x*y+w*z), 2.0*(x*z-w*y),
+                2.0*(x*y-w*z), 1.0 - 2.0*(x*x+z*z), 2.0*(y*z+w*x),
+                2.0*(x*z+w*y), 2.0*(y*z-w*x), 1.0 - 2.0*(x*x+y*y));
+  }
+  void main() {
+    vec3 center = aCenterRadius.xyz; float r = aCenterRadius.w;
+    mat3 R = quatToMat3(aQuat);
+    vec3 n = R * aNormal;
+    vWorldPos = center + n * r;
+    vNormal = n; vColor = aColorFlag.rgb; vIsSun = aColorFlag.w; vCenter = center; vRadius = r;
+    vec4 clip = uViewProjection * vec4(vWorldPos, 1.0);
+    float Fcoef = 1.0 / log2(uFar + 1.0);
+    clip.z = (log2(max(1e-6, clip.w + 1.0)) * Fcoef * 2.0 - 1.0) * clip.w;   // logarithmic depth (Outerra)
+    gl_Position = clip;
+  }`;
+const SPHERE_FS = `#version 300 es
+  precision highp float;
+  in vec3 vNormal; in vec3 vWorldPos; in vec3 vColor; in float vIsSun; in vec3 vCenter; in float vRadius;
+  uniform vec3 uSunPos; uniform float uSunRadius;
+  uniform vec3 uOccPos[4]; uniform float uOccRadius[4]; uniform int uOccCount;
+  out vec4 outColor;
+  // area of the circular segment of a circle (radius r) cut by a chord at distance d1 from its centre
+  float segment(float r, float d1) { return r*r*acos(clamp(d1/r, -1.0, 1.0)) - d1*sqrt(max(r*r - d1*d1, 0.0)); }
+  float lensArea(float d, float r1, float r2) {
+    float d1 = (d*d - r2*r2 + r1*r1) / (2.0*d);
+    return segment(r1, d1) + segment(r2, d - d1);
+  }
+  // fraction of the sun's disc (angular radius r1) covered by an occluder (angular radius r2) separated by angle d
+  float coverage(float d, float r1, float r2) {
+    if (d >= r1 + r2) return 0.0;
+    if (d <= abs(r1 - r2)) { float m = min(r1, r2); return (m*m) / (r1*r1); }
+    return clamp(lensArea(d, r1, r2) / (3.14159265 * r1 * r1), 0.0, 1.0);
+  }
+  void main() {
+    vec3 N = normalize(vNormal);
+    vec3 toSun = uSunPos - vWorldPos; float dSun = length(toSun); vec3 L = toSun / max(dSun, 1e-6);
+    float ndotl = max(dot(N, L), 0.0);
+    float shadow = 0.0;
+    if (vIsSun < 0.5) {
+      float sunAngR = uSunRadius / dSun;
+      for (int i = 0; i < 4; i++) {
+        if (i >= uOccCount) break;
+        vec3 toOcc = uOccPos[i] - vWorldPos; float dOcc = length(toOcc);
+        if (dOcc < vRadius * 1.2) continue;   // this body is its own "occluder" entry: skip
+        vec3 Locc = toOcc / dOcc;
+        float occAngR = uOccRadius[i] / dOcc;
+        float theta = acos(clamp(dot(L, Locc), -1.0, 1.0));
+        shadow = max(shadow, coverage(theta, sunAngR, occAngR));
+      }
+    }
+    float lit = ndotl * (1.0 - shadow);
+    vec3 base;
+    if (vIsSun > 0.5) {
+      base = vColor * 2.4;
+    } else {
+      base = vColor * (0.035 + 0.965 * lit);
+      if (shadow > 0.2) base = mix(base, vec3(0.5, 0.2, 0.09) * (0.04 + 0.6 * ndotl), clamp((shadow - 0.2) / 0.8, 0.0, 1.0) * 0.75);
+      base *= 1.0 + 0.04 * sin(N.y * 16.0 + vRadius * 0.01);   // cheap banding, visible mainly on gas giants
+    }
+    outColor = vec4(base, 1.0);
+  }`;
+const BG_VS = `#version 300 es
+  out vec2 vUv;
+  void main() { vec2 p = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0); vUv = p; gl_Position = vec4(p, 0.99999, 1.0); }`;
+const BG_FS = `#version 300 es
+  precision highp float;
+  in vec2 vUv; uniform mat4 uInverseViewProjection; out vec4 outColor;
+  float hash(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+  void main() {
+    vec4 a = uInverseViewProjection * vec4(vUv, -1.0, 1.0), b = uInverseViewProjection * vec4(vUv, 1.0, 1.0);
+    vec3 d = normalize(a.xyz / a.w - b.xyz / b.w);
+    vec3 cell = floor(d * 280.0);
+    float s = step(0.9985, hash(cell)) * (0.4 + 1.6 * hash(cell + 3.1));
+    outColor = vec4(vec3(s), 1.0);
+  }`;
+
+function compile(type, src) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { const log = gl.getShaderInfoLog(s); hud.textContent = 'Shader error: ' + log; throw new Error(log); }
+  return s;
+}
+function program(vs, fs) {
+  const p = gl.createProgram(); gl.attachShader(p, compile(gl.VERTEX_SHADER, vs)); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {}; return { p, u: name => u[name] ??= gl.getUniformLocation(p, name) };
+}
+const sphereProgram = program(SPHERE_VS, SPHERE_FS);
+const bgProgram = program(BG_VS, BG_FS);
+
+// ---------- a single shared unit sphere, instanced
+function icosphere(levels) {
+  const t = (1 + Math.sqrt(5)) / 2;
+  let v = [[-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0], [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t], [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1]];
+  let f = [[0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11], [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8], [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9], [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1]];
+  v = v.map(p => { const l = Math.hypot(...p); return p.map(c => c / l); });
+  for (let l = 0; l < levels; l++) {
+    const cache = new Map(), nf = [];
+    const mid = (a, b) => {
+      const k = a < b ? a + ',' + b : b + ',' + a;
+      if (!cache.has(k)) { const m = v[a].map((c, i) => (c + v[b][i]) / 2); const n = Math.hypot(...m); v.push(m.map(c => c / n)); cache.set(k, v.length - 1); }
+      return cache.get(k);
+    };
+    for (const [a, b, c] of f) { const ab = mid(a, b), bc = mid(b, c), ca = mid(c, a); nf.push([a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]); }
+    f = nf;
+  }
+  return { positions: new Float32Array(v.flat()), normals: new Float32Array(v.flat()), indices: new Uint16Array(f.flat()) };
+}
+const SPHERE_FLOATS = 12; // per instance: center.xyz, radius | color.rgb, isSun | qx qy qz qw
+const geo = icosphere(2);
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+function staticBuf(data, target = gl.ARRAY_BUFFER) { const b = gl.createBuffer(); gl.bindBuffer(target, b); gl.bufferData(target, data, gl.STATIC_DRAW); return b; }
+staticBuf(geo.positions); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+staticBuf(geo.normals); gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+staticBuf(geo.indices, gl.ELEMENT_ARRAY_BUFFER);
+const instanceBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, instanceBuf);
+for (let i = 0; i < 3; i++) { gl.enableVertexAttribArray(2 + i); gl.vertexAttribPointer(2 + i, 4, gl.FLOAT, false, SPHERE_FLOATS * 4, i * 16); }
+gl.bindVertexArray(null);
+let instanceData = new Float32Array(SPHERE_FLOATS * 1024);
+const emptyVao = gl.createVertexArray();
+
+// ---------- math: quaternion compose/rotate, matrices (double precision; JS numbers are doubles throughout)
+const qmul = (a, b) => [a[3]*b[0] + a[0]*b[3] + a[1]*b[2] - a[2]*b[1], a[3]*b[1] - a[0]*b[2] + a[1]*b[3] + a[2]*b[0],
+  a[3]*b[2] + a[0]*b[1] - a[1]*b[0] + a[2]*b[3], a[3]*b[3] - a[0]*b[0] - a[1]*b[1] - a[2]*b[2]];
+function qrot(q, v) {
+  const [x, y, z, w] = q, tx = 2*(y*v[2] - z*v[1]), ty = 2*(z*v[0] - x*v[2]), tz = 2*(x*v[1] - y*v[0]);
+  return [v[0] + w*tx + y*tz - z*ty, v[1] + w*ty + z*tx - x*tz, v[2] + w*tz + x*ty - y*tx];
+}
+const sub = (a, b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+const dot3 = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+const cross = (a, b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+const norm = a => { const l = Math.hypot(...a) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+const lerp = (a, b, t) => a + (b - a) * t;
+function perspective(fov, aspect, near, far) { const f = 1/Math.tan(fov/2), n = 1/(near-far); return [f/aspect,0,0,0, 0,f,0,0, 0,0,(far+near)*n,-1, 0,0,2*far*near*n,0]; }
+function lookAt(e, t, u) { const z = norm(sub(e,t)), x = norm(cross(u,z)), y = cross(z,x); return [x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0, -dot3(x,e),-dot3(y,e),-dot3(z,e),1]; }
+function multiply(a, b) { const o = new Array(16); for (let c=0;c<4;c++) for (let r=0;r<4;r++) { let s=0; for (let k=0;k<4;k++) s += a[k*4+r]*b[c*4+k]; o[c*4+r]=s; } return o; }
+
+// ---------- node tree: id -> {parentId, name, radius, kind, desc:[t0,x,y,z,vx,vy,vz,qx,qy,qz,qw,wx,wy,wz,ax,ay,az]}
+const KIND_STAR = 0, KIND_PLANET = 1, KIND_MOON = 2, KIND_ASTEROID = 3, KIND_ANCHOR = 4, KIND_ORBIT_FRAME = 5;
+let nodesById = new Map(), order = [], nameToId = new Map(), largeBodies = [], targetList = [];
+let epoch = null, gameTimeKnown = 0;
+const worldPos = new Map(), worldQuat = new Map();
+
+const COLORS = {
+  Sun: [1.0, 0.82, 0.35], Mercury: [0.62, 0.59, 0.56], Venus: [0.86, 0.76, 0.52], Earth: [0.18, 0.4, 0.62],
+  Moon: [0.62, 0.62, 0.6], Mars: [0.68, 0.33, 0.21], Jupiter: [0.78, 0.63, 0.46], Saturn: [0.85, 0.74, 0.55],
+  Uranus: [0.56, 0.8, 0.85], Neptune: [0.26, 0.42, 0.86], Io: [0.85, 0.78, 0.4], Europa: [0.75, 0.72, 0.68],
+  Ganymede: [0.55, 0.52, 0.5], Callisto: [0.45, 0.43, 0.42], Titan: [0.8, 0.68, 0.4], Phobos: [0.5, 0.46, 0.43],
+  Deimos: [0.5, 0.46, 0.43],
+};
+function colorFor(n) { return COLORS[n.name] || (n.kind === KIND_ASTEROID ? [0.5, 0.48, 0.46] : [0.6, 0.6, 0.62]); }
+
+function computeWorld(t) {
+  worldPos.set(0, [0, 0, 0]); worldQuat.set(0, [0, 0, 0, 1]);
+  for (const id of order) {
+    const n = nodesById.get(id), d = n.desc, dt = t - d[0];
+    const local = [d[1] + d[4]*dt + 0.5*d[14]*dt*dt, d[2] + d[5]*dt + 0.5*d[15]*dt*dt, d[3] + d[6]*dt + 0.5*d[16]*dt*dt];
+    let q = [d[7], d[8], d[9], d[10]];
+    const wx = d[11], wy = d[12], wz = d[13], spin = Math.hypot(wx, wy, wz);
+    if (spin > 1e-12) { const half = spin * dt / 2, s = Math.sin(half) / spin; q = qmul([wx*s, wy*s, wz*s, Math.cos(half)], q); }
+    const pw = worldPos.get(n.parentId) || [0, 0, 0], qw = worldQuat.get(n.parentId) || [0, 0, 0, 1];
+    const rotated = qrot(qw, local);
+    worldPos.set(id, [pw[0] + rotated[0], pw[1] + rotated[1], pw[2] + rotated[2]]);
+    worldQuat.set(id, qmul(qw, q));
+  }
+}
+
+// ---------- clock: estimate server (game-time) offset from ping round trips; evaluate at that time + a user offset
+let offset = null, bestRtt = Infinity, rttAvg = 0, jitter = 0, delay = 0.05, worker = null;
+function serverNow() { return performance.now() / 1000 + (offset ?? 0); }
+let timeOffset = 0; // seconds, user-controlled ("now" by default)
+function evalTime() { return serverNow() - delay + timeOffset; }
+
+// ---------- connection
 const base = /\.[a-z0-9]+$/i.test(location.pathname) ? location.pathname.replace(/[^/]*$/, '') : location.pathname.replace(/\/?$/, '/');
 const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + base + 'ws';
-
-let nodeCount = 0, named = [], batches = 0, lastBatch = 0, epoch = null, gameTime = 0;
-
+let ws, socketState = 'connecting';
 function connect() {
-  const ws = new WebSocket(url);
+  ws = new WebSocket(url);
   ws.binaryType = 'arraybuffer';
-  ws.onopen = () => { hud.textContent = 'Joining…'; };
-  ws.onclose = () => { hud.textContent = 'Disconnected. Reconnecting…'; setTimeout(connect, 1500); };
-  ws.onmessage = (e) => {
-    if (typeof e.data !== 'string') {
-      const v = new DataView(e.data);
-      if (v.getUint8(0) !== 1) return;
-      gameTime = v.getFloat64(1, true);
-      let count = 0;
-      for (let o = 9; o + 76 <= v.byteLength; o += 76) count++;
-      batches++; lastBatch = count;
-      render();
-      return;
-    }
+  ws.onopen = () => { socketState = 'joining'; ping(); };
+  clearInterval(window.pinger); window.pinger = setInterval(ping, 1000);
+  ws.onclose = () => { socketState = 'reconnecting'; setTimeout(connect, 1500); };
+  ws.onmessage = e => {
+    if (typeof e.data !== 'string') { applyBatch(new DataView(e.data)); return; }
     const m = JSON.parse(e.data);
-    if (m.type === 'snapshot') {
-      if ((m.part ?? 0) === 0) { nodeCount = 0; named = []; epoch = m.epoch; }
-      nodeCount += m.nodes.length;
-      for (const n of m.nodes) if (n[2]) named.push(n[2]);
-      gameTime = m.t;
-      render();
+    if (m.type === 'pong') {
+      worker = m.w;
+      const now = performance.now() / 1000, rtt = now - m.c;
+      rttAvg = rttAvg ? rttAvg * 0.9 + rtt * 0.1 : rtt;
+      jitter = jitter * 0.9 + Math.abs(rtt - rttAvg) * 0.1;
+      if (rtt <= bestRtt * 1.2 || offset === null) { bestRtt = Math.min(bestRtt, rtt); offset = m.s + rtt / 2 - now; }
+      delay = Math.max(0.03, rttAvg / 2 + 3 * jitter);
+    } else if (m.type === 'snapshot') {
+      applySnapshot(m);
     }
   };
 }
-function render() {
-  const date = epoch !== null ? new Date((epoch + gameTime) * 1000).toISOString() : '?';
-  hud.textContent = `Solar system war (observer)\nnodes: ${nodeCount}\nnamed: ${named.join(', ')}\n` +
-    `game time: ${gameTime.toFixed(1)} s\nsim date (UTC): ${date}\nbatches received: ${batches} (last: ${lastBatch} nodes)`;
+function ping() { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'ping', c: performance.now() / 1000 })); }
+
+function applySnapshot(m) {
+  if ((m.part ?? 0) === 0) { nodesById = new Map(); order = []; epoch = m.epoch; }
+  gameTimeKnown = m.t;
+  for (const e of m.nodes) {
+    const [id, parentId, name, radius, kind, ...desc] = e;
+    nodesById.set(id, { parentId, name, radius, kind, desc });
+    order.push(id);
+  }
+  if ((m.part ?? 0) === (m.parts ?? 1) - 1) {
+    socketState = 'live';
+    nameToId = new Map(); for (const [id, n] of nodesById) if (n.name) nameToId.set(n.name, id);
+    largeBodies = [...nodesById.entries()].filter(([, n]) => n.radius > 500 && n.kind !== KIND_STAR).map(([id]) => id);
+    const order1 = ['Sun', 'Mercury', 'Venus', 'Earth', 'Moon', 'Mars', 'Phobos', 'Deimos', 'Jupiter', 'Io', 'Europa', 'Ganymede', 'Callisto', 'Saturn', 'Titan', 'Uranus', 'Neptune'];
+    targetList = order1.map(n => nameToId.get(n)).filter(id => id !== undefined);
+    buildLabels();
+    if (!initialCameraSet) setInitialCamera();
+  }
+}
+function applyBatch(v) {
+  if (v.getUint8(0) !== 1) return;
+  for (let o = 9; o + 76 <= v.byteLength; o += 76) {
+    const id = v.getUint32(o, true), n = nodesById.get(id);
+    if (!n) continue;
+    const d = [v.getFloat64(o + 4, true)];
+    for (let k = 0; k < 16; k++) d.push(v.getFloat32(o + 12 + 4 * k, true));
+    n.desc = d;
+  }
 }
 connect();
+
+// ---------- camera: a target body, orbited at (distance, yaw, pitch); flyTo() blends world position over a fixed
+// wall-clock duration regardless of real distance ("faster than light"), then tracking resumes as the target moves
+let target = null, distance = 50000, yaw = 0, pitch = 0.25, initialCameraSet = false, travel = null;
+let drag = null, pointers = new Map(), pinch = null, lastTap = null;
+function offsetVector(d, yaw, pitch) { return [d * Math.cos(pitch) * Math.sin(yaw), d * Math.sin(pitch), d * Math.cos(pitch) * Math.cos(yaw)]; }
+function defaultDistanceFor(id) {
+  const n = nodesById.get(id);
+  if (!n) return 50000;
+  return n.name === 'Sun' ? n.radius * 3.5 : Math.max(n.radius * 7, 1500);
+}
+function easeInOutCubic(t) { return t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t + 2, 3) / 2; }
+function cameraWorldPos() {
+  if (travel) {
+    const elapsed = (performance.now() - travel.start) / travel.duration;
+    if (elapsed >= 1) { distance = travel.toDistance; travel = null; }
+    else {
+      const e = easeInOutCubic(Math.min(1, elapsed));
+      const toPos = worldPos.get(travel.toId) || [0, 0, 0];
+      distance = lerp(travel.fromDistance, travel.toDistance, e);
+      const off = offsetVector(distance, yaw, pitch);
+      const toCam = [toPos[0] + off[0], toPos[1] + off[1], toPos[2] + off[2]];
+      return [lerp(travel.from[0], toCam[0], e), lerp(travel.from[1], toCam[1], e), lerp(travel.from[2], toCam[2], e)];
+    }
+  }
+  const p = worldPos.get(target) || [0, 0, 0], off = offsetVector(distance, yaw, pitch);
+  return [p[0] + off[0], p[1] + off[1], p[2] + off[2]];
+}
+function flyTo(id, customDistance) {
+  if (id === undefined || id === null || !nodesById.has(id)) return;
+  if (id === target && !travel) return;
+  const from = cameraWorldPos();
+  travel = { from, fromDistance: distance, toId: id, toDistance: customDistance ?? defaultDistanceFor(id), start: performance.now(), duration: 3000 };
+  target = id;
+}
+function setInitialCamera() {
+  computeWorld(gameTimeKnown);
+  const earth = nameToId.get('Earth'), moon = nameToId.get('Moon');
+  target = earth ?? targetList[0] ?? null;
+  if (earth !== undefined && moon !== undefined) {
+    const pe = worldPos.get(earth), pm = worldPos.get(moon), diff = sub(pm, pe), dist = Math.hypot(...diff), dir = norm(diff);
+    distance = Math.max(dist * 0.85, 40000);
+    yaw = Math.atan2(-dir[0], -dir[2]); pitch = Math.max(-1.4, Math.min(1.4, Math.asin(-dir[1])));
+  } else { distance = 50000; }
+  initialCameraSet = true;
+}
+
+canvas.addEventListener('pointerdown', e => {
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, t0: performance.now() });
+  canvas.setPointerCapture(e.pointerId);
+  drag = pointers.size === 1 ? [e.clientX, e.clientY] : null;
+  pinch = null;
+});
+canvas.addEventListener('pointermove', e => {
+  const p = pointers.get(e.pointerId);
+  if (!p) return;
+  p.x = e.clientX; p.y = e.clientY;
+  if (pointers.size === 2) {
+    const [a, b] = [...pointers.values()], span = Math.hypot(a.x - b.x, a.y - b.y);
+    if (pinch) distance = Math.max(0.5, Math.min(2e10, distance * pinch / span));
+    pinch = span;
+  } else if (drag) {
+    yaw -= (e.clientX - drag[0]) * 0.006; pitch = Math.max(-1.45, Math.min(1.45, pitch + (e.clientY - drag[1]) * 0.006)); drag = [e.clientX, e.clientY];
+  }
+});
+function pointerEnd(e) {
+  const p = pointers.get(e.pointerId);
+  pointers.delete(e.pointerId); drag = null; pinch = null;
+  if (!p || e.pointerType === 'mouse' || e.type === 'pointercancel') return;
+  const now = performance.now();
+  if (now - p.t0 > 300 || Math.hypot(e.clientX - p.x0, e.clientY - p.y0) > 12) { lastTap = null; return; }
+  if (lastTap && now - lastTap.t < 350) { lastTap = null; distance = Math.max(0.5, distance * 0.4); return; }
+  lastTap = { t: now, x: e.clientX, y: e.clientY };
+}
+canvas.addEventListener('pointerup', pointerEnd);
+canvas.addEventListener('pointercancel', pointerEnd);
+canvas.addEventListener('wheel', e => { e.preventDefault(); distance = Math.max(0.5, Math.min(2e10, distance * Math.exp(e.deltaY * 0.0012))); }, { passive: false });
+addEventListener('keydown', e => {
+  if (e.code === 'Tab') { e.preventDefault(); if (targetList.length) { const i = targetList.indexOf(target); flyTo(targetList[(i + 1 + targetList.length) % targetList.length]); } return; }
+  if (e.code >= 'Digit0' && e.code <= 'Digit9') {
+    const names = ['Sun', 'Mercury', 'Venus', 'Earth', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune', 'Moon'];
+    const idx = parseInt(e.code.slice(5), 10); flyTo(nameToId.get(names[idx]));
+  }
+});
+
+// ---------- time control panel
+const tSlider = document.getElementById('tSlider'), timeLabel = document.getElementById('timeLabel');
+function setOffsetHours(h) { timeOffset = h * 3600; tSlider.value = Math.max(-720, Math.min(720, h)); }
+document.getElementById('tMinusDay').onclick = () => setOffsetHours(timeOffset / 3600 - 24);
+document.getElementById('tMinusHour').onclick = () => setOffsetHours(timeOffset / 3600 - 1);
+document.getElementById('tNow').onclick = () => setOffsetHours(0);
+document.getElementById('tPlusHour').onclick = () => setOffsetHours(timeOffset / 3600 + 1);
+document.getElementById('tPlusDay').onclick = () => setOffsetHours(timeOffset / 3600 + 24);
+tSlider.oninput = () => { timeOffset = Number(tSlider.value) * 3600; };
+document.getElementById('eclipse').onclick = () => {
+  if (epoch === null) return;
+  const eclipseUnix = Date.UTC(2026, 7, 28, 4, 13, 0) / 1000;
+  timeOffset = (eclipseUnix - epoch) - (serverNow() - delay);
+  setOffsetHours(timeOffset / 3600);
+  const moon = nameToId.get('Moon');
+  if (moon !== undefined) flyTo(moon, Math.max((nodesById.get(moon)?.radius ?? 1737) * 8, 9000));
+};
+
+// ---------- HTML labels
+let labelEls = new Map();
+function buildLabels() {
+  labelsEl.innerHTML = ''; labelEls = new Map();
+  for (const id of targetList) {
+    const n = nodesById.get(id);
+    const el = document.createElement('div');
+    el.className = 'label'; el.innerHTML = `<span class="dot"></span>${n.name}`;
+    el.onclick = () => flyTo(id);
+    labelsEl.appendChild(el);
+    labelEls.set(id, el);
+  }
+}
+
+// ---------- render
+let frames = 0, fps = 0, lastStats = performance.now();
+let camPos = [0, 0, 0], viewProjection = null;
+function frame() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.floor(canvas.clientWidth * dpr)), h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  gl.viewport(0, 0, w, h);
+
+  if (order.length) {
+    const t = evalTime();
+    computeWorld(t);
+    camPos = cameraWorldPos();
+    const vp = multiply(perspective(0.9, w / h, 1e-3, FAR), lookAt([0, 0, 0], sub(worldPos.get(target) || [0, 0, 0], camPos), [0, 1, 0]));
+    viewProjection = vp;
+
+    // build instance data: every drawable body, position relative to the camera (subtract in doubles, upload float32)
+    let count = 0;
+    const minPixels = 2.5, pixelScale = minPixels * 2 * Math.tan(0.45) / h;
+    for (const id of order) {
+      const n = nodesById.get(id);
+      if (n.kind === KIND_ANCHOR || n.kind === KIND_ORBIT_FRAME || n.radius <= 0) continue;
+      if ((count + 1) * SPHERE_FLOATS > instanceData.length) { const grown = new Float32Array(instanceData.length * 2); grown.set(instanceData); instanceData = grown; }
+      const p = worldPos.get(id), rel = sub(p, camPos), distCam = Math.hypot(...rel);
+      const renderRadius = Math.max(n.radius, distCam * pixelScale);
+      const q = worldQuat.get(id) || [0, 0, 0, 1], col = colorFor(n);
+      const o = count * SPHERE_FLOATS;
+      instanceData[o] = rel[0]; instanceData[o+1] = rel[1]; instanceData[o+2] = rel[2]; instanceData[o+3] = renderRadius;
+      instanceData[o+4] = col[0]; instanceData[o+5] = col[1]; instanceData[o+6] = col[2]; instanceData[o+7] = n.kind === KIND_STAR ? 1 : 0;
+      instanceData[o+8] = q[0]; instanceData[o+9] = q[1]; instanceData[o+10] = q[2]; instanceData[o+11] = q[3];
+      count++;
+    }
+
+    // nearest large bodies to the current target: shadow occluder candidates
+    const tPos = worldPos.get(target) || [0, 0, 0];
+    const occluders = largeBodies.filter(id => id !== target)
+      .map(id => ({ id, d: Math.hypot(...sub(worldPos.get(id), tPos)) }))
+      .sort((a, b) => a.d - b.d).slice(0, 4);
+
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.disable(gl.DEPTH_TEST);
+    gl.useProgram(bgProgram.p);
+    const vpInv = invert4(vp);
+    gl.uniformMatrix4fv(bgProgram.u('uInverseViewProjection'), false, vpInv);
+    gl.bindVertexArray(emptyVao);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); gl.enable(gl.CULL_FACE);
+    gl.useProgram(sphereProgram.p);
+    gl.uniformMatrix4fv(sphereProgram.u('uViewProjection'), false, vp);
+    gl.uniform1f(sphereProgram.u('uFar'), FAR);
+    const sunId = nameToId.get('Sun');
+    const sunPos = sunId !== undefined ? sub(worldPos.get(sunId), camPos) : [0, 0, 0];
+    gl.uniform3fv(sphereProgram.u('uSunPos'), sunPos);
+    gl.uniform1f(sphereProgram.u('uSunRadius'), sunId !== undefined ? nodesById.get(sunId).radius : 696000);
+    gl.uniform1i(sphereProgram.u('uOccCount'), occluders.length);
+    const op = new Float32Array(12), or = new Float32Array(4);
+    occluders.forEach((occ, i) => { const r = sub(worldPos.get(occ.id), camPos); op[i*3]=r[0]; op[i*3+1]=r[1]; op[i*3+2]=r[2]; or[i] = nodesById.get(occ.id).radius; });
+    gl.uniform3fv(sphereProgram.u('uOccPos[0]'), op);
+    gl.uniform1fv(sphereProgram.u('uOccRadius[0]'), or);
+    gl.bindBuffer(gl.ARRAY_BUFFER, instanceBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, instanceData.subarray(0, count * SPHERE_FLOATS), gl.DYNAMIC_DRAW);
+    gl.bindVertexArray(vao);
+    gl.drawElementsInstanced(gl.TRIANGLES, geo.indices.length, gl.UNSIGNED_SHORT, 0, count);
+
+    updateLabels(vp, w, h);
+    updateHud(t);
+  }
+
+  frames++;
+  const now = performance.now();
+  if (now - lastStats >= 500) { fps = frames / ((now - lastStats) / 1000); frames = 0; lastStats = now; }
+  requestAnimationFrame(frame);
+}
+function invert4(m) {
+  const a = m, i = new Array(16);
+  const [a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15] = a;
+  i[0]=a5*a10*a15-a5*a11*a14-a9*a6*a15+a9*a7*a14+a13*a6*a11-a13*a7*a10;
+  i[4]=-a4*a10*a15+a4*a11*a14+a8*a6*a15-a8*a7*a14-a12*a6*a11+a12*a7*a10;
+  i[8]=a4*a9*a15-a4*a11*a13-a8*a5*a15+a8*a7*a13+a12*a5*a11-a12*a7*a9;
+  i[12]=-a4*a9*a14+a4*a10*a13+a8*a5*a14-a8*a6*a13-a12*a5*a10+a12*a6*a9;
+  i[1]=-a1*a10*a15+a1*a11*a14+a9*a2*a15-a9*a3*a14-a13*a2*a11+a13*a3*a10;
+  i[5]=a0*a10*a15-a0*a11*a14-a8*a2*a15+a8*a3*a14+a12*a2*a11-a12*a3*a10;
+  i[9]=-a0*a9*a15+a0*a11*a13+a8*a1*a15-a8*a3*a13-a12*a1*a11+a12*a3*a9;
+  i[13]=a0*a9*a14-a0*a10*a13-a8*a1*a14+a8*a2*a13+a12*a1*a10-a12*a2*a9;
+  i[2]=a1*a6*a15-a1*a7*a14-a5*a2*a15+a5*a3*a14+a13*a2*a7-a13*a3*a6;
+  i[6]=-a0*a6*a15+a0*a7*a14+a4*a2*a15-a4*a3*a14-a12*a2*a7+a12*a3*a6;
+  i[10]=a0*a5*a15-a0*a7*a13-a4*a1*a15+a4*a3*a13+a12*a1*a7-a12*a3*a5;
+  i[14]=-a0*a5*a14+a0*a6*a13+a4*a1*a14-a4*a2*a13-a12*a1*a6+a12*a2*a5;
+  i[3]=-a1*a6*a11+a1*a7*a10+a5*a2*a11-a5*a3*a10-a9*a2*a7+a9*a3*a6;
+  i[7]=a0*a6*a11-a0*a7*a10-a4*a2*a11+a4*a3*a10+a8*a2*a7-a8*a3*a6;
+  i[11]=-a0*a5*a11+a0*a7*a9+a4*a1*a11-a4*a3*a9-a8*a1*a7+a8*a3*a5;
+  i[15]=a0*a5*a10-a0*a6*a9-a4*a1*a10+a4*a2*a9+a8*a1*a6-a8*a2*a5;
+  const det = a0*i[0]+a1*i[4]+a2*i[8]+a3*i[12];
+  return i.map(v => v / det);
+}
+function project(vp, p, w, h) {
+  const x = vp[0]*p[0]+vp[4]*p[1]+vp[8]*p[2]+vp[12], y = vp[1]*p[0]+vp[5]*p[1]+vp[9]*p[2]+vp[13];
+  const wc = vp[3]*p[0]+vp[7]*p[1]+vp[11]*p[2]+vp[15];
+  if (wc <= 1e-6) return null;
+  return [(x / wc * 0.5 + 0.5) * w, (1 - (y / wc * 0.5 + 0.5)) * h];
+}
+function updateLabels(vp, w, h) {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  for (const [id, el] of labelEls) {
+    const p = worldPos.get(id);
+    if (!p) { el.style.display = 'none'; continue; }
+    const rel = sub(p, camPos), s = project(vp, rel, w, h);
+    if (!s) { el.style.display = 'none'; continue; }
+    el.style.display = ''; el.style.left = (s[0] / dpr) + 'px'; el.style.top = (s[1] / dpr) + 'px';
+  }
+}
+function formatDistance(km) { return km > AU * 0.1 ? (km / AU).toFixed(3) + ' AU' : km.toLocaleString(undefined, { maximumFractionDigits: 0 }) + ' km'; }
+let lastHudAt = 0;
+function updateHud(t) {
+  const now = performance.now();
+  if (now - lastHudAt < 200) return;
+  lastHudAt = now;
+  const tn = nodesById.get(target);
+  const dist = target !== null ? Math.hypot(...sub(worldPos.get(target) || [0,0,0], camPos)) : 0;
+  const date = epoch !== null ? new Date((epoch + t) * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' UTC' : '?';
+  hud.innerHTML = `<b>phasync+Phame: Tech preview</b>\n` +
+    `<span class="k">target</span> ${tn ? tn.name || 'unnamed' : '-'}${travel ? ' (travelling…)' : ''}\n` +
+    `<span class="k">distance</span> ${formatDistance(dist)}\n` +
+    `<span class="k">time</span> ${date}\n` +
+    `<span class="k">fps</span> ${fps.toFixed(0)}${worker ? `  <span class="k">worker</span> ${worker}` : ''}\n` +
+    `<span class="k">socket</span> ${socketState}`;
+  timeLabel.textContent = timeOffset === 0 ? 'now' : (timeOffset > 0 ? '+' : '') + (timeOffset / 3600).toFixed(1) + 'h';
+}
+requestAnimationFrame(frame);
 </script>
 </body>
 </html>
