@@ -73,14 +73,16 @@ class SolarSystem
         // Anchor: a non-rotating node moving in a straight line (a chord to its position at the window's end),
         // refit on Event::EXPIRE with an interval sized from the error budget.
         $anchor = new Node3D();
-        $anchor->name = $name;
         $this->scene->root->addChild($anchor);
         $anchor->addEventListener('expire', fn () => $this->refitPlanetAnchor($name, $anchor));
         $this->refitPlanetAnchor($name, $anchor);
         $this->track($anchor, null, self::KIND_ANCHOR);
 
         // Planet body: fixed axial tilt, spinning about its own (tilted) pole so the pole direction never moves.
+        // The name belongs here, not on the anchor: SolarGame's wire protocol documents every anchor as unnamed
+        // (radius 0, structural only), matching how the Sun and every moon are named on their visible body.
         $body = new Node3D();
+        $body->name = $name;
         $body->radius = $this->getPlanetRadius($name);
         $body->setOrientation(...$this->getTiltQuaternion($name));
         [$wx, $wy, $wz] = $this->getSpinAxis($name);

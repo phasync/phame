@@ -12,11 +12,11 @@
   #hud { position: fixed; left: 12px; top: 10px; padding: 8px 11px; border-radius: 8px; background: rgba(10, 12, 24, .72); backdrop-filter: blur(6px); white-space: pre; pointer-events: none; min-width: 15rem; }
   #hud b { color: #ffd77a; font-weight: 600; }
   #hud .k { color: #8890b0; }
-  #labels { position: fixed; inset: 0; pointer-events: none; overflow: hidden; }
+  #labels { position: fixed; inset: 0; pointer-events: none; overflow: hidden; z-index: 2; }
   .label { position: absolute; transform: translate(-50%, -50%); font-size: 11px; color: #e4e8ff; text-shadow: 0 0 4px #000, 0 0 2px #000; white-space: nowrap; pointer-events: auto; cursor: pointer; padding: 2px 5px; }
   .label:hover { color: #ffd77a; }
   .label .dot { display: inline-block; width: 4px; height: 4px; border-radius: 50%; background: #e4e8ff; margin-right: 4px; vertical-align: middle; }
-  #panel { position: fixed; right: 10px; bottom: 10px; padding: 8px 10px; border-radius: 8px; background: rgba(10, 12, 24, .72); backdrop-filter: blur(6px); max-width: 280px; }
+  #panel { position: fixed; right: 10px; bottom: 10px; padding: 8px 10px; border-radius: 8px; background: rgba(10, 12, 24, .72); backdrop-filter: blur(6px); max-width: 280px; z-index: 3; }
   #panel .row { display: flex; align-items: center; gap: 6px; margin: 3px 0; }
   #panel button { background: #1b2040; color: #cfd3e6; border: 1px solid #38406e; border-radius: 5px; padding: 3px 8px; font: inherit; cursor: pointer; }
   #panel button:hover { background: #2a2f58; }
@@ -42,59 +42,99 @@
   <div class="row"><input id="tSlider" type="range" min="-720" max="720" step="1" value="0"></div>
   <div class="row"><button id="eclipse" style="flex:1">Next lunar eclipse</button></div>
 </div>
-<div id="help">drag to orbit · wheel/pinch to zoom · 0-9 or Tab: pick target · click a label</div>
-<script>
+<div id="help">drag to orbit · wheel/pinch to zoom · 0-9 or Tab: pick target · click a label · P: perf</div>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.186.1/examples/jsm/"
+} }
+</script>
+<script type="module">
 'use strict';
-// The Solar System War observer client. Reads PhameServer\SolarGame's wire protocol (see its docblock): a snapshot
-// of the node tree, then binary description batches. Every node's world position/orientation is evaluated in
-// double-precision JS from its motion description (position = p0 + v*dt + 1/2*a*dt^2, orientation turned by a
-// constant spin, composed parent-to-child), then rendered relative to the camera (subtracting the camera's world
-// position in doubles before the float32 upload to the GPU) so nothing jitters at planetary distances. A
-// logarithmic depth trick (the Outerra w-based remap) lets a nearby moon and a planet billions of km away both
-// draw correctly. Shadows (for eclipses) are evaluated analytically per fragment against the nearest large bodies.
+// The Solar System War observer client, rendered with three.js (loaded as an ES module from jsdelivr - no build
+// step). Reads PhameServer\SolarGame's wire protocol (see its docblock): a snapshot of the node tree, then binary
+// description batches. Every node's world position/orientation is evaluated in double-precision JS from its motion
+// description (position = p0 + v*dt + 1/2*a*dt^2, orientation turned by a constant spin, composed parent-to-child -
+// see computeWorld()), independently of three.js.
+//
+// Precision at planetary distances: the three.js camera always sits at the scene origin; every Object3D's position
+// is set to (that body's world position - the camera's world position), computed in JS doubles, every frame. Three
+// composes matrices in JS (also double precision) and only the final per-object matrix is uploaded to the GPU as
+// float32 - by then the magnitudes involved are "distance from camera", not "distance from the Sun", so float32 is
+// plenty. The renderer also gets logarithmicDepthBuffer so a moon a few thousand km away and Neptune can both draw
+// correctly in the same frame.
+//
+// Level of detail: the ~18 bodies big enough to matter (the Sun, planets, major moons) each get a real lit
+// SphereGeometry mesh, given a stable 1:1 mapping built once from the snapshot (there are few enough that no
+// per-frame pool-assignment logic is needed). Everything else - every asteroid - is one shared THREE.Points cloud,
+// sized per-point in its own vertex shader from a minimum-apparent-size floor. Three.js's own frustum culling
+// handles off-screen meshes "for free"; Points are left to ordinary clip-space point clipping.
+//
+// Shadows: three.js shadow maps do not work at this scale (the depth range spans AU to km). Eclipses instead come
+// from a small custom ShaderMaterial (ndotl lighting plus an analytic Sun-disc-coverage calculation against the
+// nearest few large bodies) applied to every body mesh - see PLANET_FS.
+
+import * as THREE from 'three';
+import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
 
 const canvas = document.getElementById('c');
 const hud = document.getElementById('hud');
 const labelsEl = document.getElementById('labels');
-const gl = canvas.getContext('webgl2', { antialias: false });
-if (!gl) { hud.textContent = 'WebGL2 is not available in this browser.'; throw new Error('no webgl2'); }
-
 const AU = 1.495978707e8; // km
 
-// ---------- shaders
-const FAR = 2e11; // km, generous: covers the whole system and then some; only the log-depth remap uses it
-const SPHERE_VS = `#version 300 es
-  layout(location = 0) in vec3 aPos;
-  layout(location = 1) in vec3 aNormal;
-  layout(location = 2) in vec4 aCenterRadius;  // center.xyz (camera-relative, km), renderRadius (km)
-  layout(location = 3) in vec4 aColorFlag;     // color.rgb, isSun (0/1)
-  layout(location = 4) in vec4 aQuat;          // body orientation, camera-independent
-  uniform mat4 uViewProjection;
-  uniform float uFar;
-  out vec3 vNormal; out vec3 vWorldPos; out vec3 vColor; out float vIsSun; out vec3 vCenter; out float vRadius;
-  mat3 quatToMat3(vec4 q) {
-    float x = q.x, y = q.y, z = q.z, w = q.w;
-    return mat3(1.0 - 2.0*(y*y+z*z), 2.0*(x*y+w*z), 2.0*(x*z-w*y),
-                2.0*(x*y-w*z), 1.0 - 2.0*(x*x+z*z), 2.0*(y*z+w*x),
-                2.0*(x*z+w*y), 2.0*(y*z-w*x), 1.0 - 2.0*(x*x+y*y));
+// ---------- three.js setup
+const NEAR = 1e-4, FAR = 2e11; // km: a 10cm near plane, a far plane generous enough to cover the whole system
+const FCOEF = 1 / Math.log2(FAR + 1); // for the manual per-fragment log-depth write (see PLANET_FS/POINTS_FS)
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, logarithmicDepthBuffer: true });
+renderer.setClearColor(0x000000, 1);
+let dprCap = 2; // adaptive: stepped down under sustained load, back up once it recovers (see the stats tick below)
+renderer.setPixelRatio(dprCap);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(51.57, 1, NEAR, FAR); // 0.9 rad, matching the earlier hand-rolled client
+const cssRenderer = new CSS2DRenderer({ element: labelsEl });
+
+// a sparse, purely decorative starfield at a fixed huge distance - not part of the protocol or physics
+{
+  const N = 2500, pos = new Float32Array(N * 3);
+  for (let i = 0; i < N; i++) {
+    const u = Math.random() * 2 - 1, a = Math.random() * Math.PI * 2, r = Math.sqrt(1 - u * u);
+    pos[i*3] = r * Math.cos(a) * 5e10; pos[i*3+1] = u * 5e10; pos[i*3+2] = r * Math.sin(a) * 5e10;
   }
+  const starGeo = new THREE.BufferGeometry();
+  starGeo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const stars = new THREE.Points(starGeo, new THREE.PointsMaterial({ color: 0xaaaaaa, size: 1.3, sizeAttenuation: false, depthWrite: false }));
+  stars.frustumCulled = false;
+  scene.add(stars);
+}
+
+// ---------- the Sun as a point light (no decay - constant intensity regardless of distance) plus its own mesh
+const sunLight = new THREE.PointLight(0xfff4e0, 3, 0, 0);
+scene.add(sunLight);
+
+// ---------- body shader: lit diffuse (N.L) plus the analytic eclipse shadow, shared source for every body mesh.
+// Each mesh gets its own material instance (own uColor/uIsSun/uRadius), but the global uniforms (sun position,
+// occluders) are literally the same {value:...} wrapper objects across all of them (see makeBodyMaterial), so
+// updating the wrapper once a frame updates every material at once without a per-material uniform loop.
+const sharedUniforms = {
+  uSunPos: { value: new THREE.Vector3() }, uSunRadius: { value: 696000 },
+  uOccPos: { value: [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()] },
+  uOccRadius: { value: new Float32Array(4) }, uOccCount: { value: 0 },
+};
+const PLANET_VS = `
+  varying vec3 vWorldPos; varying vec3 vNormal; varying float vClipW;
   void main() {
-    vec3 center = aCenterRadius.xyz; float r = aCenterRadius.w;
-    mat3 R = quatToMat3(aQuat);
-    vec3 n = R * aNormal;
-    vWorldPos = center + n * r;
-    vNormal = n; vColor = aColorFlag.rgb; vIsSun = aColorFlag.w; vCenter = center; vRadius = r;
-    vec4 clip = uViewProjection * vec4(vWorldPos, 1.0);
-    float Fcoef = 1.0 / log2(uFar + 1.0);
-    clip.z = (log2(max(1e-6, clip.w + 1.0)) * Fcoef * 2.0 - 1.0) * clip.w;   // logarithmic depth (Outerra)
+    vWorldPos = (modelMatrix * vec4(position, 1.0)).xyz;
+    vNormal = normalize(normalMatrix * normal);
+    vec4 clip = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    vClipW = clip.w;
     gl_Position = clip;
   }`;
-const SPHERE_FS = `#version 300 es
+const PLANET_FS = `
   precision highp float;
-  in vec3 vNormal; in vec3 vWorldPos; in vec3 vColor; in float vIsSun; in vec3 vCenter; in float vRadius;
+  varying vec3 vWorldPos; varying vec3 vNormal; varying float vClipW;
+  uniform vec3 uColor; uniform float uIsSun; uniform float uRadius; uniform float uFcoef;
   uniform vec3 uSunPos; uniform float uSunRadius;
   uniform vec3 uOccPos[4]; uniform float uOccRadius[4]; uniform int uOccCount;
-  out vec4 outColor;
   // area of the circular segment of a circle (radius r) cut by a chord at distance d1 from its centre
   float segment(float r, float d1) { return r*r*acos(clamp(d1/r, -1.0, 1.0)) - d1*sqrt(max(r*r - d1*d1, 0.0)); }
   float lensArea(float d, float r1, float r2) {
@@ -112,12 +152,12 @@ const SPHERE_FS = `#version 300 es
     vec3 toSun = uSunPos - vWorldPos; float dSun = length(toSun); vec3 L = toSun / max(dSun, 1e-6);
     float ndotl = max(dot(N, L), 0.0);
     float shadow = 0.0;
-    if (vIsSun < 0.5) {
+    if (uIsSun < 0.5) {
       float sunAngR = uSunRadius / dSun;
       for (int i = 0; i < 4; i++) {
         if (i >= uOccCount) break;
         vec3 toOcc = uOccPos[i] - vWorldPos; float dOcc = length(toOcc);
-        if (dOcc < vRadius * 1.2) continue;   // this body is its own "occluder" entry: skip
+        if (dOcc < uRadius * 1.2) continue;   // this body is its own "occluder" entry: skip
         vec3 Locc = toOcc / dOcc;
         float occAngR = uOccRadius[i] / dOcc;
         float theta = acos(clamp(dot(L, Locc), -1.0, 1.0));
@@ -126,97 +166,72 @@ const SPHERE_FS = `#version 300 es
     }
     float lit = ndotl * (1.0 - shadow);
     vec3 base;
-    if (vIsSun > 0.5) {
-      base = vColor * 2.4;
+    if (uIsSun > 0.5) {
+      base = uColor * 2.4;
     } else {
-      base = vColor * (0.035 + 0.965 * lit);
+      base = uColor * (0.035 + 0.965 * lit);
       if (shadow > 0.2) base = mix(base, vec3(0.5, 0.2, 0.09) * (0.04 + 0.6 * ndotl), clamp((shadow - 0.2) / 0.8, 0.0, 1.0) * 0.75);
-      base *= 1.0 + 0.04 * sin(N.y * 16.0 + vRadius * 0.01);   // cheap banding, visible mainly on gas giants
+      base *= 1.0 + 0.04 * sin(N.y * 16.0 + uRadius * 0.01);   // cheap banding, visible mainly on gas giants
     }
-    outColor = vec4(base, 1.0);
+    gl_FragColor = vec4(base, 1.0);
+    gl_FragDepth = clamp(log2(max(1e-6, vClipW + 1.0)) * uFcoef, 0.0, 1.0);   // logarithmic depth, per fragment
   }`;
-const BG_VS = `#version 300 es
-  out vec2 vUv;
-  void main() { vec2 p = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0); vUv = p; gl_Position = vec4(p, 0.99999, 1.0); }`;
-const BG_FS = `#version 300 es
-  precision highp float;
-  in vec2 vUv; uniform mat4 uInverseViewProjection; out vec4 outColor;
-  float hash(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+function makeBodyMaterial(colorArr3, isSun, radius) {
+  return new THREE.ShaderMaterial({
+    vertexShader: PLANET_VS, fragmentShader: PLANET_FS,
+    uniforms: { ...sharedUniforms, uFcoef: { value: FCOEF },
+      uColor: { value: new THREE.Color(colorArr3[0], colorArr3[1], colorArr3[2]) }, uIsSun: { value: isSun ? 1 : 0 }, uRadius: { value: radius } },
+  });
+}
+const sphereGeo = new THREE.SphereGeometry(1, 32, 20);
+
+// ---------- the asteroid belt (and anything else too small to bother meshing): one Points cloud, sized per-point
+// in the vertex shader from a minimum-apparent-size floor (uMinPx) so nothing vanishes at a distance.
+const POINTS_VS = `
+  attribute float aRadius; attribute vec3 aColor;
+  varying vec3 vColor;
+  uniform float uScreenFactor; uniform float uMinPx;
   void main() {
-    vec4 a = uInverseViewProjection * vec4(vUv, -1.0, 1.0), b = uInverseViewProjection * vec4(vUv, 1.0, 1.0);
-    vec3 d = normalize(a.xyz / a.w - b.xyz / b.w);
-    vec3 cell = floor(d * 280.0);
-    float s = step(0.9985, hash(cell)) * (0.4 + 1.6 * hash(cell + 3.1));
-    outColor = vec4(vec3(s), 1.0);
+    vColor = aColor;
+    vec4 mv = modelViewMatrix * vec4(position, 1.0);
+    float dist = max(-mv.z, 1e-6);
+    gl_PointSize = max(uMinPx, aRadius / dist * uScreenFactor);
+    gl_Position = projectionMatrix * mv;
   }`;
+const POINTS_FS = `
+  precision highp float;
+  varying vec3 vColor;
+  void main() {
+    vec2 c = gl_PointCoord - vec2(0.5);
+    if (dot(c, c) > 0.25) discard;
+    gl_FragColor = vec4(vColor, 1.0);
+  }`;
+const pointsUniforms = { uScreenFactor: { value: 1 }, uMinPx: { value: 2.5 } };
+const pointsMaterial = new THREE.ShaderMaterial({ vertexShader: POINTS_VS, fragmentShader: POINTS_FS, uniforms: pointsUniforms });
+let pointsObj = null; // (re)built per snapshot, once the asteroid count is known - see applySnapshot
 
-function compile(type, src) {
-  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
-  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { const log = gl.getShaderInfoLog(s); hud.textContent = 'Shader error: ' + log; throw new Error(log); }
-  return s;
-}
-function program(vs, fs) {
-  const p = gl.createProgram(); gl.attachShader(p, compile(gl.VERTEX_SHADER, vs)); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(p);
-  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
-  const u = {}; return { p, u: name => u[name] ??= gl.getUniformLocation(p, name) };
-}
-const sphereProgram = program(SPHERE_VS, SPHERE_FS);
-const bgProgram = program(BG_VS, BG_FS);
+// ---------- CSS2D labels (planets and major moons only - see targetList)
+document.body.appendChild(cssRenderer.domElement);
 
-// ---------- a single shared unit sphere, instanced
-function icosphere(levels) {
-  const t = (1 + Math.sqrt(5)) / 2;
-  let v = [[-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0], [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t], [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1]];
-  let f = [[0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11], [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8], [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9], [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1]];
-  v = v.map(p => { const l = Math.hypot(...p); return p.map(c => c / l); });
-  for (let l = 0; l < levels; l++) {
-    const cache = new Map(), nf = [];
-    const mid = (a, b) => {
-      const k = a < b ? a + ',' + b : b + ',' + a;
-      if (!cache.has(k)) { const m = v[a].map((c, i) => (c + v[b][i]) / 2); const n = Math.hypot(...m); v.push(m.map(c => c / n)); cache.set(k, v.length - 1); }
-      return cache.get(k);
-    };
-    for (const [a, b, c] of f) { const ab = mid(a, b), bc = mid(b, c), ca = mid(c, a); nf.push([a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]); }
-    f = nf;
-  }
-  return { positions: new Float32Array(v.flat()), normals: new Float32Array(v.flat()), indices: new Uint16Array(f.flat()) };
-}
-const SPHERE_FLOATS = 12; // per instance: center.xyz, radius | color.rgb, isSun | qx qy qz qw
-const geo = icosphere(2);
-const vao = gl.createVertexArray();
-gl.bindVertexArray(vao);
-function staticBuf(data, target = gl.ARRAY_BUFFER) { const b = gl.createBuffer(); gl.bindBuffer(target, b); gl.bufferData(target, data, gl.STATIC_DRAW); return b; }
-staticBuf(geo.positions); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
-staticBuf(geo.normals); gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
-staticBuf(geo.indices, gl.ELEMENT_ARRAY_BUFFER);
-const instanceBuf = gl.createBuffer();
-gl.bindBuffer(gl.ARRAY_BUFFER, instanceBuf);
-for (let i = 0; i < 3; i++) { gl.enableVertexAttribArray(2 + i); gl.vertexAttribPointer(2 + i, 4, gl.FLOAT, false, SPHERE_FLOATS * 4, i * 16); }
-gl.bindVertexArray(null);
-let instanceData = new Float32Array(SPHERE_FLOATS * 1024);
-const emptyVao = gl.createVertexArray();
-
-// ---------- math: quaternion compose/rotate, matrices (double precision; JS numbers are doubles throughout)
-const qmul = (a, b) => [a[3]*b[0] + a[0]*b[3] + a[1]*b[2] - a[2]*b[1], a[3]*b[1] - a[0]*b[2] + a[1]*b[3] + a[2]*b[0],
-  a[3]*b[2] + a[0]*b[1] - a[1]*b[0] + a[2]*b[3], a[3]*b[3] - a[0]*b[0] - a[1]*b[1] - a[2]*b[2]];
-function qrot(q, v) {
-  const [x, y, z, w] = q, tx = 2*(y*v[2] - z*v[1]), ty = 2*(z*v[0] - x*v[2]), tz = 2*(x*v[1] - y*v[0]);
-  return [v[0] + w*tx + y*tz - z*ty, v[1] + w*ty + z*tx - x*tz, v[2] + w*tz + x*ty - y*tx];
-}
+// ---------- small-vector helpers for the few things still off the hot path (camera target, travel, HUD)
 const sub = (a, b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
-const dot3 = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
-const cross = (a, b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
 const norm = a => { const l = Math.hypot(...a) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
 const lerp = (a, b, t) => a + (b - a) * t;
-function perspective(fov, aspect, near, far) { const f = 1/Math.tan(fov/2), n = 1/(near-far); return [f/aspect,0,0,0, 0,f,0,0, 0,0,(far+near)*n,-1, 0,0,2*far*near*n,0]; }
-function lookAt(e, t, u) { const z = norm(sub(e,t)), x = norm(cross(u,z)), y = cross(z,x); return [x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0, -dot3(x,e),-dot3(y,e),-dot3(z,e),1]; }
-function multiply(a, b) { const o = new Array(16); for (let c=0;c<4;c++) for (let r=0;r<4;r++) { let s=0; for (let k=0;k<4;k++) s += a[k*4+r]*b[c*4+k]; o[c*4+r]=s; } return o; }
 
-// ---------- node tree: id -> {parentId, name, radius, kind, desc:[t0,x,y,z,vx,vy,vz,qx,qy,qz,qw,wx,wy,wz,ax,ay,az]}
+// ---------- node tree, as a struct-of-arrays indexed by a stable "slot" (0 is a virtual root: identity transform).
+// computeWorld() walks this once a frame with plain scalar arithmetic: no array literal, no Map.get/set, no object
+// is allocated per node per frame - this is independent of the rendering backend (it was the same with hand-rolled
+// WebGL, kept as-is for three.js).
 const KIND_STAR = 0, KIND_PLANET = 1, KIND_MOON = 2, KIND_ASTEROID = 3, KIND_ANCHOR = 4, KIND_ORBIT_FRAME = 5;
-let nodesById = new Map(), order = [], nameToId = new Map(), largeBodies = [], targetList = [];
+let nodesById = new Map(), nameToId = new Map(), targetList = [];
 let epoch = null, gameTimeKnown = 0;
-const worldPos = new Map(), worldQuat = new Map();
+// per-slot flat state; slot 0 is the virtual root parentId=0 maps to
+let nodesBySlot = [null], orderSlots = new Int32Array(0), parentSlot = new Int32Array(1);
+let drawableSlots = new Int32Array(0), largeSlots = new Int32Array(0), meshSlots = [], pointSlots = [];
+let radiusArr = new Float64Array(1), colorArr = new Float32Array(3);
+let worldPosX = new Float64Array(1), worldPosY = new Float64Array(1), worldPosZ = new Float64Array(1);
+let worldQuatX = new Float64Array(1), worldQuatY = new Float64Array(1), worldQuatZ = new Float64Array(1), worldQuatW = new Float64Array(1);
+worldQuatW[0] = 1;
 
 const COLORS = {
   Sun: [1.0, 0.82, 0.35], Mercury: [0.62, 0.59, 0.56], Venus: [0.86, 0.76, 0.52], Earth: [0.18, 0.4, 0.62],
@@ -226,19 +241,35 @@ const COLORS = {
   Deimos: [0.5, 0.46, 0.43],
 };
 function colorFor(n) { return COLORS[n.name] || (n.kind === KIND_ASTEROID ? [0.5, 0.48, 0.46] : [0.6, 0.6, 0.62]); }
+// id -> world position, as a fresh small array: used only off the hot path (camera target, labels, HUD - a
+// handful of calls per frame, never the per-body loop), so a tiny allocation here is fine.
+function posOf(id) { const n = nodesById.get(id); return n ? [worldPosX[n.slot], worldPosY[n.slot], worldPosZ[n.slot]] : [0, 0, 0]; }
 
+// parent-to-child composition (position = p0 + v*dt + 1/2*a*dt^2 in the parent's space, orientation turned by a
+// constant spin), walked once in parent-first order; every operation here is a scalar, nothing is allocated.
 function computeWorld(t) {
-  worldPos.set(0, [0, 0, 0]); worldQuat.set(0, [0, 0, 0, 1]);
-  for (const id of order) {
-    const n = nodesById.get(id), d = n.desc, dt = t - d[0];
-    const local = [d[1] + d[4]*dt + 0.5*d[14]*dt*dt, d[2] + d[5]*dt + 0.5*d[15]*dt*dt, d[3] + d[6]*dt + 0.5*d[16]*dt*dt];
-    let q = [d[7], d[8], d[9], d[10]];
+  for (let i = 0; i < orderSlots.length; i++) {
+    const slot = orderSlots[i], n = nodesBySlot[slot], d = n.desc, dt = t - d[0];
+    const lx = d[1] + d[4]*dt + 0.5*d[14]*dt*dt, ly = d[2] + d[5]*dt + 0.5*d[15]*dt*dt, lz = d[3] + d[6]*dt + 0.5*d[16]*dt*dt;
+    let qx = d[7], qy = d[8], qz = d[9], qw = d[10];
     const wx = d[11], wy = d[12], wz = d[13], spin = Math.hypot(wx, wy, wz);
-    if (spin > 1e-12) { const half = spin * dt / 2, s = Math.sin(half) / spin; q = qmul([wx*s, wy*s, wz*s, Math.cos(half)], q); }
-    const pw = worldPos.get(n.parentId) || [0, 0, 0], qw = worldQuat.get(n.parentId) || [0, 0, 0, 1];
-    const rotated = qrot(qw, local);
-    worldPos.set(id, [pw[0] + rotated[0], pw[1] + rotated[1], pw[2] + rotated[2]]);
-    worldQuat.set(id, qmul(qw, q));
+    if (spin > 1e-12) {
+      const half = spin * dt / 2, s = Math.sin(half) / spin, sx = wx*s, sy = wy*s, sz = wz*s, sw = Math.cos(half);
+      const nqx = sw*qx + sx*qw + sy*qz - sz*qy, nqy = sw*qy - sx*qz + sy*qw + sz*qx;
+      const nqz = sw*qz + sx*qy - sy*qx + sz*qw, nqw = sw*qw - sx*qx - sy*qy - sz*qz;
+      qx = nqx; qy = nqy; qz = nqz; qw = nqw;
+    }
+    const p = parentSlot[slot];
+    const pwx = worldQuatX[p], pwy = worldQuatY[p], pwz = worldQuatZ[p], pww = worldQuatW[p];
+    // rotate (lx,ly,lz) by the parent's world orientation
+    const tx = 2*(pwy*lz - pwz*ly), ty = 2*(pwz*lx - pwx*lz), tz = 2*(pwx*ly - pwy*lx);
+    const rx = lx + pww*tx + pwy*tz - pwz*ty, ry = ly + pww*ty + pwz*tx - pwx*tz, rz = lz + pww*tz + pwx*ty - pwy*tx;
+    worldPosX[slot] = worldPosX[p] + rx; worldPosY[slot] = worldPosY[p] + ry; worldPosZ[slot] = worldPosZ[p] + rz;
+    // compose orientation: parentWorldQuat * localQuat
+    worldQuatX[slot] = pww*qx + pwx*qw + pwy*qz - pwz*qy;
+    worldQuatY[slot] = pww*qy - pwx*qz + pwy*qw + pwz*qx;
+    worldQuatZ[slot] = pww*qz + pwx*qy - pwy*qx + pwz*qw;
+    worldQuatW[slot] = pww*qw - pwx*qx - pwy*qy - pwz*qz;
   }
 }
 
@@ -248,10 +279,12 @@ function serverNow() { return performance.now() / 1000 + (offset ?? 0); }
 let timeOffset = 0; // seconds, user-controlled ("now" by default)
 function evalTime() { return serverNow() - delay + timeOffset; }
 
-// ---------- connection
+// ---------- connection + traffic stats (rate, KB/s, snapshot load time, time since last batch), surfaced in the HUD
 const base = /\.[a-z0-9]+$/i.test(location.pathname) ? location.pathname.replace(/[^/]*$/, '') : location.pathname.replace(/\/?$/, '/');
 const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + base + 'ws';
 let ws, socketState = 'connecting';
+let bytesSinceStats = 0, bps = 0, descsSinceStats = 0, dps = 0;
+let snapshotStart = 0, snapshotBytes = 0, snapshotLoadMs = null, lastBatchAt = null;
 function connect() {
   ws = new WebSocket(url);
   ws.binaryType = 'arraybuffer';
@@ -259,7 +292,8 @@ function connect() {
   clearInterval(window.pinger); window.pinger = setInterval(ping, 1000);
   ws.onclose = () => { socketState = 'reconnecting'; setTimeout(connect, 1500); };
   ws.onmessage = e => {
-    if (typeof e.data !== 'string') { applyBatch(new DataView(e.data)); return; }
+    if (typeof e.data !== 'string') { bytesSinceStats += e.data.byteLength; applyBatch(new DataView(e.data)); return; }
+    bytesSinceStats += e.data.length;
     const m = JSON.parse(e.data);
     if (m.type === 'pong') {
       worker = m.w;
@@ -269,38 +303,101 @@ function connect() {
       if (rtt <= bestRtt * 1.2 || offset === null) { bestRtt = Math.min(bestRtt, rtt); offset = m.s + rtt / 2 - now; }
       delay = Math.max(0.03, rttAvg / 2 + 3 * jitter);
     } else if (m.type === 'snapshot') {
+      if ((m.part ?? 0) === 0) { snapshotStart = performance.now(); snapshotBytes = 0; }
+      snapshotBytes += e.data.length;
       applySnapshot(m);
+      if ((m.part ?? 0) === (m.parts ?? 1) - 1) snapshotLoadMs = performance.now() - snapshotStart;
     }
   };
 }
 function ping() { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'ping', c: performance.now() / 1000 })); }
 
+// ---------- snapshot -> the flat slot arrays (computeWorld) + the three.js objects (meshes, points cloud, labels)
 function applySnapshot(m) {
-  if ((m.part ?? 0) === 0) { nodesById = new Map(); order = []; epoch = m.epoch; }
+  if ((m.part ?? 0) === 0) { nodesById = new Map(); epoch = m.epoch; }
   gameTimeKnown = m.t;
   for (const e of m.nodes) {
     const [id, parentId, name, radius, kind, ...desc] = e;
-    nodesById.set(id, { parentId, name, radius, kind, desc });
-    order.push(id);
+    nodesById.set(id, { id, parentId, name, radius, kind, desc, slot: 0 });
   }
   if ((m.part ?? 0) === (m.parts ?? 1) - 1) {
     socketState = 'live';
-    nameToId = new Map(); for (const [id, n] of nodesById) if (n.name) nameToId.set(n.name, id);
-    largeBodies = [...nodesById.entries()].filter(([, n]) => n.radius > 500 && n.kind !== KIND_STAR).map(([id]) => id);
+    nameToId = new Map();
+    const slotCount = nodesById.size + 1;
+    nodesBySlot = new Array(slotCount); nodesBySlot[0] = null;
+    orderSlots = new Int32Array(nodesById.size);
+    parentSlot = new Int32Array(slotCount);
+    radiusArr = new Float64Array(slotCount); colorArr = new Float32Array(slotCount * 3);
+    worldPosX = new Float64Array(slotCount); worldPosY = new Float64Array(slotCount); worldPosZ = new Float64Array(slotCount);
+    worldQuatX = new Float64Array(slotCount); worldQuatY = new Float64Array(slotCount); worldQuatZ = new Float64Array(slotCount); worldQuatW = new Float64Array(slotCount);
+    worldQuatW[0] = 1;
+    let slot = 1;
+    const idToSlot = new Map();
+    const drawable = [], large = [], meshKinds = [], pointKinds = [];
+    for (const [id, n] of nodesById) {
+      n.slot = slot; idToSlot.set(id, slot); nodesBySlot[slot] = n;
+      orderSlots[slot - 1] = slot;
+      radiusArr[slot] = n.radius;
+      const col = colorFor(n); colorArr[slot*3] = col[0]; colorArr[slot*3+1] = col[1]; colorArr[slot*3+2] = col[2];
+      if (n.name) nameToId.set(n.name, id);
+      if (n.kind !== KIND_ANCHOR && n.kind !== KIND_ORBIT_FRAME && n.radius > 0) {
+        drawable.push(slot);
+        // LOD split: the handful of star/planet/moon bodies each get a real mesh (fixed 1:1, built once here - no
+        // per-frame pool reassignment needed, there are only ever a couple dozen); every asteroid is a Point.
+        (n.kind === KIND_ASTEROID ? pointKinds : meshKinds).push(slot);
+      }
+      if (n.radius > 500 && n.kind !== KIND_STAR) large.push(slot);
+      slot++;
+    }
+    for (const [id, n] of nodesById) parentSlot[n.slot] = n.parentId === 0 ? 0 : (idToSlot.get(n.parentId) ?? 0);
+    drawableSlots = new Int32Array(drawable); largeSlots = new Int32Array(large);
+
+    // (re)build the body meshes: dispose the old ones first (a reconnect could change the node set)
+    for (const { mesh } of meshSlots) { scene.remove(mesh); mesh.material.dispose(); }
+    meshSlots = meshKinds.map(s => {
+      const n = nodesBySlot[s];
+      const mesh = new THREE.Mesh(sphereGeo, makeBodyMaterial(colorFor(n), n.kind === KIND_STAR, n.radius));
+      scene.add(mesh);
+      return { slot: s, mesh };
+    });
+    const sunMeshEntry = meshSlots.find(e => nodesBySlot[e.slot].kind === KIND_STAR);
+    if (sunMeshEntry) sunLight.userData.slot = sunMeshEntry.slot;
+
+    // (re)build the points cloud (the asteroid belt, mostly)
+    if (pointsObj) { scene.remove(pointsObj); pointsObj.geometry.dispose(); }
+    pointSlots = pointKinds;
+    const posArr = new Float32Array(pointSlots.length * 3);
+    const radArr = new Float32Array(pointSlots.length);
+    const colArr = new Float32Array(pointSlots.length * 3);
+    pointSlots.forEach((s, i) => { radArr[i] = radiusArr[s]; colArr[i*3] = colorArr[s*3]; colArr[i*3+1] = colorArr[s*3+1]; colArr[i*3+2] = colorArr[s*3+2]; });
+    const pointsGeo = new THREE.BufferGeometry();
+    pointsGeo.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
+    pointsGeo.setAttribute('aRadius', new THREE.BufferAttribute(radArr, 1));
+    pointsGeo.setAttribute('aColor', new THREE.BufferAttribute(colArr, 3));
+    pointsGeo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), Infinity); // positions are camera-relative and move every frame
+    pointsObj = new THREE.Points(pointsGeo, pointsMaterial);
+    pointsObj.frustumCulled = false;
+    scene.add(pointsObj);
+
     const order1 = ['Sun', 'Mercury', 'Venus', 'Earth', 'Moon', 'Mars', 'Phobos', 'Deimos', 'Jupiter', 'Io', 'Europa', 'Ganymede', 'Callisto', 'Saturn', 'Titan', 'Uranus', 'Neptune'];
     targetList = order1.map(n => nameToId.get(n)).filter(id => id !== undefined);
     buildLabels();
     if (!initialCameraSet) setInitialCamera();
   }
 }
+// a batch of descriptions: id (uint32) + t0 (float64) + 16 float32s. Writes straight into the node's own small
+// `desc` array (replaced, not mutated in place, so computeWorld never sees a half-written record) - this only
+// happens when a body actually refits (per SolarGame's docblock, every few minutes to about a day), not per frame.
 function applyBatch(v) {
   if (v.getUint8(0) !== 1) return;
+  lastBatchAt = performance.now();
   for (let o = 9; o + 76 <= v.byteLength; o += 76) {
     const id = v.getUint32(o, true), n = nodesById.get(id);
     if (!n) continue;
     const d = [v.getFloat64(o + 4, true)];
     for (let k = 0; k < 16; k++) d.push(v.getFloat32(o + 12 + 4 * k, true));
     n.desc = d;
+    descsSinceStats++;
   }
 }
 connect();
@@ -322,14 +419,14 @@ function cameraWorldPos() {
     if (elapsed >= 1) { distance = travel.toDistance; travel = null; }
     else {
       const e = easeInOutCubic(Math.min(1, elapsed));
-      const toPos = worldPos.get(travel.toId) || [0, 0, 0];
+      const toPos = posOf(travel.toId);
       distance = lerp(travel.fromDistance, travel.toDistance, e);
       const off = offsetVector(distance, yaw, pitch);
       const toCam = [toPos[0] + off[0], toPos[1] + off[1], toPos[2] + off[2]];
       return [lerp(travel.from[0], toCam[0], e), lerp(travel.from[1], toCam[1], e), lerp(travel.from[2], toCam[2], e)];
     }
   }
-  const p = worldPos.get(target) || [0, 0, 0], off = offsetVector(distance, yaw, pitch);
+  const p = posOf(target), off = offsetVector(distance, yaw, pitch);
   return [p[0] + off[0], p[1] + off[1], p[2] + off[2]];
 }
 function flyTo(id, customDistance) {
@@ -344,7 +441,7 @@ function setInitialCamera() {
   const earth = nameToId.get('Earth'), moon = nameToId.get('Moon');
   target = earth ?? targetList[0] ?? null;
   if (earth !== undefined && moon !== undefined) {
-    const pe = worldPos.get(earth), pm = worldPos.get(moon), diff = sub(pm, pe), dist = Math.hypot(...diff), dir = norm(diff);
+    const pe = posOf(earth), pm = posOf(moon), diff = sub(pm, pe), dist = Math.hypot(...diff), dir = norm(diff);
     distance = Math.max(dist * 0.85, 40000);
     yaw = Math.atan2(-dir[0], -dir[2]); pitch = Math.max(-1.4, Math.min(1.4, Math.asin(-dir[1])));
   } else { distance = 50000; }
@@ -382,6 +479,7 @@ canvas.addEventListener('pointerup', pointerEnd);
 canvas.addEventListener('pointercancel', pointerEnd);
 canvas.addEventListener('wheel', e => { e.preventDefault(); distance = Math.max(0.5, Math.min(2e10, distance * Math.exp(e.deltaY * 0.0012))); }, { passive: false });
 addEventListener('keydown', e => {
+  if (e.key === 'p' || e.key === 'P') { showPerf = !showPerf; return; }
   if (e.code === 'Tab') { e.preventDefault(); if (targetList.length) { const i = targetList.indexOf(target); flyTo(targetList[(i + 1 + targetList.length) % targetList.length]); } return; }
   if (e.code >= 'Digit0' && e.code <= 'Digit9') {
     const names = ['Sun', 'Mercury', 'Venus', 'Earth', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune', 'Moon'];
@@ -407,133 +505,165 @@ document.getElementById('eclipse').onclick = () => {
   if (moon !== undefined) flyTo(moon, Math.max((nodesById.get(moon)?.radius ?? 1737) * 8, 9000));
 };
 
-// ---------- HTML labels
-let labelEls = new Map();
+// ---------- CSS2D labels: planets and major moons only (targetList)
+let labelObjs = new Map();
 function buildLabels() {
-  labelsEl.innerHTML = ''; labelEls = new Map();
+  for (const { obj } of labelObjs.values()) { scene.remove(obj); obj.element.remove(); }
+  labelObjs = new Map();
   for (const id of targetList) {
     const n = nodesById.get(id);
     const el = document.createElement('div');
     el.className = 'label'; el.innerHTML = `<span class="dot"></span>${n.name}`;
     el.onclick = () => flyTo(id);
-    labelsEl.appendChild(el);
-    labelEls.set(id, el);
+    const obj = new CSS2DObject(el);
+    scene.add(obj);
+    labelObjs.set(id, { obj });
   }
+}
+
+// ---------- occluder reselection: a plain scalar nearest-N scan over the (small, ~20-body) large-body list, run a
+// few times a second rather than every frame - the result barely changes between calls since orbits move slowly.
+let occSlots = new Int32Array(4), occCount = 0, lastOccAt = -Infinity;
+function maybeReselectOccluders(t) {
+  if (t - lastOccAt < 0.3 && occCount > 0) return;
+  lastOccAt = t;
+  const targetN = nodesById.get(target);
+  if (!targetN) { occCount = 0; return; }
+  const tx = worldPosX[targetN.slot], ty = worldPosY[targetN.slot], tz = worldPosZ[targetN.slot];
+  // insertion into a fixed-size top-4 (by distance), no sort(), no allocation
+  const bestSlot = [-1, -1, -1, -1], bestD = [Infinity, Infinity, Infinity, Infinity];
+  for (let i = 0; i < largeSlots.length; i++) {
+    const slot = largeSlots[i];
+    if (slot === targetN.slot) continue;
+    const dx = worldPosX[slot] - tx, dy = worldPosY[slot] - ty, dz = worldPosZ[slot] - tz;
+    const d = dx*dx + dy*dy + dz*dz;
+    for (let k = 0; k < 4; k++) {
+      if (d < bestD[k]) {
+        for (let j = 3; j > k; j--) { bestD[j] = bestD[j-1]; bestSlot[j] = bestSlot[j-1]; }
+        bestD[k] = d; bestSlot[k] = slot;
+        break;
+      }
+    }
+  }
+  occCount = 0;
+  for (let k = 0; k < 4; k++) if (bestSlot[k] >= 0) occSlots[occCount++] = bestSlot[k];
 }
 
 // ---------- render
 let frames = 0, fps = 0, lastStats = performance.now();
-let camPos = [0, 0, 0], viewProjection = null;
+let camPos = [0, 0, 0];
+let showPerf = false;
+const T = { tree: 0, occ: 0, mesh: 0, points: 0, render: 0, labels: 0, hud: 0, total: 0 };
+function ema(k, ms) { T[k] = T[k] ? T[k] * 0.9 + ms * 0.1 : ms; }
+// diagnostic (kept from chasing an earlier broken-geometry bug): every drawn mesh's screen-space radius is checked
+// against the viewport so a runaway sphere shows up in the console log instead of as garbled pixels.
+let lastMaxScreenPx = 0, lastMaxScreenName = '-', lastCulledMesh = 0;
+
+let lastCw = -1, lastCh = -1;
 function frame() {
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  const w = Math.max(1, Math.floor(canvas.clientWidth * dpr)), h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
-  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
-  gl.viewport(0, 0, w, h);
+  const t0f = performance.now();
+  const cw = canvas.clientWidth || 1, ch = canvas.clientHeight || 1;
+  if (cw !== lastCw || ch !== lastCh) {
+    renderer.setSize(cw, ch, false);
+    cssRenderer.setSize(cw, ch);
+    camera.aspect = cw / ch; camera.updateProjectionMatrix();
+    lastCw = cw; lastCh = ch;
+  }
+  if (renderer.getPixelRatio() !== dprCap) renderer.setPixelRatio(dprCap);
 
-  if (order.length) {
+  if (drawableSlots.length) {
     const t = evalTime();
+    const s0 = performance.now();
     computeWorld(t);
+    const s1 = performance.now(); ema('tree', s1 - s0);
+
     camPos = cameraWorldPos();
-    const vp = multiply(perspective(0.9, w / h, 1e-3, FAR), lookAt([0, 0, 0], sub(worldPos.get(target) || [0, 0, 0], camPos), [0, 1, 0]));
-    viewProjection = vp;
+    const camX = camPos[0], camY = camPos[1], camZ = camPos[2];
+    const targetN = nodesById.get(target);
+    const tgtX = targetN ? worldPosX[targetN.slot] - camX : 0, tgtY = targetN ? worldPosY[targetN.slot] - camY : 0, tgtZ = targetN ? worldPosZ[targetN.slot] - camZ : 0;
+    camera.position.set(0, 0, 0);
+    camera.up.set(0, 1, 0);
+    camera.lookAt(tgtX, tgtY, tgtZ);
+    const fwdLen = Math.hypot(tgtX, tgtY, tgtZ) || 1, fwdX = tgtX / fwdLen, fwdY = tgtY / fwdLen, fwdZ = tgtZ / fwdLen;
 
-    // build instance data: every drawable body, position relative to the camera (subtract in doubles, upload float32)
-    let count = 0;
-    const minPixels = 2.5, pixelScale = minPixels * 2 * Math.tan(0.45) / h;
-    for (const id of order) {
-      const n = nodesById.get(id);
-      if (n.kind === KIND_ANCHOR || n.kind === KIND_ORBIT_FRAME || n.radius <= 0) continue;
-      if ((count + 1) * SPHERE_FLOATS > instanceData.length) { const grown = new Float32Array(instanceData.length * 2); grown.set(instanceData); instanceData = grown; }
-      const p = worldPos.get(id), rel = sub(p, camPos), distCam = Math.hypot(...rel);
-      const renderRadius = Math.max(n.radius, distCam * pixelScale);
-      const q = worldQuat.get(id) || [0, 0, 0, 1], col = colorFor(n);
-      const o = count * SPHERE_FLOATS;
-      instanceData[o] = rel[0]; instanceData[o+1] = rel[1]; instanceData[o+2] = rel[2]; instanceData[o+3] = renderRadius;
-      instanceData[o+4] = col[0]; instanceData[o+5] = col[1]; instanceData[o+6] = col[2]; instanceData[o+7] = n.kind === KIND_STAR ? 1 : 0;
-      instanceData[o+8] = q[0]; instanceData[o+9] = q[1]; instanceData[o+10] = q[2]; instanceData[o+11] = q[3];
-      count++;
+    const s2 = performance.now();
+    maybeReselectOccluders(t);
+    const sunId = nameToId.get('Sun'), sunN = sunId !== undefined ? nodesById.get(sunId) : null;
+    const sunX = sunN ? worldPosX[sunN.slot] - camX : 0, sunY = sunN ? worldPosY[sunN.slot] - camY : 0, sunZ = sunN ? worldPosZ[sunN.slot] - camZ : 0;
+    sharedUniforms.uSunPos.value.set(sunX, sunY, sunZ);
+    sharedUniforms.uSunRadius.value = sunN ? sunN.radius : 696000;
+    sharedUniforms.uOccCount.value = occCount;
+    for (let i = 0; i < occCount; i++) {
+      const slot = occSlots[i];
+      sharedUniforms.uOccPos.value[i].set(worldPosX[slot] - camX, worldPosY[slot] - camY, worldPosZ[slot] - camZ);
+      sharedUniforms.uOccRadius.value[i] = radiusArr[slot];
     }
+    sunLight.position.set(sunX, sunY, sunZ);
+    const s3 = performance.now(); ema('occ', s3 - s2);
 
-    // nearest large bodies to the current target: shadow occluder candidates
-    const tPos = worldPos.get(target) || [0, 0, 0];
-    const occluders = largeBodies.filter(id => id !== target)
-      .map(id => ({ id, d: Math.hypot(...sub(worldPos.get(id), tPos)) }))
-      .sort((a, b) => a.d - b.d).slice(0, 4);
+    // body meshes: position/orient/scale each of the ~18 star/planet/moon meshes; hide any wholly behind the near
+    // plane (three's own frustum culling handles everything else that's off-screen but in front of the camera).
+    const minPixels = 2.5, screenFactor = (ch / 2) / Math.tan((camera.fov * Math.PI / 180) / 2);
+    const pixelScale = minPixels / screenFactor;
+    let maxScreenPx = 0, maxScreenName = '-', culled = 0;
+    for (const { slot, mesh } of meshSlots) {
+      const rx = worldPosX[slot] - camX, ry = worldPosY[slot] - camY, rz = worldPosZ[slot] - camZ;
+      const distCam = Math.hypot(rx, ry, rz);
+      const trueRadius = radiusArr[slot];
+      const renderRadius = Math.max(trueRadius, distCam * pixelScale);
+      const viewZ = rx * fwdX + ry * fwdY + rz * fwdZ;
+      if (viewZ + renderRadius < NEAR) { mesh.visible = false; culled++; continue; }
+      mesh.visible = true;
+      mesh.position.set(rx, ry, rz);
+      mesh.scale.setScalar(renderRadius);
+      mesh.quaternion.set(worldQuatX[slot], worldQuatY[slot], worldQuatZ[slot], worldQuatW[slot]);
+      const px = trueRadius / Math.max(distCam, 1e-9) * screenFactor;
+      if (px > maxScreenPx) { maxScreenPx = px; maxScreenName = nodesBySlot[slot].name || '(unnamed)'; }
+    }
+    lastMaxScreenPx = maxScreenPx; lastMaxScreenName = maxScreenName; lastCulledMesh = culled;
+    const s4 = performance.now(); ema('mesh', s4 - s3);
 
-    gl.clearColor(0, 0, 0, 1);
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    gl.disable(gl.DEPTH_TEST);
-    gl.useProgram(bgProgram.p);
-    const vpInv = invert4(vp);
-    gl.uniformMatrix4fv(bgProgram.u('uInverseViewProjection'), false, vpInv);
-    gl.bindVertexArray(emptyVao);
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    // the points cloud (asteroids): one scalar loop over preallocated typed arrays, no per-point allocation
+    if (pointsObj) {
+      const posAttr = pointsObj.geometry.attributes.position, arr = posAttr.array;
+      for (let i = 0; i < pointSlots.length; i++) {
+        const slot = pointSlots[i], o = i * 3;
+        arr[o] = worldPosX[slot] - camX; arr[o+1] = worldPosY[slot] - camY; arr[o+2] = worldPosZ[slot] - camZ;
+      }
+      posAttr.needsUpdate = true;
+      pointsUniforms.uScreenFactor.value = screenFactor;
+    }
+    const s5 = performance.now(); ema('points', s5 - s4);
 
-    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); gl.enable(gl.CULL_FACE);
-    gl.useProgram(sphereProgram.p);
-    gl.uniformMatrix4fv(sphereProgram.u('uViewProjection'), false, vp);
-    gl.uniform1f(sphereProgram.u('uFar'), FAR);
-    const sunId = nameToId.get('Sun');
-    const sunPos = sunId !== undefined ? sub(worldPos.get(sunId), camPos) : [0, 0, 0];
-    gl.uniform3fv(sphereProgram.u('uSunPos'), sunPos);
-    gl.uniform1f(sphereProgram.u('uSunRadius'), sunId !== undefined ? nodesById.get(sunId).radius : 696000);
-    gl.uniform1i(sphereProgram.u('uOccCount'), occluders.length);
-    const op = new Float32Array(12), or = new Float32Array(4);
-    occluders.forEach((occ, i) => { const r = sub(worldPos.get(occ.id), camPos); op[i*3]=r[0]; op[i*3+1]=r[1]; op[i*3+2]=r[2]; or[i] = nodesById.get(occ.id).radius; });
-    gl.uniform3fv(sphereProgram.u('uOccPos[0]'), op);
-    gl.uniform1fv(sphereProgram.u('uOccRadius[0]'), or);
-    gl.bindBuffer(gl.ARRAY_BUFFER, instanceBuf);
-    gl.bufferData(gl.ARRAY_BUFFER, instanceData.subarray(0, count * SPHERE_FLOATS), gl.DYNAMIC_DRAW);
-    gl.bindVertexArray(vao);
-    gl.drawElementsInstanced(gl.TRIANGLES, geo.indices.length, gl.UNSIGNED_SHORT, 0, count);
+    renderer.render(scene, camera);
+    const s6 = performance.now(); ema('render', s6 - s5);
 
-    updateLabels(vp, w, h);
+    // labels: three.js's CSS2DRenderer does the screen-space projection; just keep each label's world (camera-
+    // relative) position current and let it decide visibility/placement.
+    for (const [id, { obj }] of labelObjs) {
+      const n = nodesById.get(id);
+      if (n) obj.position.set(worldPosX[n.slot] - camX, worldPosY[n.slot] - camY, worldPosZ[n.slot] - camZ);
+    }
+    cssRenderer.render(scene, camera);
+    const s7 = performance.now(); ema('labels', s7 - s6);
     updateHud(t);
+    const s8 = performance.now(); ema('hud', s8 - s7);
   }
 
   frames++;
   const now = performance.now();
-  if (now - lastStats >= 500) { fps = frames / ((now - lastStats) / 1000); frames = 0; lastStats = now; }
+  ema('total', now - t0f);
+  if (now - lastStats >= 500) {
+    const secs = (now - lastStats) / 1000;
+    fps = frames / secs; bps = bytesSinceStats / secs; dps = descsSinceStats / secs;
+    frames = 0; bytesSinceStats = 0; descsSinceStats = 0; lastStats = now;
+    if (fps < 45 && dprCap > 1) dprCap = Math.max(1, dprCap - 0.25);
+    else if (fps > 58 && dprCap < 2) dprCap = Math.min(2, dprCap + 0.25);
+    console.log(`[solar] fps=${fps.toFixed(0)} tree=${T.tree.toFixed(2)}ms occ=${T.occ.toFixed(2)}ms mesh=${T.mesh.toFixed(2)}ms points=${T.points.toFixed(2)}ms render=${T.render.toFixed(2)}ms labels=${T.labels.toFixed(2)}ms hud=${T.hud.toFixed(2)}ms total=${T.total.toFixed(2)}ms meshes=${meshSlots.length} points=${pointSlots.length} dpr=${dprCap} maxScreenPx=${lastMaxScreenPx.toFixed(1)}(${lastMaxScreenName}) culledMeshes=${lastCulledMesh}`);
+  }
   requestAnimationFrame(frame);
 }
-function invert4(m) {
-  const a = m, i = new Array(16);
-  const [a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15] = a;
-  i[0]=a5*a10*a15-a5*a11*a14-a9*a6*a15+a9*a7*a14+a13*a6*a11-a13*a7*a10;
-  i[4]=-a4*a10*a15+a4*a11*a14+a8*a6*a15-a8*a7*a14-a12*a6*a11+a12*a7*a10;
-  i[8]=a4*a9*a15-a4*a11*a13-a8*a5*a15+a8*a7*a13+a12*a5*a11-a12*a7*a9;
-  i[12]=-a4*a9*a14+a4*a10*a13+a8*a5*a14-a8*a6*a13-a12*a5*a10+a12*a6*a9;
-  i[1]=-a1*a10*a15+a1*a11*a14+a9*a2*a15-a9*a3*a14-a13*a2*a11+a13*a3*a10;
-  i[5]=a0*a10*a15-a0*a11*a14-a8*a2*a15+a8*a3*a14+a12*a2*a11-a12*a3*a10;
-  i[9]=-a0*a9*a15+a0*a11*a13+a8*a1*a15-a8*a3*a13-a12*a1*a11+a12*a3*a9;
-  i[13]=a0*a9*a14-a0*a10*a13-a8*a1*a14+a8*a2*a13+a12*a1*a10-a12*a2*a9;
-  i[2]=a1*a6*a15-a1*a7*a14-a5*a2*a15+a5*a3*a14+a13*a2*a7-a13*a3*a6;
-  i[6]=-a0*a6*a15+a0*a7*a14+a4*a2*a15-a4*a3*a14-a12*a2*a7+a12*a3*a6;
-  i[10]=a0*a5*a15-a0*a7*a13-a4*a1*a15+a4*a3*a13+a12*a1*a7-a12*a3*a5;
-  i[14]=-a0*a5*a14+a0*a6*a13+a4*a1*a14-a4*a2*a13-a12*a1*a6+a12*a2*a5;
-  i[3]=-a1*a6*a11+a1*a7*a10+a5*a2*a11-a5*a3*a10-a9*a2*a7+a9*a3*a6;
-  i[7]=a0*a6*a11-a0*a7*a10-a4*a2*a11+a4*a3*a10+a8*a2*a7-a8*a3*a6;
-  i[11]=-a0*a5*a11+a0*a7*a9+a4*a1*a11-a4*a3*a9-a8*a1*a7+a8*a3*a5;
-  i[15]=a0*a5*a10-a0*a6*a9-a4*a1*a10+a4*a2*a9+a8*a1*a6-a8*a2*a5;
-  const det = a0*i[0]+a1*i[4]+a2*i[8]+a3*i[12];
-  return i.map(v => v / det);
-}
-function project(vp, p, w, h) {
-  const x = vp[0]*p[0]+vp[4]*p[1]+vp[8]*p[2]+vp[12], y = vp[1]*p[0]+vp[5]*p[1]+vp[9]*p[2]+vp[13];
-  const wc = vp[3]*p[0]+vp[7]*p[1]+vp[11]*p[2]+vp[15];
-  if (wc <= 1e-6) return null;
-  return [(x / wc * 0.5 + 0.5) * w, (1 - (y / wc * 0.5 + 0.5)) * h];
-}
-function updateLabels(vp, w, h) {
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  for (const [id, el] of labelEls) {
-    const p = worldPos.get(id);
-    if (!p) { el.style.display = 'none'; continue; }
-    const rel = sub(p, camPos), s = project(vp, rel, w, h);
-    if (!s) { el.style.display = 'none'; continue; }
-    el.style.display = ''; el.style.left = (s[0] / dpr) + 'px'; el.style.top = (s[1] / dpr) + 'px';
-  }
-}
+
 function formatDistance(km) { return km > AU * 0.1 ? (km / AU).toFixed(3) + ' AU' : km.toLocaleString(undefined, { maximumFractionDigits: 0 }) + ' km'; }
 let lastHudAt = 0;
 function updateHud(t) {
@@ -541,14 +671,24 @@ function updateHud(t) {
   if (now - lastHudAt < 200) return;
   lastHudAt = now;
   const tn = nodesById.get(target);
-  const dist = target !== null ? Math.hypot(...sub(worldPos.get(target) || [0,0,0], camPos)) : 0;
+  const dist = tn ? Math.hypot(worldPosX[tn.slot] - camPos[0], worldPosY[tn.slot] - camPos[1], worldPosZ[tn.slot] - camPos[2]) : 0;
   const date = epoch !== null ? new Date((epoch + t) * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' UTC' : '?';
+  const lastUpdate = lastBatchAt === null ? 'none yet' : ((now - lastBatchAt) / 1000).toFixed(0) + 's ago';
+  let perf = '';
+  if (showPerf) {
+    perf = `\n<span class="k">tree</span> ${T.tree.toFixed(2)}ms <span class="k">occ</span> ${T.occ.toFixed(2)}ms <span class="k">mesh</span> ${T.mesh.toFixed(2)}ms\n` +
+      `<span class="k">points</span> ${T.points.toFixed(2)}ms <span class="k">render</span> ${T.render.toFixed(2)}ms <span class="k">labels</span> ${T.labels.toFixed(2)}ms\n` +
+      `<span class="k">total</span> ${T.total.toFixed(2)}ms <span class="k">dpr</span> ${dprCap.toFixed(2)}`;
+  }
   hud.innerHTML = `<b>phasync+Phame: Tech preview</b>\n` +
     `<span class="k">target</span> ${tn ? tn.name || 'unnamed' : '-'}${travel ? ' (travelling…)' : ''}\n` +
     `<span class="k">distance</span> ${formatDistance(dist)}\n` +
     `<span class="k">time</span> ${date}\n` +
     `<span class="k">fps</span> ${fps.toFixed(0)}${worker ? `  <span class="k">worker</span> ${worker}` : ''}\n` +
-    `<span class="k">socket</span> ${socketState}`;
+    `<span class="k">socket</span> ${socketState}\n` +
+    `<span class="k">descriptions</span> ${dps.toFixed(2)}/s · ${(bps / 1024).toFixed(2)} KB/s\n` +
+    `<span class="k">snapshot</span> ${snapshotLoadMs !== null ? (snapshotBytes/1024).toFixed(0) + ' KB in ' + snapshotLoadMs.toFixed(0) + ' ms' : 'loading…'}\n` +
+    `<span class="k">last update</span> ${lastUpdate}` + perf;
   timeLabel.textContent = timeOffset === 0 ? 'now' : (timeOffset > 0 ? '+' : '') + (timeOffset / 3600).toFixed(1) + 'h';
 }
 requestAnimationFrame(frame);
