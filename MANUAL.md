@@ -444,6 +444,32 @@ How to read it:
 - **The GPU is never the bottleneck** for 2D: Phame's cost is PHP on the CPU. A 2025 desktop CPU is about 2.5 times
   as fast as a 2014 server CPU for game logic.
 
+### Memory: owners take apart what they dispose of
+
+PHP frees an object the moment its last reference goes, except when objects reference each other: a child knows its
+parent and the parent its children, a listener closure captures `$this`, two objects point at each other. Such a
+cycle stays until the cycle collector finds it. phasync runs the collector about every half second while busy, and a
+run costs what it has to walk: the objects that changed hands since the last run, and everything they still point at.
+A game that leaves cycles behind pays for them in collector time, and the pauses grow with the world.
+
+So think about ownership: every object has one owner, and the owner that is done with an object takes it apart before
+letting go. Then it is freed at once, and if anything still holds it, it points at nothing and costs nothing to check.
+
+- **`dispose()` a node you are done with.** `Node3D::dispose()` (and `DisplayObject::dispose()` in 2D) leaves the
+  parent, ends the node's coroutines and cuts every reference inside its tree. `removeChild()` only detaches: use it
+  for a node you will add again.
+- **In your own classes, do the same.** A `dispose()` that sets properties holding other objects to null and empties
+  arrays of objects, called by whoever owns the object, is all it takes.
+- **Don't keep a `Contact`.** It holds both bodies; copy the numbers you need inside the handler.
+- **Mind closures.** A listener or callback stored on an object, capturing that object, is a cycle: remove it when you
+  dispose (nodes do this for their own coroutines and enter-frame listeners).
+- **Reuse recurring objects.** `Vector3::get()` / `release()` and `Matrix4::get()` take from pools; reuse arrays
+  instead of building new ones per frame.
+
+To check a game: `gc_collect_cycles()` returns the garbage it found (aim for none), and `gc_status()['collector_time']`
+gives the time spent collecting. Phame's ragdoll demo leaves no garbage; before its trees were taken apart, 20
+expiring ragdolls left 952 objects for one collection, and that collection took about five times as long.
+
 ## Testing games headless
 
 `new Engine(800, 600, headless: true)` renders without a window, so games can be tested in CI and by bots:
