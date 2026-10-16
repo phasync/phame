@@ -43,10 +43,10 @@ class SolarSystem
      * A sphere of $radius, drawn in $color: shares one unit Geometry (scaled), as RocksGame's balls do. $shadowed
      * (the Sun, every planet, every moon - never one of the 300 asteroids) opts into the eclipse-capable shader
      * below; every Material is still its own object (so each body keeps its own colour - Net\View has no notion of
-     * per-instance colour, only per-material), but the eclipse shader's GLSL is a few KB, and View's snapshot does
-     * not chunk by byte size, only by node count - inlining it into all ~300 asteroids' materials once blew a single
-     * snapshot chunk past Swerve's 128 KiB ceiling (and so past silently). Asteroids are far too small on screen for
-     * the shadow to read anyway, so they get the plain (shaderless, still lit) material instead.
+     * per-instance colour, only per-material), but the eclipse shader's GLSL is a few KB, and 300 of them (one per
+     * asteroid) is a few hundred KB of GLSL repeated for bodies far too small on screen for the shadow to read
+     * anyway - wasteful even though View now chunks a snapshot by byte size, not just node count. Asteroids get the
+     * plain (shaderless, still lit) material instead, one shared instance for all 300.
      */
     private static ?Material $asteroidMaterial = null;
 
@@ -67,10 +67,9 @@ class SolarSystem
      * Lit by the nearest point light (the Sun) plus an eclipse shadow: the fraction of the Sun's disc covered by
      * the nearest few large bodies (phame.js's generic "occluder" uniforms - see client/phame.js's docblock and
      * docs/REMOTE-VIEW.md's note on this), darkening and reddening a body passing through another's shadow (the
-     * Moon during a lunar eclipse). The Sun's own radius is baked in as a GLSL constant: PointLight carries no
-     * physical size (it is a true point for ordinary lighting), so there is no uniform to read it from - the engine
-     * could add one (`PointLight::$radius`, defaulting to 0) if another game ever needs a light's own angular size;
-     * until then this is the one place that needs it, and it never changes.
+     * Moon during a lunar eclipse). The Sun's own radius is baked in as a GLSL constant rather than read from
+     * `PointLight::$lightRadius` (which the Sun's light does carry - see buildSystem()): it never changes, and a
+     * GLSL float literal needs no uniform upload every tick for a value that is always the same number.
      */
     private static function bodyShader(): MeshShader
     {
@@ -132,7 +131,7 @@ class SolarSystem
         $sunAnchor->addChild($sun);
         // every body's N.L lighting (and the eclipse shadow above) comes from this, not the scene's directional
         // sun - a real point light at the Sun's position casts correctly as the viewer flies anywhere in the system.
-        $sunAnchor->addChild(new PointLight(color: 0xfff2cc, intensity: 1.0, range: 1.0e12));
+        $sunAnchor->addChild(new PointLight(color: 0xfff2cc, intensity: 1.0, range: 1.0e12, lightRadius: Ephemeris::SUN_RADIUS));
 
         foreach (['Mercury', 'Venus', 'Earth', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune'] as $planet) {
             $this->addPlanet($planet);

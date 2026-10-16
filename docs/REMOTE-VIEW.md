@@ -33,7 +33,9 @@ For every node:
   - a `Mesh`: its `geometry` and `material`, each sent once and referenced by id (object identity, via a
     `WeakMap`, decides whether a geometry or material has been sent before - two `Mesh`es sharing one `Geometry`
     instance, as a game reusing `Geometry::sphere()` across every rock should, send that geometry's data once).
-  - a `PointLight`: color, intensity, range.
+  - a `PointLight`: color, intensity, range, `lightRadius` (the light source's own physical size, 0 = a true
+    point; a renderer wanting a light's angular size at a distance - an eclipse's penumbra, say - reads this,
+    never `Node3D::$radius`, which is a collision sphere a light never has a physics reason to carry).
   - a `Label` (new - see below): its text and color.
   - anything else (a bare `Node3D`: a compound's root, a ragdoll's hinge joint, a tether's anchor): transform only,
     nothing drawn. A ragdoll bone is not a protocol concept - it is a `Mesh` with a `Geometry::cylinder()` the game
@@ -70,7 +72,13 @@ only the snapshot) and refuses to render past a mismatch rather than guess. `Vie
 ### Join -> snapshot
 
 A viewer joins (`{v, type: 'join', client}`) on the game's `in` channel, as today. The game answers on that viewer's
-own channel with one or more snapshot chunks, each under 128 KiB (Swerve's limit), in this order:
+own channel with one or more snapshot chunks, each under `View::MAX_MESSAGE_BYTES` (128 KiB, Swerve's own limit) of
+*encoded* bytes - geometries and materials included, not just the node list: a shader's GLSL alone can run to a few
+KB, and a scene with many distinctly-coloured (so distinctly-materialled) meshes blows past 128 KiB on assets long
+before it blows past it on nodes. `View` packs geometries, then materials, then nodes, greedily into as few parts
+as fit - a geometry or material is never split (there is nothing smaller to split it into), and a single record
+too big for a part on its own is a thrown `\RuntimeException` naming what and how big, not a part silently over
+the limit that a Transport then refuses to send. Each part carries:
 
 1. **Geometries** - `{id, vertices, indices}`: the same `float[8 per vertex]` / `uint16` arrays `Geometry` already
    holds (and uploads to the GPU verbatim) - sent raw (as plain number arrays, since this part is JSON like the
@@ -78,19 +86,26 @@ own channel with one or more snapshot chunks, each under 128 KiB (Swerve's limit
    name": `Geometry::sphere()` and a hand-built geometry are indistinguishable data, so the wire format does not
    distinguish them either. **Or** `{id, url}` - `Geometry::$source`, set when a (future) glTF loader built this
    one from an asset instead of a factory or an array literal, a reference the browser fetches and caches itself
-   (`"/assets/ship.glb#mesh0"`): large mesh data never goes over the WebSocket. Part 0 only.
+   (`"/assets/ship.glb#mesh0"`): large mesh data never goes over the WebSocket.
 2. **Materials** - `{id, color, alpha, unlit, doubleSided, specular, shininess, emissive, shader, displace, texture}`
    (`shader`/`displace` are GLSL source, or absent for the standard lit model; `texture` is always a reference -
    `Texture::$source` - never inline pixel data, which is not yet implemented and not yet needed by any game).
-   **Or** `{id, url}`, exactly as a geometry, when `Material::$source` is set. Part 0 only.
+   **Or** `{id, url}`, exactly as a geometry, when `Material::$source` is set.
 3. **Nodes** - flat records, *parents always before children*, as `SolarGame` already guarantees:
    `[id, parentId, kind, name, visible, scaleX, scaleY, scaleZ, kindFields..., ...17 floats]` (scale is
    `Node3D::$scaleX/Y/Z`, static far more often than not, but part of what a node looks like, same as its mesh);
-   `kind` is 0 (plain), 1 (mesh: adds `geometryId, materialId`), 2 (light: adds `color, intensity, range`), 3
-   (label: adds `text, color`). Chunked
-   across as many parts as needed.
+   `kind` is 0 (plain), 1 (mesh: adds `geometryId, materialId`), 2 (light: adds `color, intensity, range,
+   lightRadius`), 3 (label: adds `text, color`). Chunked across as many parts as needed.
 
-A chunked snapshot carries `part`/`parts` as today; a client does not act on it until the last part arrives.
+Geometries and materials may land on any part, not only the first (a client merges them into its own id maps as
+each part arrives, regardless of part number - it only waits for the last part to render). A chunked snapshot
+carries `part`/`parts` as today; a client does not act on it until the last part arrives.
+
+An `add` (below) is chunked the same way, and for the same reason: a subtree added well after the join (a thrown
+ragdoll's limbs, say) can introduce a geometry or material no viewer of that channel has seen yet, so `add` also
+carries whichever `geometries`/`materials` are new to that channel - sent once per channel, not once per node, so
+a game's own shared-by-(class, colour) `Material` (the same pattern `Ball`/`Limb` use) costs the wire nothing extra
+for every further node that reuses it.
 
 ### Description batch (binary)
 

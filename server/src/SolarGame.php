@@ -34,6 +34,10 @@ final class SolarGame
     private SolarSystem $system;
     private float $started;
 
+    /** Set the moment start() is called, before anything that could fail (a lock, a Swerve call): a test calling
+     * start() can check this ran without needing a live worker or socket, the way RocksGameTest does. */
+    public static bool $launched = false;
+
     /**
      * Starts the game as a coroutine of the calling worker (the one that won the Rocks game's lock - see
      * RocksGame::ensureRunning(): one worker runs both games, one World each). Restarts it if it stops on its own;
@@ -41,6 +45,7 @@ final class SolarGame
      */
     public static function start(): void
     {
+        self::$launched = true;
         \phasync::go(static function () {
             while (true) {
                 try {

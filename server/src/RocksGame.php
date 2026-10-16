@@ -184,6 +184,13 @@ final class RocksGame
     private array $viewers = [];
     private float $started;
 
+    /** Every other game this worker runs alongside this one, once it wins the election - a separate method so a
+     * test can call it on its own, without a lock file or a Swerve server, and catch a forgotten ::start() here. */
+    private static function startCompanions(): void
+    {
+        SolarGame::start();
+    }
+
     /**
      * Makes sure that exactly one worker runs the game: each worker tries a lock now and then, and the one holding it
      * runs the game. When that worker goes (a recycle, a crash), the lock is released and another takes over.
@@ -201,7 +208,7 @@ final class RocksGame
                     self::$lock = $lock;   // held for the life of this worker
                     try {
                         self::$instance = new self();
-                        SolarGame::start();   // the other game this worker runs - see its own docblock
+                        self::startCompanions();
                         self::$instance->run();
                     } catch (\Throwable $e) {   // log it, and let another worker (or this one) start a new game
                         error_log('phame rocks game stopped: ' . $e);

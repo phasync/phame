@@ -9,10 +9,16 @@ use Phame\Scene\{Geometry, Material, Mesh};
 final class Limb extends Mesh
 {
     private static ?Geometry $sphere = null;
+    private static ?MeshShader $shader = null;
+    /** @var array<int, Material> one Material per colour, not one per limb: as Ball's own note explains, Net\View
+     * sends a Material's fields (its shader's GLSL included) inline every time that *object* is new, so every
+     * ragdoll thrown in the same colour must share one Material, not mint a fresh one per limb. */
+    private static array $materials = [];
 
     public function __construct(public readonly Ragdoll $doll, float $radius)
     {
-        parent::__construct(self::$sphere ??= Geometry::sphere(1.0), new Material(color: $doll->by->color, shader: self::material()));
+        $material = self::$materials[$doll->by->color] ??= new Material(color: $doll->by->color, shader: self::$shader ??= self::material());
+        parent::__construct(self::$sphere ??= Geometry::sphere(1.0), $material);
         $this->radius = $radius;
         $this->setScale($radius);
         $this->mass = 3.0 * $radius ** 3;

@@ -28,7 +28,7 @@ return new RequestHandler(function (ClientRequest $request) {
             $ws->onMessage->listen(function (string $data) use ($ws, &$epoch, $client) {
                 $message = json_decode($data, true);
                 if (($message['type'] ?? '') === 'ping' && $epoch !== null) {
-                    $ws->send(json_encode(['v' => 1, 'type' => 'pong', 'c' => $message['c'], 's' => microtime(true) - $epoch, 'w' => getmypid()]));
+                    $ws->send(json_encode(['v' => \Phame\Net\View::PROTOCOL_VERSION, 'type' => 'pong', 'c' => $message['c'], 's' => microtime(true) - $epoch, 'w' => getmypid()]));
                 }
             });
             RocksGame::ensureRunning();   // elects the worker that runs both games
@@ -67,7 +67,7 @@ return new RequestHandler(function (ClientRequest $request) {
             $ws->onMessage->listen(function (string $data) use ($ws, &$epoch, $client) {   // first, so that no early ping is missed
                 $message = json_decode($data, true);
                 if (($message['type'] ?? '') === 'ping' && $epoch !== null) {
-                    $ws->send(json_encode(['v' => 1, 'type' => 'pong', 'c' => $message['c'], 's' => microtime(true) - $epoch, 'w' => getmypid()]));
+                    $ws->send(json_encode(['v' => \Phame\Net\View::PROTOCOL_VERSION, 'type' => 'pong', 'c' => $message['c'], 's' => microtime(true) - $epoch, 'w' => getmypid()]));
                 } elseif (($message['type'] ?? '') === 'drop') {
                     Swerve::publishRaw('phame:rocks:in', json_encode(['type' => 'drop', 'client' => $client]));
                 } elseif (($message['type'] ?? '') === 'camera') {   // input: to the game, wherever it runs

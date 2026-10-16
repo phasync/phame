@@ -22,9 +22,13 @@ use Phame\World;
  */
 final class View
 {
-    public const PROTOCOL_VERSION = 1;
-    /** Swerve's own ceiling on one message; a snapshot's node list is chunked to stay under it. */
-    private const CHUNK_NODES = 200;
+    public const PROTOCOL_VERSION = 2;
+    /** This protocol's own ceiling on one message (Swerve's own limit, which every Transport must meet or beat).
+     * Every snapshot and add is chunked to stay under it; one geometry, material or node too big to fit on its
+     * own is an error, not a truncated or dropped record. */
+    public const MAX_MESSAGE_BYTES = 128 * 1024;
+    /** Headroom subtracted from MAX_MESSAGE_BYTES for the envelope wrapped around a chunk's own payload. */
+    private const MESSAGE_HEADROOM = 1024;
 
     /** @var \WeakMap<Node3D, int> */
     private \WeakMap $nodeIds;
@@ -39,6 +43,12 @@ final class View
     private \WeakMap $audience;
     /** @var array<int, Node3D> every currently-known node, by id: what the next publish() diffs against. */
     private array $known = [];
+    /** @var array<string, array<int, true>> geometry ids already sent on a channel - a node added after the
+     * snapshot (a thrown ragdoll's limb, say) must still bring its geometry/material the first time that channel
+     * sees it; one already seen (shared, as a game's own pooled Material is) is not sent again. */
+    private array $sentGeometry = [];
+    /** @var array<string, array<int, true>> as $sentGeometry, for materials. */
+    private array $sentMaterial = [];
     /** @var list<Viewer> */
     private array $viewers = [];
 
@@ -131,7 +141,7 @@ final class View
             return [$id, $parentId, 1, $node->name, $node->visible, ...$scale, $this->geometryIdOf($node->geometry), $this->materialIdOf($node->material), ...$description];
         }
         if ($node instanceof PointLight) {
-            return [$id, $parentId, 2, $node->name, $node->visible, ...$scale, $node->color, $node->intensity, $node->range, ...$description];
+            return [$id, $parentId, 2, $node->name, $node->visible, ...$scale, $node->color, $node->intensity, $node->range, $node->lightRadius, ...$description];
         }
         if ($node instanceof Label) {
             return [$id, $parentId, 3, $node->name, $node->visible, ...$scale, $node->text, $node->color, ...$description];
@@ -179,7 +189,62 @@ final class View
         ];
     }
 
-    /** The whole scene, in parts small enough for Transport (one node per 76-byte-ish JSON entry, chunked). */
+    /**
+     * Greedily packs $geometries, $materials and $nodeRecords - always in that order, since a node's geometry or
+     * material must reach the client no later than the node that references it - into as few groups as fit under
+     * $budget encoded bytes each. One record too big for a group on its own (a shader's GLSL, a large inline mesh)
+     * is an error: there is nothing smaller left to split it into, and sending it truncated would be worse than
+     * refusing it loudly.
+     *
+     * @return list<array{geometries?: list<array>, materials?: list<array>, nodes?: list<array>}>
+     */
+    private function packByBytes(array $geometries, array $materials, array $nodeRecords, int $budget): array
+    {
+        $groups = [];
+        foreach ($geometries as $g) {
+            $groups[] = ['geometries', $g];
+        }
+        foreach ($materials as $m) {
+            $groups[] = ['materials', $m];
+        }
+        foreach ($nodeRecords as $n) {
+            $groups[] = ['nodes', $n];
+        }
+
+        $parts = [[]];
+        $size = 0;
+        foreach ($groups as [$key, $item]) {
+            $itemSize = strlen(json_encode($item)) + 1;   // +1: its comma in the enclosing list
+            if ($itemSize > $budget) {
+                $singular = ['geometries' => 'geometry', 'materials' => 'material', 'nodes' => 'node'][$key];
+                throw new \RuntimeException(sprintf(
+                    "Net\\View: a %s record is %d bytes, over this protocol's %d-byte message limit; split it, or send it by reference instead (Geometry/Material::\$source)",
+                    $singular, $itemSize, $budget,
+                ));
+            }
+            if ($size + $itemSize > $budget) {
+                $parts[] = [];
+                $size = 0;
+            }
+            $parts[array_key_last($parts)][$key][] = $item;
+            $size += $itemSize;
+        }
+        return $parts;
+    }
+
+    /** Every byte this View sends goes through here: a Transport failure (including "too big to publish at all")
+     * is logged with the channel and size before it propagates - so it reads as what it is, not as "never started". */
+    private function send(string $channel, string $bytes): void
+    {
+        try {
+            $this->transport->publish($channel, $bytes);
+        } catch (\Throwable $e) {
+            error_log(sprintf('Net\View: publish to %s failed (%d bytes): %s', $channel, strlen($bytes), $e->getMessage()));
+            throw $e;
+        }
+    }
+
+    /** The whole scene, chunked (by encoded byte size, assets included) to stay under MAX_MESSAGE_BYTES a part. */
     private function sendSnapshotTo(Viewer $viewer): void
     {
         $nodes = [];
@@ -198,11 +263,13 @@ final class View
                     $seenGeometry[$gid] = true;
                     $geometries[] = $this->geometryRecord($node->geometry);
                 }
+                $this->sentGeometry[$this->channelFor($node)][$gid] = true;
                 $mid = $this->materialIdOf($node->material);
                 if (!isset($seenMaterial[$mid])) {
                     $seenMaterial[$mid] = true;
                     $materials[] = $this->materialRecord($node->material);
                 }
+                $this->sentMaterial[$this->channelFor($node)][$mid] = true;
             }
             $nodeRecords[] = $this->nodeRecord($node);
         }
@@ -211,18 +278,19 @@ final class View
             $this->known[$this->idOf($node)] = $node;
         }
 
-        $chunks = array_chunk($nodeRecords, self::CHUNK_NODES) ?: [[]];
-        foreach ($chunks as $i => $chunk) {
-            $message = [
-                'v' => self::PROTOCOL_VERSION, 'type' => 'snapshot', 'part' => $i, 'parts' => count($chunks),
-                't' => $this->world->clock->time, 'nodes' => $chunk,
-            ];
+        $scene = $this->sceneRecord();
+        $envelope = ['v' => self::PROTOCOL_VERSION, 'type' => 'snapshot', 'part' => 0, 'parts' => 0, 't' => $this->world->clock->time] + $scene;
+        $budget = self::MAX_MESSAGE_BYTES - strlen(json_encode($envelope)) - self::MESSAGE_HEADROOM;
+        $parts = $this->packByBytes($geometries, $materials, $nodeRecords, $budget);
+        $total = count($parts);
+        foreach ($parts as $i => $part) {
+            $message = ['v' => self::PROTOCOL_VERSION, 'type' => 'snapshot', 'part' => $i, 'parts' => $total, 't' => $this->world->clock->time];
             if ($i === 0) {
-                $message['geometries'] = $geometries;
-                $message['materials'] = $materials;
-                $message += $this->sceneRecord();
+                $message += $scene;
             }
-            $this->transport->publish($viewer->channel, json_encode($message));
+            $message += $part;
+            $message['nodes'] ??= [];
+            $this->send($viewer->channel, json_encode($message));
         }
     }
 
@@ -253,10 +321,10 @@ final class View
         if ($addedIds !== []) {
             $byChannel = [];
             foreach ($addedIds as $node) {
-                $byChannel[$this->channelFor($node)][] = $this->nodeRecord($node);
+                $byChannel[$this->channelFor($node)][] = $node;
             }
-            foreach ($byChannel as $channel => $records) {
-                $this->transport->publish($channel, json_encode(['v' => self::PROTOCOL_VERSION, 'type' => 'add', 'nodes' => $records]));
+            foreach ($byChannel as $channel => $addedNodes) {
+                $this->sendAdd($channel, $addedNodes);
             }
         }
         if ($removedIds !== []) {
@@ -265,7 +333,10 @@ final class View
                 $byChannel[$this->channelFor($node)][] = $id;
             }
             foreach ($byChannel as $channel => $ids) {
-                $this->transport->publish($channel, json_encode(['v' => self::PROTOCOL_VERSION, 'type' => 'remove', 'ids' => $ids]));
+                $budget = self::MAX_MESSAGE_BYTES - self::MESSAGE_HEADROOM;
+                foreach (array_chunk($ids, intdiv($budget, 11)) as $chunk) {   // an id is at most 10 digits, plus its comma
+                    $this->send($channel, json_encode(['v' => self::PROTOCOL_VERSION, 'type' => 'remove', 'ids' => $chunk]));
+                }
             }
         }
 
@@ -282,8 +353,11 @@ final class View
         }
         $time = $this->world->clock->time;
         $header = pack('Ce', self::PROTOCOL_VERSION, $time);
+        $perChunk = intdiv(self::MAX_MESSAGE_BYTES - self::MESSAGE_HEADROOM - strlen($header), 88);
         foreach ($byChannel as $channel => $records) {
-            $this->transport->publish($channel, $header . implode('', array_column($records, 1)));
+            foreach (array_chunk($records, $perChunk) as $chunk) {
+                $this->send($channel, $header . implode('', array_column($chunk, 1)));
+            }
             if ($channel !== $this->channel) {
                 continue;   // already one viewer's own channel: interest filtering does not apply to a private node
             }
@@ -297,10 +371,41 @@ final class View
                         $filtered .= $bytes;
                     }
                 }
-                if ($filtered !== '') {
-                    $this->transport->publish($viewer->channel, $header . $filtered);
+                foreach (str_split($filtered, $perChunk * 88) as $batch) {
+                    $this->send($viewer->channel, $header . $batch);
                 }
             }
+        }
+    }
+
+    /** Sends a newly-added subtree on $channel: its node records, plus any geometry/material that channel has not
+     * been sent before (a thrown ragdoll's limb brings its own Geometry/Material the first time, like a joining
+     * viewer's snapshot does; one already shared with something already on that channel is not repeated). */
+    private function sendAdd(string $channel, array $addedNodes): void
+    {
+        $geometries = [];
+        $materials = [];
+        $nodeRecords = [];
+        foreach ($addedNodes as $node) {
+            if ($node instanceof Mesh) {
+                $gid = $this->geometryIdOf($node->geometry);
+                if (!isset($this->sentGeometry[$channel][$gid])) {
+                    $this->sentGeometry[$channel][$gid] = true;
+                    $geometries[] = $this->geometryRecord($node->geometry);
+                }
+                $mid = $this->materialIdOf($node->material);
+                if (!isset($this->sentMaterial[$channel][$mid])) {
+                    $this->sentMaterial[$channel][$mid] = true;
+                    $materials[] = $this->materialRecord($node->material);
+                }
+            }
+            $nodeRecords[] = $this->nodeRecord($node);
+        }
+        $budget = self::MAX_MESSAGE_BYTES - strlen(json_encode(['v' => self::PROTOCOL_VERSION, 'type' => 'add'])) - self::MESSAGE_HEADROOM;
+        foreach ($this->packByBytes($geometries, $materials, $nodeRecords, $budget) as $part) {
+            $message = ['v' => self::PROTOCOL_VERSION, 'type' => 'add'] + $part;
+            $message['nodes'] ??= [];
+            $this->send($channel, json_encode($message));
         }
     }
 }
