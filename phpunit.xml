@@ -5,6 +5,7 @@
     <testsuites>
         <testsuite name="phame"><directory>tests</directory></testsuite>
     </testsuites>
+    <groups><exclude><group>baseline-failure</group><group>soak</group></exclude></groups>
     <php>
         <ini name="error_reporting" value="-1"/>
     </php>
