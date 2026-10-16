@@ -52,7 +52,7 @@ final class ViewTest extends TestCase
 
         $this->assertCount(1, $transport->published, 'everything fits one chunk');
         $message = json_decode($transport->published[0][1], true);
-        $this->assertSame(1, $message['v'], 'the protocol version');
+        $this->assertSame(View::PROTOCOL_VERSION, $message['v'], 'the protocol version');
         $this->assertSame('snapshot', $message['type']);
         $this->assertCount(1, $message['geometries'], 'one geometry, shared by both meshes');
         $this->assertCount(1, $message['materials'], 'one material, shared by both meshes');
@@ -123,13 +123,13 @@ final class ViewTest extends TestCase
         $transport = new RecordingTransport();
         $view = new View($world, $scene, $transport, 'out');
         $view->join('viewer1');
-        $this->assertSame(1, json_decode($transport->published[0][1], true)['v']);
+        $this->assertSame(View::PROTOCOL_VERSION, json_decode($transport->published[0][1], true)['v']);
         $transport->reset();
 
         $node = new Node3D();
         $scene->root->addChild($node);
         $view->publish();
-        $this->assertSame(1, json_decode($transport->published[0][1], true)['v']);
+        $this->assertSame(View::PROTOCOL_VERSION, json_decode($transport->published[0][1], true)['v']);
         $transport->reset();
 
         \phasync::run(function () use ($world, $node, $view, $transport) {
