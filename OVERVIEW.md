@@ -96,4 +96,4 @@ These are worth knowing before judging it.
 - **Speed.** About 2.7 µs per animated sprite on the development machine, roughly 5,000 sprites at 72 fps. The cost is PHP-side (matrices, vertex packing), not GPU. The JIT helps with 3D math.
 - **Single-threaded, Linux-tested only.** Headless rendering depends on SDL's offscreen driver.
 - **Hard cancellation costs more than a request.** Measured on phasync main: cancelling its own frame takes about 10 µs, `requestCancellation()` about 4 µs. A full owner lifecycle is about 83 µs with a request and about 276 µs with a hard cancel, because the exception unwinds a nested `run()`. Phame therefore prefers requests and hard-cancels only stragglers.
-- **Still young.** It has no clipping rectangles, shadow maps, model loader, gamepad input or compressed audio yet (see the README's roadmap).
+- **Still young.** It has no clipping rectangles, shadow maps, model loader, gamepad input or compressed audio yet (see the roadmap in [docs/ENGINE.md](docs/ENGINE.md#roadmap)).
