@@ -69,4 +69,26 @@ final class OrientationTest extends TestCase
         $this->assertEqualsWithDelta(0.2, $node->x, 1e-12, 'evaluated now it has moved on');
         $world->dispose();
     }
+
+    public function testADisposedTreeIsFreedWithoutTheCycleCollector(): void
+    {
+        // children know their parent and parents their children: a removed tree is a cycle, left to the collector.
+        // Taken apart by its owner, it goes the moment the last reference does
+        $world = new \Phame\World();
+        $scene = $world->stage->addChild(new \Phame\Scene\Scene3D(100, 100));
+        $root = new Node3D();
+        $joint = $root->addChild(new Node3D());
+        $joint->addChild(new Node3D());
+        $scene->root->addChild($root);
+        $weak = \WeakReference::create($joint);
+        gc_disable();
+        try {
+            $root->dispose();
+            unset($root, $joint);
+            $this->assertNull($weak->get(), 'freed by its reference count alone');
+        } finally {
+            gc_enable();
+        }
+        $world->dispose();
+    }
 }

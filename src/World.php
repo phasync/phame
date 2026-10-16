@@ -788,14 +788,10 @@ final class World
         if ($handler === null) {
             return;
         }
-        $a->impact = $contact;
-        if ($b instanceof \Phame\Scene\Node3D) {
-            $b->impact = $contact;
-        }
         $swapped ? ($wantsWorld ? $handler($b, $a, $contact, $this) : $handler($b, $a, $contact)) : ($wantsWorld ? $handler($a, $b, $contact, $this) : $handler($a, $b, $contact));
     }
 
-    /** Ends every current wait() of the body now: it returns Wake::woken(), and the body's $impact tells what happened. */
+    /** Ends every current wait() of the body now: it returns Wake::woken(). */
     public function wake(Kinetic\Body $body): void
     {
         foreach ($body->waiting ?? [] as $waiter) {

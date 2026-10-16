@@ -59,8 +59,6 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
     public ?Node3D $physicsCompound = null;
     /** Whether the walls of the scene's box hold it in (see Scene3D's world bounds). False: it goes straight through. */
     public bool $confined = true;
-    /** The last contact the world handled for this node (set before the collision handler runs). */
-    public ?\Phame\Physics\Contact $impact = null;
     /** @internal */
     public ?\Phame\Physics\Space $physicsSpace = null;
     /** @internal */
@@ -578,6 +576,35 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
             $event = null;
             self::leaveParent($child, $event);
         }
+    }
+
+    /**
+     * For the owner that is done with this node: takes it and everything below it apart. It leaves its parent (and
+     * the physics, as removeChild() does), its coroutines end, and every reference between the nodes is cut, so they
+     * are freed the moment the owner lets go of the node instead of waiting, as a cycle, for the collector (whose
+     * every run also walks what is still connected). Don't use the nodes afterwards.
+     */
+    public function dispose(): void
+    {
+        $this->parent?->removeChild($this);
+        $this->takeApart();
+    }
+
+    private function takeApart(): void
+    {
+        $this->cancelCoroutines();
+        foreach ($this->children as $child) {
+            $child->parent = null;
+            $child->takeApart();
+        }
+        $this->children = [];
+        $this->scene = null;
+        $this->clock = null;
+        $this->contact = null;
+        $this->waiting = null;
+        $this->kineticCache = null;
+        $this->physicsPair = null;
+        $this->physicsCompound = null;
     }
 
     public function removeFromParent(): void

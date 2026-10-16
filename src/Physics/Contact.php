@@ -7,6 +7,7 @@ use Phame\Scene\Node3D;
 /**
  * What happened when two bodies touched (or a body reached a wall): the facts, for the handler and the objects to
  * decide what follows. The engine applies nothing itself. The normal points from $a to $b (into the wall for walls).
+ * It lives while the handler runs: keep the facts you need, not the contact (it holds both bodies).
  */
 final class Contact
 {

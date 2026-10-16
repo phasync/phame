@@ -250,6 +250,20 @@ final class Ragdoll extends Node3D
         }
     }
 
+    /**
+     * Gone: the joints stop waiting (their coroutines end), and the tree is taken apart, so nothing of it is left
+     * for the cycle collector (see Node3D::dispose()).
+     */
+    public function dispose(): void
+    {
+        $this->gone = true;
+        foreach ($this->joints as $joint) {
+            $this->world()->wake($joint);
+        }
+        [$this->joints, $this->limbs, $this->bones, $this->below] = [[], [], [], []];
+        parent::dispose();
+    }
+
     /** Every node of the tree, root first: what viewers are told about (bodies), and how it hangs together. */
     public function nodes(): array
     {

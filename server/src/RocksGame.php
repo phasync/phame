@@ -409,13 +409,9 @@ final class RocksGame
         $this->world->go(function () use ($doll) {
             \phasync::sleep(10.0);
             $this->world->sync();
-            $doll->gone = true;
-            foreach ($doll->joints as $joint) {
-                $this->world->wake($joint);   // their coroutines end
-            }
             $ids = array_map('spl_object_id', $doll->nodes());
-            $this->scene->root->removeChild($doll);
             unset($this->ragdolls[spl_object_id($doll)]);
+            $doll->dispose();   // the game owns it: taken apart, freed as soon as this coroutine lets go
             --$doll->by->ragdolls;
             $this->announce(['type' => 'remove', 'ids' => $ids]);
         });
@@ -450,7 +446,7 @@ final class RocksGame
         }
         $observer = $this->observers[$client];
         unset($this->observers[$client]);
-        $this->scene->root->removeChild($observer);
+        $observer->dispose();
         $this->announce(['type' => 'remove', 'id' => spl_object_id($observer)]);
         error_log("phame rocks (worker " . getmypid() . "): viewer $client $why, " . count($this->observers) . ' watching');
     }
