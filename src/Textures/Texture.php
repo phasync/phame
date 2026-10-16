@@ -25,6 +25,13 @@ final class Texture
         public readonly float $v1 = 1.0,
         public readonly bool $premultiplied = false,
         public readonly float $scale = 1.0,
+        /**
+         * Where this came from, if a loader (glTF, later) built it from an asset: "url#sub-id". Null (the default)
+         * means Net\View would have to send pixel data inline (not yet implemented - no demo uses a texture yet);
+         * set, it sends the reference instead, and a browser fetches and caches the image itself. See
+         * docs/REMOTE-VIEW.md.
+         */
+        public ?string $source = null,
     ) {
     }
 

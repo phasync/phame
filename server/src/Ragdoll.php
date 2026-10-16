@@ -21,8 +21,6 @@ final class Ragdoll extends Node3D
     public private(set) array $joints = [];
     /** @var list<Limb> */
     public private(set) array $limbs = [];
-    /** @var list<array{int, int, float}> pairs of limbs drawn joined (ids), and the bone's radius */
-    public private(set) array $bones = [];
     /** @var array<int, float> by joint: the mass of the limbs that turn with it */
     private array $below = [];
     private float $inertia = 1.0;
@@ -65,8 +63,6 @@ final class Ragdoll extends Node3D
         $chest = $this->limb($spine, 0.0, 1.3, 0.0, 1.5);
         $neck = $this->joint($spine, 0.0, 2.6, 0.0, [1, 0, 0], -0.5, 0.5);
         $head = $this->limb($neck, 0.0, 1.0, 0.0, 1.05);
-        $this->bone($pelvis, $chest, 0.6);
-        $this->bone($chest, $head, 0.4);
         foreach ([-1, 1] as $side) {
             $shoulder = $this->joint($spine, 1.5 * $side, 2.0, 0.0, [0, 0, 1], $side < 0 ? -1.6 : -1.2, $side < 0 ? 1.2 : 1.6);
             $upper = $this->limb($shoulder, 1.1 * $side, 0.0, 0.0, 0.7);
@@ -76,10 +72,6 @@ final class Ragdoll extends Node3D
             $thigh = $this->limb($hip, 0.0, -1.3, 0.0, 0.85);
             $knee = $this->joint($hip, 0.0, -2.6, 0.0, [1, 0, 0], 0.0, 2.0);
             $shin = $this->limb($knee, 0.0, -1.2, 0.0, 0.75);
-            $this->bone($chest, $upper, 0.4);
-            $this->bone($upper, $fore, 0.35);
-            $this->bone($pelvis, $thigh, 0.45);
-            $this->bone($thigh, $shin, 0.4);
         }
     }
 
@@ -93,8 +85,6 @@ final class Ragdoll extends Node3D
             $femur = $this->limb($hip, 1.2 * $c, 0.6, 1.2 * $s, 0.45);
             $knee = $this->joint($hip, 2.4 * $c, 1.2, 2.4 * $s, [-$s, 0, $c], -1.8, -0.2);
             $tibia = $this->limb($knee, 0.8 * $c, -1.3, 0.8 * $s, 0.4);
-            $this->bone($body, $femur, 0.3);
-            $this->bone($femur, $tibia, 0.25);
         }
     }
 
@@ -109,7 +99,6 @@ final class Ragdoll extends Node3D
         for ($i = 1; $i < 11; ++$i) {
             $joint = $this->joint($parent, 0.0, 0.0, $at, $i % 2 ? [0, 1, 0] : [1, 0, 0], -1.4, 1.4, 0.4, 1.0);
             $segment = $this->limb($joint, 0.0, 0.0, -0.6, 0.75 - 0.025 * $i);
-            $this->bone($previous, $segment, 0.4 - 0.015 * $i);
             [$parent, $previous, $at] = [$joint, $segment, -1.2];
         }
     }
@@ -124,7 +113,6 @@ final class Ragdoll extends Node3D
             for ($i = 0; $i < 3; ++$i) {
                 $joint = $this->joint($parent, $at * $c, $at * $s, 0.0, [-$s, $c, 0], -0.9, 0.9);
                 $segment = $this->limb($joint, 0.9 * $c, 0.9 * $s, 0.0, 0.8 - 0.15 * $i);
-                $this->bone($previous, $segment, 0.45 - 0.08 * $i);
                 [$parent, $previous, $at] = [$joint, $segment, 1.8];
             }
         }
@@ -148,10 +136,6 @@ final class Ragdoll extends Node3D
         return $limb;
     }
 
-    private function bone(Limb $a, Limb $b, float $radius): void
-    {
-        $this->bones[] = [spl_object_id($a), spl_object_id($b), $radius];
-    }
 
     /** Where a limb sits in the rest pose, relative to the root, and the length of its chain of offsets from it. */
     private static function restPosition(Node3D $node): array
@@ -260,7 +244,7 @@ final class Ragdoll extends Node3D
         foreach ($this->joints as $joint) {
             $this->world()->wake($joint);
         }
-        [$this->joints, $this->limbs, $this->bones, $this->below] = [[], [], [], []];
+        [$this->joints, $this->limbs, $this->below] = [[], [], []];
         parent::dispose();
     }
 

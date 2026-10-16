@@ -21,7 +21,7 @@ return new RequestHandler(function (ClientRequest $request) {
             $ws->onMessage->listen(function (string $data) use ($ws, &$epoch, $client) {
                 $message = json_decode($data, true);
                 if (($message['type'] ?? '') === 'ping' && $epoch !== null) {
-                    $ws->send(json_encode(['type' => 'pong', 'c' => $message['c'], 's' => microtime(true) - $epoch, 'w' => getmypid()]));
+                    $ws->send(json_encode(['v' => 1, 'type' => 'pong', 'c' => $message['c'], 's' => microtime(true) - $epoch, 'w' => getmypid()]));
                 }
             });
             RocksGame::ensureRunning();   // elects the worker that runs both games
@@ -34,8 +34,11 @@ return new RequestHandler(function (ClientRequest $request) {
                     continue;
                 }
                 $part = json_decode($snapshot, true);
-                $epoch = $part['epoch'];
                 $ws->send($snapshot);
+                if (($part['type'] ?? '') === 'epoch') {   // the game's start, sent once before the snapshot
+                    $epoch = $part['epoch'];
+                    continue;
+                }
                 if ($part['part'] === $part['parts'] - 1) {
                     break;
                 }
@@ -57,7 +60,7 @@ return new RequestHandler(function (ClientRequest $request) {
             $ws->onMessage->listen(function (string $data) use ($ws, &$epoch, $client) {   // first, so that no early ping is missed
                 $message = json_decode($data, true);
                 if (($message['type'] ?? '') === 'ping' && $epoch !== null) {
-                    $ws->send(json_encode(['type' => 'pong', 'c' => $message['c'], 's' => microtime(true) - $epoch, 'w' => getmypid()]));
+                    $ws->send(json_encode(['v' => 1, 'type' => 'pong', 'c' => $message['c'], 's' => microtime(true) - $epoch, 'w' => getmypid()]));
                 } elseif (($message['type'] ?? '') === 'drop') {
                     Swerve::publishRaw('phame:rocks:in', json_encode(['type' => 'drop', 'client' => $client]));
                 } elseif (($message['type'] ?? '') === 'camera') {   // input: to the game, wherever it runs
@@ -75,8 +78,11 @@ return new RequestHandler(function (ClientRequest $request) {
                         continue;
                     }
                     $part = json_decode($snapshot, true);
-                    $epoch = $part['epoch'];
                     $ws->send($snapshot);
+                    if (($part['type'] ?? '') === 'epoch') {   // the game's start, sent once before the snapshot
+                        $epoch = $part['epoch'];
+                        continue;
+                    }
                     if ($part['part'] === $part['parts'] - 1) {
                         break;   // the whole snapshot is through
                     }

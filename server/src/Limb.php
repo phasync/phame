@@ -3,14 +3,18 @@
 namespace PhameServer;
 
 use Phame\Rendering\MeshShader;
-use Phame\Scene\Node3D;
+use Phame\Scene\{Geometry, Material, Mesh};
 
 /** A visible, solid piece of a ragdoll: a sphere that sits still on its joint and collides as part of the ragdoll. */
-final class Limb extends Node3D
+final class Limb extends Mesh
 {
+    private static ?Geometry $sphere = null;
+
     public function __construct(public readonly Ragdoll $doll, float $radius)
     {
+        parent::__construct(self::$sphere ??= Geometry::sphere(1.0), new Material(color: $doll->by->color, shader: self::material()));
         $this->radius = $radius;
+        $this->setScale($radius);
         $this->mass = 3.0 * $radius ** 3;
     }
 

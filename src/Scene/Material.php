@@ -28,4 +28,11 @@ final class Material
         public ?MeshShader $shader = null,
     ) {
     }
+
+    /**
+     * Where this came from, if a loader (glTF, later) built it from an asset: "url#sub-id". Null (the default)
+     * means Net\View sends this material's fields inline; set, it sends the reference instead. See
+     * docs/REMOTE-VIEW.md.
+     */
+    public ?string $source = null;
 }

@@ -2,18 +2,25 @@
 
 namespace PhameServer;
 
+use Phame\Net\View;
 use Phame\Physics\{Contact, Wall};
 use Phame\Rendering\MeshShader;
-use Phame\Scene\{Node3D, Scene3D};
+use Phame\Scene\{Geometry, Material, Mesh, Scene3D};
 use Phame\World;
 use Swerve\Swerve;
 
-/** Something round that bounces: its class decides how it reacts to what the engine reports. */
-abstract class Ball extends Node3D
+/** Something round that bounces: its class decides how it reacts to what the engine reports. A Mesh, so Net\View
+ * shows it like any other node - its own radius sizes both the physics sphere and the drawn one (via setScale()). */
+abstract class Ball extends Mesh
 {
-    public int $color = 0xFFFFFF;
-    /** Which material it is drawn with (an index into the materials the game sends). */
-    abstract public function kind(): int;
+    private static ?Geometry $sphere = null;
+
+    public function __construct(int $color)
+    {
+        parent::__construct(self::$sphere ??= Geometry::sphere(1.0), new Material(color: $color, shader: static::material()));
+    }
+
+    abstract public static function material(): MeshShader;
 
     public function bounced(Contact $contact, float $impulse): void
     {
@@ -35,11 +42,6 @@ abstract class Ball extends Node3D
 
 final class Rock extends Ball
 {
-    public function kind(): int
-    {
-        return 0;
-    }
-
     /** How rocks look: Phame's shade() contract, the same GLSL a local engine would use. */
     public static function material(): MeshShader
     {
@@ -64,9 +66,11 @@ final class Rock extends Ball
     }
 }
 
-/** Someone watching: a camera in the world, moved by that viewer's input. It takes no part in collisions. */
-final class Observer extends Node3D
+/** Someone watching: a camera in the world, moved by that viewer's input. It takes no part in collisions (no
+ * physics radius is set - only its visual scale). */
+final class Observer extends Mesh
 {
+    private static ?Geometry $body = null;
     /** When (Unix time) the viewer's socket last spoke for them: a camera that goes quiet has gone. */
     public float $heard;
     /** Where the camera looks (a unit vector): down its -z, turned by its orientation. */
@@ -76,8 +80,9 @@ final class Observer extends Node3D
     public float $droppedAt = 0.0;
     public int $ragdolls = 0;
 
-    public function __construct(public readonly string $client, public readonly int $color)
+    public function __construct(public readonly string $client, int $color)
     {
+        parent::__construct(self::$body ??= Geometry::box(1.2, 0.84, 1.0), new Material(color: $color, shader: self::material()));
         $this->heard = microtime(true);
     }
 
@@ -100,11 +105,9 @@ final class Observer extends Node3D
             vec4 shade() {
                 vec3 n = normalize(vNormal);
                 vec3 view = normalize(uEye - vWorldPos);
-                float lens = smoothstep(0.35, 0.25, length(vLocal.xy)) * step(vLocal.z, -0.55);   // the lens, at the front (-z)
                 float rim = pow(1.0 - max(dot(n, view), 0.0), 2.0);
                 vec3 body = vColor * (0.25 + 0.75 * max(dot(n, SUN), 0.0)) + vColor * rim * 1.5;
-                vec3 c = mix(body, vec3(0.9, 0.95, 1.0) * 2.5, lens);
-                return vec4(c + vColor * 0.35, 1.0);
+                return vec4(body + vColor * 0.35, 1.0);
             }
             GLSL);
     }
@@ -113,11 +116,6 @@ final class Observer extends Node3D
 /** A glass marble: larger and heavier than most rocks. */
 final class Marble extends Ball
 {
-    public function kind(): int
-    {
-        return 1;
-    }
-
     /** Glass: Fresnel reflection of the environment, a tinted interior with swirls, a sharp glint. */
     public static function material(): MeshShader
     {
@@ -141,18 +139,14 @@ final class Marble extends Ball
 
 /**
  * Rocks floating weightless in a box, colliding. Runs in one worker as a phasync service; viewers anywhere talk to it
- * through swerve's publish/subscribe: joins on phame:rocks:in, a snapshot on their own topic, then the descriptions
- * that changed on phame:rocks:out after every tick.
+ * through swerve's publish/subscribe: joins on phame:rocks:in, then a Net\View\Viewer and whatever it is shown (see
+ * docs/REMOTE-VIEW.md) - this class has no wire format of its own any more.
  */
 final class RocksGame
 {
     public const SIZE = 40.0;
     public const ROCKS = 700;
     public const MARBLES = 12;
-    /** How late a contact can be published (phasync's timer resolution): the browsers' margin. */
-    public const TICK = 0.01;
-    /** How long descriptions collect before they go out together: fewer, larger messages, for that much latency. */
-    public const BATCH = 0.01;
     private static ?self $instance = null;
     /** @var resource|null the lock that makes this worker the game's only owner */
     private static $lock = null;
@@ -160,19 +154,17 @@ final class RocksGame
 
     public readonly World $world;
     public readonly Scene3D $scene;
+    public readonly View $view;
     /** @var array<int, Ball> */
     private array $rocks = [];
-    /** @var list<int|float> the descriptions of the batch being collected, flat: id, then describe()'s 14 values */
-    private array $batch = [];
-    private int $batched = 0;
-    /** Raised when a batch starts: the flusher sleeps on it while nothing changes. */
-    private object $batchStarted;
     /** @var array<int, Ragdoll> the ragdolls in flight */
     private array $ragdolls = [];
     /** How many were thrown: the next is the next type. */
     private int $thrown = 0;
     /** @var array<string, Observer> by client */
     private array $observers = [];
+    /** @var array<string, \Phame\Net\Viewer> by client */
+    private array $viewers = [];
     private float $started;
 
     /**
@@ -192,7 +184,6 @@ final class RocksGame
                     self::$lock = $lock;   // held for the life of this worker
                     try {
                         self::$instance = new self();
-                        SolarGame::start();   // the same elected worker runs both games, each its own World
                         self::$instance->run();
                     } catch (\Throwable $e) {   // log it, and let another worker (or this one) start a new game
                         error_log('phame rocks game stopped: ' . $e);
@@ -221,9 +212,9 @@ final class RocksGame
     private function __construct()
     {
         $this->started = microtime(true);
-        $this->batchStarted = new \stdClass();
         $this->world = new World();
         $this->scene = $this->world->stage->addChild(new Scene3D(100, 100));
+        $this->view = $this->world->view($this->scene, new SwerveTransport(), 'phame:rocks:out');
         $s = self::SIZE;
         [$this->scene->worldMinX, $this->scene->worldMinY, $this->scene->worldMinZ] = [-$s, -$s, -$s];
         [$this->scene->worldMaxX, $this->scene->worldMaxY, $this->scene->worldMaxZ] = [$s, $s, $s];
@@ -253,16 +244,18 @@ final class RocksGame
         $glass = [0x7fd6ff, 0xff8fb8, 0x9dff9a, 0xffd36e, 0xc59bff, 0x6ef0e0];
         for ($i = 0; $i < self::MARBLES + self::ROCKS; ++$i) {
             $marble = $i < self::MARBLES;   // placed first, while there is room
-            $ball = $marble ? new Marble() : new Rock();
-            $ball->radius = $marble ? mt_rand(330, 400) / 100 : mt_rand(50, 180) / 100;
-            $ball->mass = ($marble ? 1.6 : 1.0) * $ball->radius ** 3;   // glass is denser than these rocks
-            $ball->color = $marble ? $glass[$i % count($glass)] : $palette[$i % count($palette)];
-            $span = (int) ((self::SIZE - $ball->radius - 0.5) * 10);
+            $radius = $marble ? mt_rand(330, 400) / 100 : mt_rand(50, 180) / 100;
+            $color = $marble ? $glass[$i % count($glass)] : $palette[$i % count($palette)];
+            $ball = $marble ? new Marble($color) : new Rock($color);
+            $ball->radius = $radius;
+            $ball->setScale($radius);
+            $ball->mass = ($marble ? 1.6 : 1.0) * $radius ** 3;   // glass is denser than these rocks
+            $span = (int) ((self::SIZE - $radius - 0.5) * 10);
             do {
                 [$x, $y, $z] = [mt_rand(-$span, $span) / 10, mt_rand(-$span, $span) / 10, mt_rand(-$span, $span) / 10];
                 $free = true;
                 foreach ($this->rocks as $o) {
-                    if ((($o->x - $x) ** 2 + ($o->y - $y) ** 2 + ($o->z - $z) ** 2) < ($o->radius + $ball->radius + 0.2) ** 2) {
+                    if ((($o->x - $x) ** 2 + ($o->y - $y) ** 2 + ($o->z - $z) ** 2) < ($o->radius + $radius + 0.2) ** 2) {
                         $free = false;
                         break;
                     }
@@ -271,7 +264,6 @@ final class RocksGame
             $ball->moveTo($x, $y, $z);
             $speed = $marble ? 25 : 40;
             $ball->setVelocity(mt_rand(-$speed, $speed) / 10, mt_rand(-$speed, $speed) / 10, mt_rand(-$speed, $speed) / 10);
-            $ball->published = true;
             $this->scene->root->addChild($ball);
             $this->rocks[spl_object_id($ball)] = $ball;
         }
@@ -290,16 +282,13 @@ final class RocksGame
                     }
                     switch ($request['type'] ?? '') {
                         case 'join':
-                            $observer = $this->observers[$client] ??= $this->observe($client);
-                            foreach ($this->snapshot($observer) as $part) {
-                                Swerve::publishRaw('phame:rocks:client:' . $client, $part);
-                            }
+                            $this->observers[$client] ??= $this->observe($client);
                             break;
                         case 'camera':
                             $this->observers[$client]?->moved($request['p'], $request['q']);
                             break;
                         case 'leave':
-                            $this->leave($client, 'left');
+                            $this->leave($client);
                             break;
                         case 'drop':
                             if (isset($this->observers[$client])) {
@@ -317,7 +306,7 @@ final class RocksGame
                     foreach ($this->observers as $client => $observer) {
                         if (microtime(true) - $observer->heard > 6.0) {
                             $this->world->sync();
-                            $this->leave($client, 'went quiet');
+                            $this->leave($client);
                         }
                     }
                 }
@@ -325,58 +314,11 @@ final class RocksGame
             // game time is real time since this moment: browsers sync to it through the epoch, so it must match the
             // world's clock exactly (setting the world up took time that the clock did not count)
             $this->started = microtime(true) - $world->clock->time;
-            // what changed goes out in batches, BATCH seconds after the first change of each: idle, nothing wakes
-            $world->go(function () {
-                while (true) {
-                    \phasync::awaitFlag($this->batchStarted);
-                    \phasync::sleep(self::BATCH);
-                    $this->flush();
-                }
-            });
-            // no ticks: sleep until the next contact (or until something changes), handle it, queue what changed
-            $world->runEvented(function (World $world) {
-                $changed = $world->takeChangedDescriptions();
-                if ($changed === []) {
-                    return;
-                }
-                if ($this->batched === 0) {
-                    \phasync::raiseFlag($this->batchStarted);
-                }
-                foreach ($changed as [$node, $description]) {
-                    // the client's record has no acceleration yet (nothing here accelerates): the first 14 floats
-                    array_push($this->batch, spl_object_id($node), ...array_slice($description, 0, 14));
-                    ++$this->batched;
-                }
-                if ($this->batched >= 2000) {   // a message is at most 128 KiB: 64 bytes each
-                    $this->flush();
-                }
+            // View::publish() batches what changed since it was last called; no ticks, just whenever something does
+            $world->runEvented(function () {
+                $this->view->publish();
             });
         });
-    }
-
-    /**
-     * Sends the batch: one binary message, a type byte (1) and the game time, then 64 bytes per description: the
-     * body's id (uint32), the time it starts (float64), and position, velocity, orientation and spin (13 float32s),
-     * all little-endian. The browser reads it with a DataView, nothing to parse.
-     */
-    private function flush(): void
-    {
-        if ($this->batched === 0) {
-            return;
-        }
-        Swerve::publishRaw('phame:rocks:out', pack('Ce' . str_repeat('Veg13', $this->batched), 1, $this->world->clock->time, ...$this->batch));
-        $this->batch = [];
-        $this->batched = 0;
-    }
-
-    /**
-     * A JSON message to every viewer (an add, a remove), after the batch so far: a description must not arrive after
-     * its body was removed, and land on a new body that got the same id.
-     */
-    private function announce(array $message): void
-    {
-        $this->flush();
-        Swerve::publishRaw('phame:rocks:out', json_encode($message));
     }
 
     /**
@@ -396,9 +338,6 @@ final class RocksGame
         $doll = new Ragdoll($by, Ragdoll::TYPES[$this->thrown++ % count(Ragdoll::TYPES)]);
         [$lx, $ly, $lz] = [$by->lookX, $by->lookY, $by->lookZ];
         $n = sqrt($lx * $lx + $lz * $lz) ?: 1.0;   // the camera's right: look x world up
-        foreach ($doll->nodes() as $node) {
-            $node->published = true;
-        }
         $this->scene->root->addChild($doll);
         $doll->launch(
             $this->world,
@@ -407,101 +346,38 @@ final class RocksGame
             [-$lz / $n * 3.0 + $lx, $ly, $lx / $n * 3.0 + $lz],   // head over heels, and a little about the way it flies
         );
         $this->ragdolls[spl_object_id($doll)] = $doll;
-        $this->announce(['type' => 'add'] + $this->describeDolls([$doll]));
         $this->world->go(function () use ($doll) {
             \phasync::sleep(10.0);
             $this->world->sync();
-            $ids = array_map('spl_object_id', $doll->nodes());
             unset($this->ragdolls[spl_object_id($doll)]);
             $doll->dispose();   // the game owns it: taken apart, freed as soon as this coroutine lets go
             --$doll->by->ragdolls;
-            $this->announce(['type' => 'remove', 'ids' => $ids]);
         });
     }
 
-    /**
-     * Ragdolls as viewers get them: every node a body (the root and the joints invisible), with the parent each hangs
-     * on (its motion description is in the parent's space) and the bones drawn between limbs.
-     *
-     * @param list<Ragdoll> $dolls
-     */
-    private function describeDolls(array $dolls): array
-    {
-        $out = ['bodies' => [], 'parents' => [], 'trees' => [], 'links' => []];
-        foreach ($dolls as $doll) {
-            $out['trees'][] = spl_object_id($doll);
-            foreach ($doll->nodes() as $node) {
-                $out['bodies'][] = [spl_object_id($node), $node instanceof Limb ? $node->radius : 0.0, $doll->by->color, 3, ...$node->describe()];
-                if ($node !== $doll) {
-                    $out['parents'][] = [spl_object_id($node), spl_object_id($node->parent)];
-                }
-            }
-            array_push($out['links'], ...$doll->bones);
-        }
-        return $out;
-    }
-
-    private function leave(string $client, string $why): void
+    private function leave(string $client): void
     {
         if (!isset($this->observers[$client])) {
             return;
         }
         $observer = $this->observers[$client];
         unset($this->observers[$client]);
+        $this->view->leave($this->viewers[$client]);
+        unset($this->viewers[$client]);
         $observer->dispose();
-        $this->announce(['type' => 'remove', 'id' => spl_object_id($observer)]);
-        error_log("phame rocks (worker " . getmypid() . "): viewer $client $why, " . count($this->observers) . ' watching');
+        error_log("phame rocks (worker " . getmypid() . "): viewer $client left, " . count($this->observers) . ' watching');
     }
 
-    /** A new viewer's camera: in the world for everyone to see, until they leave. */
+    /** A new viewer's camera: in the world for everyone to see, until they leave. Joins the View too. */
     private function observe(string $client): Observer
     {
         $colors = [0xff6b6b, 0x5ce1e6, 0xffd166, 0x9b8cff, 0x6bff95, 0xff9cf0];
         $observer = new Observer($client, $colors[count($this->observers) % count($colors)]);
         $observer->moveTo(0, 30, 150);
-        $observer->published = true;
         $this->scene->root->addChild($observer);
+        Swerve::publishRaw('phame:rocks:client:' . $client, json_encode(['v' => View::PROTOCOL_VERSION, 'type' => 'epoch', 'epoch' => $this->started]));
+        $this->viewers[$client] = $this->view->join('phame:rocks:client:' . $client);
         error_log("phame rocks (worker " . getmypid() . "): viewer $client joined, " . (count($this->observers) + 1) . ' watching');
-        $this->announce(['type' => 'add', 'body' => [spl_object_id($observer), 4.0, $observer->color, 2, ...$observer->describe()]]);
         return $observer;
-    }
-
-    /**
-     * The whole state, in parts small enough for publish/subscribe (messages are at most 128 KiB). $you is the viewer's
-     * own camera, which their browser does not draw.
-     *
-     * @return list<string>
-     */
-    private function snapshot(Observer $you): array
-    {
-        $chunks = array_chunk(array_keys($this->rocks), 200);
-        $parts = [];
-        foreach ($chunks as $i => $ids) {
-            $bodies = [];
-            foreach ($ids as $id) {
-                $rock = $this->rocks[$id];
-                $bodies[] = [$id, $rock->radius, $rock->color, $rock->kind(), ...$rock->describe()];
-            }
-            if ($i === 0) {
-                foreach ($this->observers as $observer) {
-                    $bodies[] = [spl_object_id($observer), 4.0, $observer->color, 2, ...$observer->describe()];
-                }
-            }
-            $parts[] = json_encode([
-                'type' => 'snapshot', 'part' => $i, 'parts' => count($chunks), 't' => $this->world->clock->time,
-                'epoch' => $this->started, 'tick' => self::TICK + self::BATCH, 'size' => self::SIZE, 'bodies' => $bodies,
-            ] + ($i === 0 ? [   // how things look, written in PHP: the browser compiles it, games write no JavaScript
-                'you' => spl_object_id($you),
-                'dolls' => $this->describeDolls(array_values($this->ragdolls)),
-                'environment' => $this->scene->environment,
-                'materials' => [
-                    ['shade' => Rock::material()->fragment, 'mesh' => 'rock', 'transparent' => false, 'tumble' => true],
-                    ['shade' => Marble::material()->fragment, 'mesh' => 'sphere', 'transparent' => true, 'tumble' => true],
-                    ['shade' => Observer::material()->fragment, 'mesh' => 'camera', 'transparent' => false, 'tumble' => false],
-                    ['shade' => Limb::material()->fragment, 'mesh' => 'sphere', 'transparent' => false, 'tumble' => false],
-                ],
-            ] : []));
-        }
-        return $parts;
     }
 }

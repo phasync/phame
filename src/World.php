@@ -72,6 +72,8 @@ final class World
     private int $changedCount = 0;
     /** @var \WeakMap<\Phame\Scene\Scene3D, \Phame\Physics\Space> */
     private \WeakMap $spaces;
+    /** @var \WeakMap<\Phame\Scene\Scene3D, \Phame\Net\View> */
+    private \WeakMap $views;
     /** @var list<array{string, string, \Closure, bool}> collision handlers: class a, class b, handler, wants the world */
     private array $handlers = [];
     /** @var array<string, array{?\Closure, bool, bool}> resolved per class pair: handler, swapped, wants the world */
@@ -110,6 +112,7 @@ final class World
         $this->collisionTrees = new \WeakMap();
         $this->dependents = new \WeakMap();
         $this->spaces = new \WeakMap();
+        $this->views = new \WeakMap();
         $guarded = $this->guarded = $this->runGuarded(...);
         $this->ownerLoop = static function (Owner $owner) use ($guarded): void {
             phasync::run(static function (Owner $owner) use ($guarded): void {
@@ -823,6 +826,12 @@ final class World
     public function physics(\Phame\Scene\Scene3D $scene): \Phame\Physics\Space
     {
         return $this->spaces[$scene] ??= new \Phame\Physics\Space($this, $scene);
+    }
+
+    /** The remote view of a scene (see docs/REMOTE-VIEW.md): one per Scene3D, made on first use. */
+    public function view(\Phame\Scene\Scene3D $scene, \Phame\Net\Transport $transport, string $channel): \Phame\Net\View
+    {
+        return $this->views[$scene] ??= new \Phame\Net\View($this, $scene, $transport, $channel);
     }
 
     /**

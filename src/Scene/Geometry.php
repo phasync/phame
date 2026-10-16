@@ -17,15 +17,32 @@ use Phame\Math\Vector3;
 final class Geometry
 {
     public readonly int $indexCount;
-    private readonly VertexArray $vao;
-    private readonly Buffer $vertexBuffer;
-    private readonly Buffer $indexBuffer;
-    private readonly GL $gl;
+    private ?VertexArray $vao = null;
+    private ?Buffer $vertexBuffer = null;
+    private ?Buffer $indexBuffer = null;
+    private ?GL $gl = null;
     /** The axis-aligned box around the vertices, in the geometry's own space. */
     public readonly Vector3 $boundsMin;
     public readonly Vector3 $boundsMax;
+    /** @var list<float> x, y, z, nx, ny, nz, u, v for each vertex */
+    public readonly array $vertices;
+    /** @var list<int> three per triangle */
+    public readonly array $indices;
+    /**
+     * Where this came from, if a loader (glTF, later) built it from an asset rather than `box()`/`sphere()`/a
+     * hand-built array: "url#sub-id" (e.g. "/assets/ship.glb#mesh0"). Null (the default, for everything today)
+     * means Net\View sends the vertex/index data inline; set, it sends this instead, and a browser fetches and
+     * caches the asset itself - large mesh data never goes over the WebSocket. See docs/REMOTE-VIEW.md.
+     */
+    public ?string $source = null;
 
     /**
+     * Building a Geometry never touches the GPU: the vertex and index data (and the bounds derived from them) are
+     * plain PHP values from the start, readable without an Engine - a headless process describing a scene for
+     * Net\View (see docs/REMOTE-VIEW.md) builds the same Mesh/Geometry a renderer would, with no GL context at all.
+     * The GPU resources (a VAO, its buffers) are created lazily, on the first draw() in a process that has a GL
+     * context.
+     *
      * @param list<float> $vertices x, y, z, nx, ny, nz, u, v for each vertex
      * @param list<int>   $indices  three per triangle
      */
@@ -47,20 +64,31 @@ final class Geometry
             $this->boundsMin->set(min($this->boundsMin->x, $vertices[$i]), min($this->boundsMin->y, $vertices[$i + 1]), min($this->boundsMin->z, $vertices[$i + 2]));
             $this->boundsMax->set(max($this->boundsMax->x, $vertices[$i]), max($this->boundsMax->y, $vertices[$i + 1]), max($this->boundsMax->z, $vertices[$i + 2]));
         }
-        $this->gl = $gl = Engine::current()->gl;
+        $this->vertices = $vertices;
+        $this->indices = $indices;
         $this->indexCount = count($indices);
+    }
+
+    /** Creates the VAO and its buffers, the first time something actually draws this geometry. */
+    private function upload(): void
+    {
+        if ($this->vao !== null) {
+            return;
+        }
+        $this->gl = $gl = Engine::current()->gl;
         $this->vertexBuffer = new Buffer($gl, GL::ARRAY_BUFFER, GL::STATIC_DRAW);
-        $this->vertexBuffer->upload(pack('f*', ...$vertices));
+        $this->vertexBuffer->upload(pack('f*', ...$this->vertices));
         $this->indexBuffer = new Buffer($gl, GL::ELEMENT_ARRAY_BUFFER, GL::STATIC_DRAW);
         $this->vao = new VertexArray($gl, $this->vertexBuffer, (new VertexLayout())->add(0, 3)->add(1, 3)->add(2, 2), $this->indexBuffer);
         // The index buffer is part of the VAO state, so it must be uploaded while the VAO is bound.
         $this->vao->bind();
-        $this->indexBuffer->upload(pack('S*', ...$indices));
+        $this->indexBuffer->upload(pack('S*', ...$this->indices));
         $gl->bindVertexArray(0);
     }
 
     public function draw(): void
     {
+        $this->upload();
         $this->vao->bind();
         $this->gl->drawElements(GL::TRIANGLES, $this->indexCount, GL::UNSIGNED_SHORT, 0);
     }
@@ -98,9 +126,9 @@ final class Geometry
 
     public function dispose(): void
     {
-        $this->vao->dispose();
-        $this->vertexBuffer->dispose();
-        $this->indexBuffer->dispose();
+        $this->vao?->dispose();
+        $this->vertexBuffer?->dispose();
+        $this->indexBuffer?->dispose();
         $this->boundsMin->release();
         $this->boundsMax->release();
     }
@@ -194,6 +222,30 @@ final class Geometry
                 $a = $r * $stride + $s;
                 $b = $a + $stride;
                 array_push($indices, $a, $b, $a + 1, $a + 1, $b, $b + 1);
+            }
+        }
+        return [$vertices, $indices];
+    }
+
+    /** An uncapped tube along the y axis, from 0 to $height, centered on the x/z origin. A bone between two joints. */
+    public static function cylinder(float $radius = 0.5, float $height = 1.0, int $segments = 12): self
+    {
+        return new self(...self::cylinderData($radius, $height, $segments));
+    }
+
+    /** @return array{list<float>, list<int>} */
+    private static function cylinderData(float $radius, float $height, int $segments): array
+    {
+        $vertices = $indices = [];
+        for ($i = 0; $i <= $segments; ++$i) {
+            $u = $i / $segments;
+            $a = $u * 2 * M_PI;
+            [$nx, $nz] = [cos($a), sin($a)];
+            array_push($vertices, $nx * $radius, 0.0, $nz * $radius, $nx, 0.0, $nz, $u, 0.0);
+            array_push($vertices, $nx * $radius, $height, $nz * $radius, $nx, 0.0, $nz, $u, 1.0);
+            if ($i < $segments) {
+                $o = $i * 2;
+                array_push($indices, $o, $o + 1, $o + 2, $o + 1, $o + 3, $o + 2);
             }
         }
         return [$vertices, $indices];

@@ -4,8 +4,12 @@ namespace Phame\Scene;
 
 use Phame\Math\Vector3;
 
-/** A node that draws a geometry with a material. */
-final class Mesh extends Node3D
+/**
+ * A node that draws a geometry with a material. Not final: a game's own kind of body (a rock, a limb) that is also
+ * a physics body (Physics\Space tracks Node3D instances directly) extends this instead of wrapping one, so Net\View
+ * finds its mesh exactly where it finds any other node's.
+ */
+class Mesh extends Node3D
 {
     public function __construct(public Geometry $geometry, public Material $material = new Material())
     {

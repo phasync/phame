@@ -2,23 +2,21 @@
 
 namespace PhameServer\Solar;
 
+use Phame\Scene\Geometry;
+use Phame\Scene\Material;
+use Phame\Scene\Mesh;
 use Phame\Scene\Node3D;
 use Phame\Scene\Scene3D;
 
 /**
- * Builds the solar system node tree in a Scene3D.
- * Sun at origin, planets as anchor nodes moving in straight lines (refit on Event::EXPIRE),
- * with planet bodies and moon orbit frames underneath.
+ * Builds the solar system node tree in a Scene3D: a Mesh for every drawn body (the Sun, a planet, a moon, an
+ * asteroid), a plain Node3D for every structural one (an anchor, an orbit frame - Net\View shows these as transform
+ * only, since nothing in SolarSystem gives them a Geometry). Sun at origin, planets as anchor nodes moving in
+ * straight lines (refit on Event::EXPIRE), with planet bodies and moon orbit frames underneath.
  */
 class SolarSystem
 {
-    // What a node is, for a networking layer that doesn't otherwise know the tree's shape (see nodes()).
-    public const KIND_STAR = 0;
-    public const KIND_PLANET = 1;
-    public const KIND_MOON = 2;
-    public const KIND_ASTEROID = 3;
-    public const KIND_ANCHOR = 4;
-    public const KIND_ORBIT_FRAME = 5;
+    private static ?Geometry $sphere = null;
 
     private Scene3D $scene;
     private float $epoch;  // unix timestamp for t=0
@@ -28,8 +26,6 @@ class SolarSystem
     private array $planets = [];
     /** @var array<string, Node3D> moon bodies, keyed by name */
     private array $moons = [];
-    /** @var list<array{Node3D, ?Node3D, int}> every node this system created, parents before children, with its kind */
-    private array $allNodes = [];
 
     public function __construct(Scene3D $scene, float $epoch)
     {
@@ -38,15 +34,13 @@ class SolarSystem
         $this->buildSystem();
     }
 
-    /** Every node this system created: [node, parent (null at the scene root), kind]. Parents always precede children. */
-    public function nodes(): array
+    /** A sphere of $radius, drawn in $color: shares one unit Geometry (scaled), as RocksGame's balls do. */
+    private static function body(float $radius, int $color, bool $emissive = false): Mesh
     {
-        return $this->allNodes;
-    }
-
-    private function track(Node3D $node, ?Node3D $parent, int $kind): void
-    {
-        $this->allNodes[] = [$node, $parent, $kind];
+        $mesh = new Mesh(self::$sphere ??= Geometry::sphere(1.0), new Material(color: $color, emissive: $emissive ? $color : 0x000000));
+        $mesh->radius = $radius;
+        $mesh->setScale($radius);
+        return $mesh;
     }
 
     private function buildSystem(): void
@@ -55,12 +49,9 @@ class SolarSystem
         // detection, so a motionless anchor at the origin carries the visible Sun as its child.
         $sunAnchor = new Node3D();
         $this->scene->root->addChild($sunAnchor);
-        $sun = new Node3D();
+        $sun = self::body(Ephemeris::SUN_RADIUS, 0xfff2cc, emissive: true);
         $sun->name = 'Sun';
-        $sun->radius = Ephemeris::SUN_RADIUS;
         $sunAnchor->addChild($sun);
-        $this->track($sunAnchor, null, self::KIND_ANCHOR);
-        $this->track($sun, $sunAnchor, self::KIND_STAR);
 
         foreach (['Mercury', 'Venus', 'Earth', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune'] as $planet) {
             $this->addPlanet($planet);
@@ -76,20 +67,17 @@ class SolarSystem
         $this->scene->root->addChild($anchor);
         $anchor->addEventListener('expire', fn () => $this->refitPlanetAnchor($name, $anchor));
         $this->refitPlanetAnchor($name, $anchor);
-        $this->track($anchor, null, self::KIND_ANCHOR);
 
         // Planet body: fixed axial tilt, spinning about its own (tilted) pole so the pole direction never moves.
-        // The name belongs here, not on the anchor: SolarGame's wire protocol documents every anchor as unnamed
-        // (radius 0, structural only), matching how the Sun and every moon are named on their visible body.
-        $body = new Node3D();
+        // The name belongs here, not on the anchor: every anchor stays unnamed (and undrawn, a plain Node3D),
+        // matching how the Sun and every moon are named on their visible body.
+        $body = self::body($this->getPlanetRadius($name), 0x8899aa);
         $body->name = $name;
-        $body->radius = $this->getPlanetRadius($name);
         $body->setOrientation(...$this->getTiltQuaternion($name));
         [$wx, $wy, $wz] = $this->getSpinAxis($name);
         $rate = 2 * M_PI / $this->getRotationPeriod($name);
         $body->spin($wx * $rate, $wy * $rate, $wz * $rate);
         $anchor->addChild($body);
-        $this->track($body, $anchor, self::KIND_PLANET);
 
         match ($name) {
             'Earth' => $this->addMoon('Moon', $anchor, 'Earth'),
@@ -132,16 +120,13 @@ class SolarSystem
         $orbitFrame = new Node3D();
         $parentAnchor->addChild($orbitFrame);
 
-        $moonNode = new Node3D();
+        $moonNode = self::body($this->getMoonRadius($name), 0x999990);
         $moonNode->name = $name;
-        $moonNode->radius = $this->getMoonRadius($name);
         $moonNode->setOrientation(0.0, 1.0, 0.0, 0.0);  // tidally locked: fixed face toward the orbit frame's origin
         $orbitFrame->addChild($moonNode);
 
         $orbitFrame->addEventListener('expire', fn () => $this->refitMoon($name, $planet, $orbitFrame, $moonNode));
         $this->refitMoon($name, $planet, $orbitFrame, $moonNode);
-        $this->track($orbitFrame, $parentAnchor, self::KIND_ORBIT_FRAME);
-        $this->track($moonNode, $orbitFrame, self::KIND_MOON);
 
         $this->moons[$name] = $moonNode;
     }
@@ -281,13 +266,10 @@ class SolarSystem
             // directly on a root child, or every one of the 300 asteroids joins the scene's collision detection.
             $asteroid = new Node3D();
             $this->scene->root->addChild($asteroid);
-            $body = new Node3D();
-            $body->radius = 5.0;
+            $body = self::body(5.0, 0x8a8278);
             $asteroid->addChild($body);
             $asteroid->addEventListener('expire', fn () => $this->refitAsteroid($asteroid, $a, $lon0, $lat));
             $this->refitAsteroid($asteroid, $a, $lon0, $lat);
-            $this->track($asteroid, null, self::KIND_ANCHOR);
-            $this->track($body, $asteroid, self::KIND_ASTEROID);
         }
     }
 

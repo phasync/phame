@@ -4,10 +4,16 @@ namespace Phame\Tests\Server;
 
 require_once __DIR__ . '/../../server/vendor/autoload.php';
 
+use Phame\Scene\Mesh;
+use Phame\Scene\Node3D;
 use PhameServer\SolarGame;
-use PhameServer\Solar\SolarSystem;
 use PHPUnit\Framework\TestCase;
 
+/**
+ * The solar system's node tree shape - what Net\View would walk and show, without going through the wire protocol
+ * itself (that's ViewTest's job). A drawn body (star, planet, moon, asteroid) is a Mesh; a structural node (an
+ * anchor, an orbit frame) is a plain Node3D, so there is no "kind" to assert here beyond that.
+ */
 class SolarGameTest extends TestCase
 {
     private function buildGame(): SolarGame
@@ -18,70 +24,77 @@ class SolarGameTest extends TestCase
         return $game;
     }
 
-    private function snapshot(SolarGame $game): array
+    /** @return list<Node3D> every node in the scene, parents before children */
+    private function walk(Node3D $root): array
     {
-        return (new \ReflectionMethod(SolarGame::class, 'snapshot'))->invoke($game);
+        $out = [$root];
+        foreach ($root->children as $child) {
+            $out = [...$out, ...$this->walk($child)];
+        }
+        return $out;
     }
 
-    public function testSnapshotRoundTripsEveryNodeParentsBeforeChildren(): void
+    public function testTreeHasEveryNodeParentBeforeChildAndOneOfEachKindByName(): void
     {
         $game = $this->buildGame();
-        $parts = $this->snapshot($game);
-        $this->assertGreaterThan(1, count($parts), 'the tree should need more than one part');
+        $nodes = $this->walk($game->scene->root);
 
-        $seenIds = [];
-        $total = 0;
-        $moon = null;
-        $byId = [];
-        foreach ($parts as $i => $part) {
-            $decoded = json_decode($part, true);
-            $this->assertSame('snapshot', $decoded['type']);
-            $this->assertSame($i, $decoded['part']);
-            $this->assertSame(count($parts), $decoded['parts']);
-
-            foreach ($decoded['nodes'] as $node) {
-                [$id, $parentId, $name, $radius, $kind] = $node;
-                if ($parentId !== 0) {
-                    $this->assertArrayHasKey($parentId, $seenIds, "node $id ($name)'s parent $parentId was not seen before it");
-                }
-                $this->assertArrayNotHasKey($id, $seenIds, "node $id appeared twice");
-                $seenIds[$id] = true;
-                $byId[$id] = ['parentId' => $parentId, 'name' => $name, 'radius' => $radius, 'kind' => $kind];
-                $this->assertCount(22, $node, 'id, parentId, name, radius, kind, then 17 description floats');
-                if ($name === 'Moon') {
-                    $moon = $id;
-                }
-                ++$total;
+        $seen = [];
+        $byObjectId = [];
+        foreach ($nodes as $node) {
+            $parentId = $node->parent !== null ? spl_object_id($node->parent) : null;
+            if ($parentId !== null) {
+                $this->assertArrayHasKey($parentId, $seen, "a node's parent was not walked before it");
             }
+            $seen[spl_object_id($node)] = true;
+            $byObjectId[spl_object_id($node)] = $node;
         }
 
-        $this->assertCount($total, $seenIds);
-        $this->assertNotNull($moon, 'the Moon should be in the snapshot');
-        $this->assertSame(SolarSystem::KIND_MOON, $byId[$moon]['kind']);
+        $moon = null;
+        foreach ($nodes as $node) {
+            if ($node->name === 'Moon') {
+                $moon = $node;
+                break;
+            }
+        }
+        $this->assertNotNull($moon, 'the Moon should be in the tree');
+        $this->assertInstanceOf(Mesh::class, $moon, 'a drawn body is a Mesh');
 
         // Moon -> orbit frame -> Earth's (unnamed) anchor, which also carries the named Earth body as a sibling
-        $orbitFrameId = $byId[$moon]['parentId'];
-        $this->assertSame(SolarSystem::KIND_ORBIT_FRAME, $byId[$orbitFrameId]['kind']);
-        $earthAnchorId = $byId[$orbitFrameId]['parentId'];
-        $this->assertSame('', $byId[$earthAnchorId]['name'], 'the anchor itself is unnamed; the name is on the body');
-        $this->assertSame(SolarSystem::KIND_ANCHOR, $byId[$earthAnchorId]['kind']);
-        $earthBody = array_filter($byId, static fn ($n) => $n['parentId'] === $earthAnchorId && $n['name'] === 'Earth');
-        $this->assertCount(1, $earthBody, "Earth's anchor should have exactly one child named Earth (its body)");
-        $this->assertSame(SolarSystem::KIND_PLANET, reset($earthBody)['kind']);
+        $orbitFrame = $moon->parent;
+        $this->assertNotInstanceOf(Mesh::class, $orbitFrame, 'an orbit frame is structural, not drawn');
+        $earthAnchor = $orbitFrame->parent;
+        $this->assertSame('', $earthAnchor->name, "the anchor itself is unnamed; the name is on the body");
+        $this->assertNotInstanceOf(Mesh::class, $earthAnchor, 'an anchor is structural, not drawn');
+        $earthBodies = array_filter($earthAnchor->children, static fn (Node3D $n) => $n->name === 'Earth');
+        $this->assertCount(1, $earthBodies, "Earth's anchor should have exactly one child named Earth (its body)");
+        $this->assertInstanceOf(Mesh::class, reset($earthBodies));
     }
 
-    public function testSnapshotIncludesStarPlanetsAndAsteroids(): void
+    public function testTreeIncludesOneSunEightPlanetsAndThreeHundredAsteroids(): void
     {
         $game = $this->buildGame();
-        $kinds = [];
-        foreach ($this->snapshot($game) as $part) {
-            foreach (json_decode($part, true)['nodes'] as [$id, $parentId, $name, $radius, $kind]) {
-                $kinds[$kind] = ($kinds[$kind] ?? 0) + 1;
+        $nodes = $this->walk($game->scene->root);
+
+        $planetNames = ['Mercury', 'Venus', 'Earth', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune'];
+        $sun = $moons = $planets = $asteroids = 0;
+        foreach ($nodes as $node) {
+            if (!$node instanceof Mesh) {
+                continue;
+            }
+            if ($node->name === 'Sun') {
+                ++$sun;
+            } elseif (in_array($node->name, $planetNames, true)) {
+                ++$planets;
+            } elseif ($node->name !== '') {
+                ++$moons;   // every other named drawn body is a moon
+            } else {
+                ++$asteroids;   // asteroids are drawn but unnamed
             }
         }
-        $this->assertSame(1, $kinds[SolarSystem::KIND_STAR] ?? 0);
-        $this->assertSame(8, $kinds[SolarSystem::KIND_PLANET] ?? 0);
-        $this->assertSame(300, $kinds[SolarSystem::KIND_ASTEROID] ?? 0);
-        $this->assertGreaterThan(0, $kinds[SolarSystem::KIND_MOON] ?? 0);
+        $this->assertSame(1, $sun);
+        $this->assertSame(8, $planets);
+        $this->assertSame(300, $asteroids);
+        $this->assertGreaterThan(0, $moons);
     }
 }
