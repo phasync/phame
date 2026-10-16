@@ -14,6 +14,9 @@ final class Ephemeris
     // consistent with plain unix/UTC timestamps elsewhere in the engine).
     public const EPOCH_J2000 = 946728000;
 
+    // Sun radius (km)
+    public const SUN_RADIUS = 696000.0;
+
     // Planet radii (km)
     public const MERCURY_RADIUS = 2439.7;
     public const VENUS_RADIUS = 6051.8;

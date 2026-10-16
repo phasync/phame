@@ -1,6 +1,8 @@
 <?php
 
 // The Phame game server. nginx serves it under /phame and strips that prefix, so paths here start at /.
+// --public=public (see run.sh) serves the static pages (/, /rocks-in-box/, /solar-system-war/) before this is ever
+// reached; this handler only answers each demo's WebSocket.
 require __DIR__ . '/vendor/autoload.php';
 
 use PhameServer\RocksGame;
@@ -11,7 +13,43 @@ use Swerve\WebSocket;
 
 return new RequestHandler(function (ClientRequest $request) {
     $path = parse_url($request->getTarget(), PHP_URL_PATH) ?: '/';
-    if ($path === '/ws') {
+    if ($path === '/solar-system-war/ws') {
+        // observer mode only: no input but join, see SolarGame's docblock for the wire protocol
+        WebSocket::from($request, function (WebSocket $ws) {
+            $epoch = null;
+            $client = bin2hex(random_bytes(6));
+            $ws->onMessage->listen(function (string $data) use ($ws, &$epoch, $client) {
+                $message = json_decode($data, true);
+                if (($message['type'] ?? '') === 'ping' && $epoch !== null) {
+                    $ws->send(json_encode(['type' => 'pong', 'c' => $message['c'], 's' => microtime(true) - $epoch, 'w' => getmypid()]));
+                }
+            });
+            RocksGame::ensureRunning();   // elects the worker that runs both games
+            $mine = Swerve::subscribe("phame:solar:client:$client", heartbeat: 1.0);
+            $state = Swerve::subscribe('phame:solar:out', heartbeat: 2.0);
+            Swerve::publishRaw('phame:solar:in', json_encode(['type' => 'join', 'client' => $client]));
+            foreach ($mine as $snapshot) {
+                if ($snapshot === null) {   // a second without an answer: the game may be starting, or moving to another worker
+                    Swerve::publishRaw('phame:solar:in', json_encode(['type' => 'join', 'client' => $client]));
+                    continue;
+                }
+                $part = json_decode($snapshot, true);
+                $epoch = $part['epoch'];
+                $ws->send($snapshot);
+                if ($part['part'] === $part['parts'] - 1) {
+                    break;
+                }
+            }
+            foreach ($state as $delta) {
+                if ($delta === null) {   // a heartbeat: two quiet seconds
+                    continue;
+                }
+                $ws->sendBinary($delta);   // always binary: there are no JSON adds/removes in observer mode
+            }
+        });
+        return;
+    }
+    if ($path === '/rocks-in-box/ws') {
         // one tab: its socket coroutine relays between the browser and the game, through publish/subscribe
         WebSocket::from($request, function (WebSocket $ws) {
             $epoch = null;   // the game's start, from the snapshot: any worker can tell the game's time

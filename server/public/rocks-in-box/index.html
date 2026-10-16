@@ -1,0 +1,602 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phame</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #03040a; overflow: hidden; font: 13px/1.45 system-ui, sans-serif; color: #cfd3e6; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: grab; touch-action: none; }
+  canvas:active { cursor: grabbing; }
+  #hud { position: fixed; left: 12px; top: 10px; padding: 8px 11px; border-radius: 8px; background: rgba(10, 12, 24, .7); backdrop-filter: blur(6px); pointer-events: none; min-width: 15rem; }
+  #hud b { color: #ffd77a; font-weight: 600; }
+  #hud .k { color: #8890b0; }
+  #help { position: fixed; right: 12px; bottom: 10px; color: #8890b0; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">Connecting…</div>
+<div id="help">drag to orbit · wheel or pinch to zoom · double-click, double-tap or space to throw a ragdoll</div>
+<script>
+'use strict';
+// The Phame browser client: the same for every game. The game, in PHP, sends what exists (motion descriptions) and
+// how it looks (materials: GLSL with Phame's shade() contract, and the scene's environment). This client compiles the
+// materials inside its own wrapper, which evaluates x0 + v (t - t0) per instance at "server time minus a presentation
+// delay", and applies fog and tone mapping. Games write no JavaScript.
+
+const canvas = document.getElementById('c');
+const hud = document.getElementById('hud');
+const gl = canvas.getContext('webgl2', { antialias: true });
+if (!gl) { hud.textContent = 'WebGL2 is not available in this browser.'; throw new Error('no webgl2'); }
+
+// ---------- what every material and environment can use (Phame's shading contract, browser side)
+const PRELUDE = `
+  const vec3 SUN = normalize(vec3(-0.45, 0.75, 0.35));
+  float hash(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+  float noise(vec3 x) {
+    vec3 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(mix(hash(i), hash(i + vec3(1,0,0)), f.x), mix(hash(i + vec3(0,1,0)), hash(i + vec3(1,1,0)), f.x), f.y),
+               mix(mix(hash(i + vec3(0,0,1)), hash(i + vec3(1,0,1)), f.x), mix(hash(i + vec3(0,1,1)), hash(i + vec3(1,1,1)), f.x), f.y), f.z);
+  }
+  float fbm(vec3 p) { float v = 0.0, a = 0.5; for (int i = 0; i < 4; i++) { v += a * noise(p); p = p * 2.03 + 11.7; a *= 0.5; } return v; }
+  vec3 tonemap(vec3 x) { x = clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); return pow(x, vec3(1.0 / 2.2)); }
+  vec3 fogged(vec3 c, float dist) { return mix(c, vec3(0.012, 0.015, 0.03), clamp((dist - 70.0) / 220.0, 0.0, 0.7)); }
+`;
+const DEFAULT_ENVIRONMENT = `vec3 environment(vec3 d) { return mix(vec3(0.02), vec3(0.08, 0.1, 0.16), d.y * 0.5 + 0.5) + vec3(1.5) * pow(max(dot(d, SUN), 0.0), 200.0); }`;
+
+// per instance: evaluates the motion description; a cosmetic tumble keeps rocks alive between descriptions
+const INSTANCE_VS = `#version 300 es
+  layout(location = 0) in vec3 aPos;
+  layout(location = 1) in vec3 aNormal;
+  layout(location = 2) in vec4 aStart;     // t0, x0, y0, z0
+  layout(location = 3) in vec4 aVelocity;  // vx, vy, vz, radius
+  layout(location = 4) in vec4 aLook;      // r, g, b, seed
+  layout(location = 5) in vec4 aOrientation;   // the description's quaternion
+  uniform mat4 uViewProjection;
+  uniform float uTime;
+  uniform bool uTumble;                    // the material asks for a cosmetic tumble instead of the orientation
+  out vec3 vNormal; out vec3 vColor; out vec3 vWorldPos; out vec3 vLocal; out float vSeed; out vec3 vCenter; out float vRadius;
+  mat3 spin(float a, vec3 axis) { float c = cos(a), s = sin(a), t = 1.0 - c; vec3 u = normalize(axis);
+    return mat3(t*u.x*u.x + c, t*u.x*u.y + s*u.z, t*u.x*u.z - s*u.y, t*u.x*u.y - s*u.z, t*u.y*u.y + c, t*u.y*u.z + s*u.x, t*u.x*u.z + s*u.y, t*u.y*u.z - s*u.x, t*u.z*u.z + c); }
+  void main() {
+    vec3 center = aStart.yzw + aVelocity.xyz * (uTime - aStart.x);   // the motion description, evaluated here
+    vec4 q = aOrientation;
+    mat3 r = uTumble
+      ? spin(uTime * (0.15 + 0.5 * fract(aLook.w * 7.3)) + aLook.w * 10.0, vec3(fract(aLook.w * 3.1) - 0.5, 1.0, fract(aLook.w * 5.7) - 0.5))
+      : mat3(1.0 - 2.0*(q.y*q.y + q.z*q.z), 2.0*(q.x*q.y + q.w*q.z), 2.0*(q.x*q.z - q.w*q.y),
+             2.0*(q.x*q.y - q.w*q.z), 1.0 - 2.0*(q.x*q.x + q.z*q.z), 2.0*(q.y*q.z + q.w*q.x),
+             2.0*(q.x*q.z + q.w*q.y), 2.0*(q.y*q.z - q.w*q.x), 1.0 - 2.0*(q.x*q.x + q.y*q.y));
+    vLocal = aPos;
+    vWorldPos = center + r * aPos * aVelocity.w;
+    vNormal = r * aNormal; vColor = aLook.rgb; vSeed = aLook.w; vCenter = center; vRadius = aVelocity.w;
+    gl_Position = uViewProjection * vec4(vWorldPos, 1.0);
+  }`;
+
+// a link between two bodies (a ragdoll's limb): a cylinder from one to the other, both ends evaluated on the GPU from
+// their own motion descriptions, shaded by the material of the first body
+const LINK_VS = `#version 300 es
+  layout(location = 0) in vec3 aPos;          // a unit cylinder: x and z on the circle, y from 0 (one end) to 1 (the other)
+  layout(location = 1) in vec3 aNormal;
+  layout(location = 2) in vec4 aStartA;       // t0, x0, y0, z0 of one end
+  layout(location = 3) in vec4 aVelocityA;    // vx, vy, vz, the link's radius
+  layout(location = 4) in vec4 aStartB;       // t0, x0, y0, z0 of the other end
+  layout(location = 5) in vec4 aVelocityB;    // vx, vy, vz, unused
+  layout(location = 6) in vec4 aLook;         // r, g, b, seed
+  uniform mat4 uViewProjection;
+  uniform float uTime;
+  out vec3 vNormal; out vec3 vColor; out vec3 vWorldPos; out vec3 vLocal; out float vSeed; out vec3 vCenter; out float vRadius;
+  void main() {
+    vec3 a = aStartA.yzw + aVelocityA.xyz * (uTime - aStartA.x);
+    vec3 b = aStartB.yzw + aVelocityB.xyz * (uTime - aStartB.x);
+    float len = max(length(b - a), 1e-4), r = aVelocityA.w;
+    vec3 y = (b - a) / len;
+    vec3 x = normalize(cross(y, abs(y.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0))), z = cross(x, y);
+    vCenter = a + (b - a) * aPos.y; vRadius = r;
+    vWorldPos = vCenter + (x * aPos.x + z * aPos.z) * r;
+    vNormal = x * aNormal.x + z * aNormal.z;
+    vLocal = vec3(aPos.x, aPos.y * len / r, aPos.z); vColor = aLook.rgb; vSeed = aLook.w;
+    gl_Position = uViewProjection * vec4(vWorldPos, 1.0);
+  }`;
+
+// the game's material inside the wrapper: inputs, the prelude, the environment, then fog and tone mapping
+const materialFS = (environment, shade) => `#version 300 es
+  precision highp float;
+  in vec3 vNormal; in vec3 vColor; in vec3 vWorldPos; in vec3 vLocal; in float vSeed; in vec3 vCenter; in float vRadius;
+  uniform vec3 uEye; uniform float uTime;
+  out vec4 phameColor;
+  ${PRELUDE}
+  ${environment}
+  ${shade}
+  void main() { vec4 c = shade(); phameColor = vec4(tonemap(fogged(c.rgb, length(uEye - vWorldPos))), c.a); }`;
+
+const BACKGROUND_VS = `#version 300 es
+  out vec2 vUv;
+  void main() { vec2 p = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0); vUv = p; gl_Position = vec4(p, 0.9999, 1.0); }`;
+const backgroundFS = (environment) => `#version 300 es
+  precision highp float;
+  in vec2 vUv;
+  uniform mat4 uInverseViewProjection;
+  out vec4 phameColor;
+  ${PRELUDE}
+  ${environment}
+  vec3 at(float z) { vec4 p = uInverseViewProjection * vec4(vUv, z, 1.0); return p.xyz / p.w; }
+  void main() {
+    vec3 d = normalize(at(1.0) - at(-1.0));
+    vec3 c = environment(d);
+    vec3 cell = floor(d * 220.0);
+    c += vec3(step(0.9988, hash(cell)) * (0.5 + 1.5 * hash(cell + 3.1)));       // sparse stars
+    phameColor = vec4(tonemap(c) * (1.0 - 0.35 * dot(vUv * 0.5, vUv * 0.5)), 1.0);
+  }`;
+
+const LINE_VS = `#version 300 es
+  layout(location = 0) in vec3 aPos; uniform mat4 uViewProjection; out vec3 vWorld;
+  void main() { vWorld = aPos; gl_Position = uViewProjection * vec4(aPos, 1.0); }`;
+const LINE_FS = `#version 300 es
+  precision highp float; in vec3 vWorld; uniform vec3 uEye; out vec4 color;
+  void main() { float fade = clamp(1.0 - (length(uEye - vWorld) - 60.0) / 250.0, 0.25, 1.0); color = vec4(0.35, 0.55, 1.0, 0.5 * fade); }`;
+
+function compile(type, src) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { const log = gl.getShaderInfoLog(s); hud.textContent = 'Shader error: ' + log; throw new Error(log); }
+  return s;
+}
+function program(vs, fs) {
+  const p = gl.createProgram(); gl.attachShader(p, compile(gl.VERTEX_SHADER, vs)); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {}; return { p, u: name => u[name] ??= gl.getUniformLocation(p, name) };
+}
+const lineProgram = program(LINE_VS, LINE_FS);
+let backgroundProgram = program(BACKGROUND_VS, backgroundFS(DEFAULT_ENVIRONMENT));
+
+// ---------- meshes the materials can be drawn on
+function icosphere(levels, rough) {
+  const t = (1 + Math.sqrt(5)) / 2;
+  let v = [[-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0], [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t], [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1]];
+  let f = [[0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11], [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8], [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9], [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1]];
+  v = v.map(p => { const l = Math.hypot(...p); return p.map(c => c / l); });
+  for (let l = 0; l < levels; l++) {
+    const cache = new Map(), nf = [];
+    const mid = (a, b) => {
+      const k = a < b ? a + ',' + b : b + ',' + a;
+      if (!cache.has(k)) { const m = v[a].map((c, i) => (c + v[b][i]) / 2); const n = Math.hypot(...m); v.push(m.map(c => c / n)); cache.set(k, v.length - 1); }
+      return cache.get(k);
+    };
+    for (const [a, b, c] of f) { const ab = mid(a, b), bc = mid(b, c), ca = mid(c, a); nf.push([a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]); }
+    f = nf;
+  }
+  // rock: lumps that go inwards only, so it stays inside its collision sphere and never pokes through
+  const pos = rough ? v.map(p => { const n = 0.86 + 0.14 * (0.5 + 0.5 * Math.sin(p[0] * 5.1 + p[1] * 2.3) * Math.cos(p[2] * 4.7 - p[0] * 1.9)); return p.map(c => c * n); }) : v;
+  return { positions: new Float32Array(pos.flat()), normals: new Float32Array(v.flat()), indices: new Uint16Array(f.flat()) };
+}
+// a camera: a body and a lens at the front (-z, where it looks)
+function camera() {
+  const positions = [], normals = [], indices = [];
+  const box = (x0, y0, z0, x1, y1, z1) => {
+    const faces = [[[1, 0, 0], [[x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]]], [[-1, 0, 0], [[x0, y0, z1], [x0, y1, z1], [x0, y1, z0], [x0, y0, z0]]],
+      [[0, 1, 0], [[x0, y1, z0], [x0, y1, z1], [x1, y1, z1], [x1, y1, z0]]], [[0, -1, 0], [[x0, y0, z1], [x0, y0, z0], [x1, y0, z0], [x1, y0, z1]]],
+      [[0, 0, 1], [[x1, y0, z1], [x1, y1, z1], [x0, y1, z1], [x0, y0, z1]]], [[0, 0, -1], [[x0, y0, z0], [x0, y1, z0], [x1, y1, z0], [x1, y0, z0]]]];
+    for (const [n, quad] of faces) {
+      const o = positions.length / 3;
+      for (const p of quad) { positions.push(...p); normals.push(...n); }
+      indices.push(o, o + 1, o + 2, o, o + 2, o + 3);
+    }
+  };
+  box(-0.6, -0.42, -0.45, 0.6, 0.42, 0.5);    // body
+  box(-0.3, -0.3, -0.8, 0.3, 0.3, -0.45);     // lens
+  box(-0.2, 0.42, -0.15, 0.2, 0.62, 0.25);    // viewfinder
+  return { positions: new Float32Array(positions), normals: new Float32Array(normals), indices: new Uint16Array(indices) };
+}
+function cylinder() {
+  const positions = [], normals = [], indices = [], n = 14;
+  for (let i = 0; i <= n; i++) {
+    const a = i / n * 2 * Math.PI, x = Math.cos(a), z = Math.sin(a);
+    positions.push(x, 0, z, x, 1, z); normals.push(x, 0, z, x, 0, z);
+    if (i < n) { const o = i * 2; indices.push(o, o + 1, o + 2, o + 1, o + 3, o + 2); }
+  }
+  return { positions: new Float32Array(positions), normals: new Float32Array(normals), indices: new Uint16Array(indices) };
+}
+const MESHES = { rock: () => icosphere(3, true), sphere: () => icosphere(4, false), camera };
+
+const FLOATS = 16;   // per instance: t0 x y z | vx vy vz radius | r g b seed | qx qy qz qw
+function instanced(geometry) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const buf = (data, target = gl.ARRAY_BUFFER) => { const b = gl.createBuffer(); gl.bindBuffer(target, b); gl.bufferData(target, data, gl.STATIC_DRAW); return b; };
+  buf(geometry.positions); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  buf(geometry.normals); gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+  buf(geometry.indices, gl.ELEMENT_ARRAY_BUFFER);
+  const instances = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, instances);
+  for (let i = 0; i < 4; i++) { gl.enableVertexAttribArray(2 + i); gl.vertexAttribPointer(2 + i, 4, gl.FLOAT, false, FLOATS * 4, i * 16); gl.vertexAttribDivisor(2 + i, 1); }
+  gl.bindVertexArray(null);
+  return { vao, instances, indexCount: geometry.indices.length, data: new Float32Array(FLOATS * 256), count: 0, index: new Map() };
+}
+
+// ---------- materials, as the game sent them
+let materials = [];   // { program, transparent, batch, shade, links }
+let environmentSource = DEFAULT_ENVIRONMENT;
+function setMaterials(list, environment) {
+  environmentSource = environment || DEFAULT_ENVIRONMENT;
+  backgroundProgram = program(BACKGROUND_VS, backgroundFS(environmentSource));
+  parentOf.clear(); childrenOf.clear(); localOf.clear(); trees.clear();
+  materials = list.map(m => ({ program: program(INSTANCE_VS, materialFS(environmentSource, m.shade)), transparent: m.transparent, tumble: m.tumble ?? false, batch: instanced((MESHES[m.mesh] ?? MESHES.sphere)()), shade: m.shade, links: null }));
+  linksOf.clear();
+}
+
+// ---------- links: per material, made with its first link; each end copies its body's description when it changes
+const LINK_FLOATS = 20;   // per link: end a (t0 x y z | vx vy vz radius), end b (t0 x y z | vx vy vz -), r g b seed
+const linksOf = new Map();   // body id -> the links it is an end of: { material, i, a, b }
+function linkBatch(material) {
+  if (material.links) return material.links;
+  const geometry = cylinder(), vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const buf = (data, target = gl.ARRAY_BUFFER) => { const b = gl.createBuffer(); gl.bindBuffer(target, b); gl.bufferData(target, data, gl.STATIC_DRAW); return b; };
+  buf(geometry.positions); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  buf(geometry.normals); gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+  buf(geometry.indices, gl.ELEMENT_ARRAY_BUFFER);
+  const instances = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, instances);
+  for (let i = 0; i < 5; i++) { gl.enableVertexAttribArray(2 + i); gl.vertexAttribPointer(2 + i, 4, gl.FLOAT, false, LINK_FLOATS * 4, i * 16); gl.vertexAttribDivisor(2 + i, 1); }
+  gl.bindVertexArray(null);
+  return material.links = { program: program(LINK_VS, materialFS(environmentSource, material.shade)), vao, instances, indexCount: geometry.indices.length, data: new Float32Array(LINK_FLOATS * 64), count: 0, all: [] };
+}
+function bodyData(id) {
+  const k = materials[kindOf.get(id)]?.batch, i = k?.index.get(id);
+  return i === undefined ? null : [k.data, i * FLOATS];
+}
+function writeLinkEnd(link, id) {
+  const body = bodyData(id);
+  if (!body) return;
+  const [data, o] = body, d = link.material.links.data, at = link.i * LINK_FLOATS + (id === link.a ? 0 : 8);
+  for (let k = 0; k < 7; k++) d[at + k] = data[o + k];
+}
+function addLink(a, b, radius) {
+  const body = bodyData(a);
+  if (!body || !bodyData(b)) return;
+  const material = materials[kindOf.get(a)], k = linkBatch(material);
+  if ((k.count + 1) * LINK_FLOATS > k.data.length) { const grown = new Float32Array(k.data.length * 2); grown.set(k.data); k.data = grown; }
+  const link = { material, i: k.count++, a, b };
+  k.all.push(link);
+  const o = link.i * LINK_FLOATS;
+  k.data[o + 7] = radius;
+  for (let c = 0; c < 4; c++) k.data[o + 16 + c] = body[0][body[1] + 8 + c];   // its first body's colour and seed
+  writeLinkEnd(link, a); writeLinkEnd(link, b);
+  for (const id of [a, b]) { if (!linksOf.has(id)) linksOf.set(id, []); linksOf.get(id).push(link); }
+}
+function removeLink(link) {
+  const k = link.material.links, last = --k.count, moved = k.all[last];
+  if (link.i !== last) { k.data.copyWithin(link.i * LINK_FLOATS, last * LINK_FLOATS, (last + 1) * LINK_FLOATS); k.all[link.i] = moved; moved.i = link.i; }
+  k.all.pop();
+  for (const id of [link.a, link.b]) { const list = linksOf.get(id)?.filter(l => l !== link); if (list?.length) linksOf.set(id, list); else linksOf.delete(id); }
+}
+
+const boxVao = gl.createVertexArray();
+let boxReady = false;
+function setBox(s) {
+  const c = [-s, s], p = [];
+  for (const a of c) for (const b of c) { p.push(-s, a, b, s, a, b, a, -s, b, a, s, b, a, b, -s, a, b, s); }
+  gl.bindVertexArray(boxVao);
+  const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(p), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+  boxReady = true;
+}
+
+// ---------- world state: one instance per body, updated in place from descriptions
+// A description takes effect at its t0, which usually lies in this browser's future (it renders in the past, by the
+// presentation delay): it waits in `pending` until the render time reaches it. Applied early, the new path would be
+// evaluated backwards from its start: the body would jump.
+let pending = [], snapshotLinks = [];
+// trees (ragdolls): a node's description is in its parent's space, so its place is worked out here, every frame
+const parentOf = new Map(), childrenOf = new Map(), localOf = new Map(), trees = new Set();
+function adoptTrees(m) {
+  for (const [id, parent] of m.parents ?? []) {
+    parentOf.set(id, parent);
+    if (!childrenOf.has(parent)) childrenOf.set(parent, []);
+    childrenOf.get(parent).push(id);
+  }
+  for (const root of m.trees ?? []) trees.add(root);
+}
+const qmul = (a, b) => [a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1], a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+  a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3], a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2]];
+function qrot(q, v) {   // v turned by q
+  const [x, y, z, w] = q, tx = 2 * (y * v[2] - z * v[1]), ty = 2 * (z * v[0] - x * v[2]), tz = 2 * (x * v[1] - y * v[0]);
+  return [v[0] + w * tx + y * tz - z * ty, v[1] + w * ty + z * tx - x * tz, v[2] + w * tz + x * ty - y * tx];
+}
+// a node at time t: its description (position and velocity, orientation and spin, in the parent's space) evaluated,
+// then placed in the parent's world transform; its children follow
+function placeTree(id, t, P = [0, 0, 0], Q = [0, 0, 0, 1]) {
+  const d = localOf.get(id);
+  if (!d) return;
+  const age = t - d[0], spin = Math.hypot(d[11], d[12], d[13]);
+  let q = [d[7], d[8], d[9], d[10]];
+  if (spin > 0) { const s = Math.sin(spin * age / 2) / spin; q = qmul([d[11] * s, d[12] * s, d[13] * s, Math.cos(spin * age / 2)], q); }
+  const p = qrot(Q, [d[1] + d[4] * age, d[2] + d[5] * age, d[3] + d[6] * age]);
+  const at = [P[0] + p[0], P[1] + p[1], P[2] + p[2]], turn = qmul(Q, q);
+  const body = bodyData(id);
+  if (body) {
+    const [data, o] = body;
+    data[o] = t; data[o + 1] = at[0]; data[o + 2] = at[1]; data[o + 3] = at[2]; data[o + 4] = data[o + 5] = data[o + 6] = 0;
+    data[o + 12] = turn[0]; data[o + 13] = turn[1]; data[o + 14] = turn[2]; data[o + 15] = turn[3];
+    for (const link of linksOf.get(id) ?? []) writeLinkEnd(link, id);
+  }
+  for (const child of childrenOf.get(id) ?? []) placeTree(child, t, at, turn);
+}
+const kindOf = new Map();
+let snapshotTime = -Infinity, size = 30, timeBase = 0;
+function writeBody(id, d, radius, color, kind) {
+  if (kind !== undefined) kindOf.set(id, kind);
+  else if (!kindOf.has(id)) return;   // a description of a body this view does not have (yet, or any more)
+  const k = materials[kindOf.get(id) ?? 0]?.batch;
+  if (!k) return;
+  let i = k.index.get(id);
+  if (i === undefined) {
+    i = k.count++;
+    k.index.set(id, i);
+    if (k.count * FLOATS > k.data.length) { const grown = new Float32Array(k.data.length * 2); grown.set(k.data); k.data = grown; }
+    const o = i * FLOATS;
+    k.data[o + 7] = id === you ? 0 : radius;   // your own camera is not drawn: you are looking through it
+    k.data[o + 8] = ((color >> 16) & 255) / 255; k.data[o + 9] = ((color >> 8) & 255) / 255; k.data[o + 10] = (color & 255) / 255;
+    k.data[o + 11] = (id * 0.618034) % 1;
+  }
+  const o = i * FLOATS;
+  // times relative to the snapshot keep float32 precise for hours
+  k.data[o] = d[0] - timeBase; k.data[o + 1] = d[1]; k.data[o + 2] = d[2]; k.data[o + 3] = d[3];
+  k.data[o + 4] = d[4]; k.data[o + 5] = d[5]; k.data[o + 6] = d[6];
+  k.data[o + 12] = d[7] ?? 0; k.data[o + 13] = d[8] ?? 0; k.data[o + 14] = d[9] ?? 0; k.data[o + 15] = d[10] ?? 1;
+  for (const link of linksOf.get(id) ?? []) writeLinkEnd(link, id);
+  if (trees.has(id) || parentOf.has(id)) localOf.set(id, [d[0] - timeBase, ...d.slice(1, 14)]);
+}
+function removeBody(id) {
+  for (const link of linksOf.get(id) ?? []) removeLink(link);
+  trees.delete(id); parentOf.delete(id); childrenOf.delete(id); localOf.delete(id);
+  const k = materials[kindOf.get(id) ?? 0]?.batch;
+  const i = k?.index.get(id);
+  if (i === undefined) return;
+  const last = --k.count;
+  if (i !== last) {   // the last instance moves into the gap
+    k.data.copyWithin(i * FLOATS, last * FLOATS, (last + 1) * FLOATS);
+    for (const [other, j] of k.index) if (j === last) { k.index.set(other, i); break; }
+  }
+  k.index.delete(id); kindOf.delete(id);
+}
+let you = null;
+
+// ---------- clock: estimate server time from ping round trips; render at serverTime - delay
+let lateNow = 0, lateMax = 0, lateCount = 0, lateness = 0, worker = null, serverTick = 0.05;
+let offset = null, bestRtt = Infinity, rttAvg = 0, jitter = 0, delay = 0.05;
+function serverNow() { return performance.now() / 1000 + (offset ?? 0); }
+
+// ---------- connection
+// the socket sits beside the page: /phame and /phame/ are both the directory, /phame/index.html is in it
+const base = /\.[a-z0-9]+$/i.test(location.pathname) ? location.pathname.replace(/[^/]*$/, '') : location.pathname.replace(/\/?$/, '/');
+const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + base + 'ws';
+let ws, bytes = 0, lastStats = performance.now(), bps = 0, updates = 0, ups = 0;
+function connect() {
+  ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { hud.textContent = 'Joining…'; ping(); };
+  clearInterval(window.pinger); window.pinger = setInterval(ping, 1000);
+  ws.onclose = () => { hud.textContent = 'Disconnected. Reconnecting…'; setTimeout(connect, 1500); };
+  ws.onmessage = (e) => {
+    if (typeof e.data !== 'string') { bytes += e.data.byteLength; descriptions(new DataView(e.data)); return; }
+    bytes += e.data.length;
+    const m = JSON.parse(e.data);
+    if (m.type === 'pong') {
+      worker = m.w;
+      const now = performance.now() / 1000, rtt = now - m.c;
+      rttAvg = rttAvg ? rttAvg * 0.9 + rtt * 0.1 : rtt;
+      jitter = jitter * 0.9 + Math.abs(rtt - rttAvg) * 0.1;
+      if (rtt <= bestRtt * 1.2 || offset === null) { bestRtt = Math.min(bestRtt, rtt); offset = m.s + rtt / 2 - now; }
+      // adaptive presentation delay: a one-way trip, room for jitter and the server's publishing latency, at least 30 ms
+      delay = Math.max(0.03, rttAvg / 2 + 3 * jitter + serverTick, lateness);
+    } else if (m.type === 'snapshot') {
+      if ((m.part ?? 0) === 0) { pending = []; you = m.you ?? null; sentEye = null;   // a new camera in the world (a join or a reconnect): send where it is at once
+        setMaterials(m.materials ?? [{ shade: 'vec4 shade() { return vec4(vColor, 1.0); }', mesh: 'sphere', transparent: false }], m.environment); kindOf.clear(); }
+      snapshotTime = m.t; serverTick = m.tick ?? 0.05; timeBase = m.t; size = m.size; setBox(size);
+      for (const b of m.bodies) writeBody(b[0], b.slice(4), b[1], b[2], b[3]);
+      if (m.dolls) { adoptTrees(m.dolls); for (const b of m.dolls.bodies) writeBody(b[0], b.slice(4), b[1], b[2], b[3]); }
+      if ((m.part ?? 0) === 0) snapshotLinks = [...(m.links ?? []), ...(m.dolls?.links ?? [])];
+      if ((m.part ?? 0) === (m.parts ?? 1) - 1) { for (const [a, b, r] of snapshotLinks) addLink(a, b, r); snapshotLinks = []; }
+      if (offset === null) offset = m.t - performance.now() / 1000;
+    } else if (m.type === 'add') {   // one body, or several (a tree: with their parents) and the links between them
+      adoptTrees(m);
+      for (const b of m.bodies ?? [m.body]) writeBody(b[0], b.slice(4), b[1], b[2], b[3]);
+      for (const [a, b, r] of m.links ?? []) addLink(a, b, r);
+    } else if (m.type === 'remove') {
+      for (const id of m.ids ?? [m.id]) removeBody(id);
+    }
+  };
+}
+// a batch of descriptions, binary: a type byte (1) and the game time (float64), then 64 bytes each: id (uint32), the
+// moment it starts (float64), position, velocity, orientation and spin (13 float32s), little-endian
+function descriptions(v) {
+  if (v.getUint8(0) !== 1 || v.getFloat64(1, true) <= snapshotTime) return;
+  const shown = serverNow() - delay;
+  for (let o = 9; o + 64 <= v.byteLength; o += 64) {
+    const b = [v.getUint32(o, true), v.getFloat64(o + 4, true)];
+    for (let k = 0; k < 13; k++) b.push(v.getFloat32(o + 12 + 4 * k, true));
+    // how late did this arrive? if its moment is already on screen, the old path was drawn past it
+    const late = shown - b[1];
+    if (late > 0) { lateCount++; lateNow = Math.max(lateNow, late); }
+    pending.push(b); updates++;
+  }
+}
+function ping() { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'ping', c: performance.now() / 1000 })); }
+connect();
+
+// ---------- camera
+let yaw = Math.random() * 2 * Math.PI, pitch = 0.32,   // a random side, so two new tabs do not sit inside each other
+    distance = 150, drag = null;
+// one pointer orbits, two pinch to zoom; a touch screen double-taps to throw (it gets no dblclick: touch-action is
+// none, so that the page does not zoom instead)
+const pointers = new Map();
+let pinch = null, lastTap = null;
+canvas.addEventListener('pointerdown', e => {
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, t0: performance.now() });
+  canvas.setPointerCapture(e.pointerId);
+  drag = pointers.size === 1 ? [e.clientX, e.clientY] : null;
+  pinch = null;
+});
+canvas.addEventListener('pointermove', e => {
+  const p = pointers.get(e.pointerId);
+  if (!p) return;
+  p.x = e.clientX; p.y = e.clientY;
+  if (pointers.size === 2) {
+    const [a, b] = [...pointers.values()], span = Math.hypot(a.x - b.x, a.y - b.y);
+    if (pinch) distance = Math.max(25, Math.min(450, distance * pinch / span));
+    pinch = span;
+  } else if (drag) {
+    yaw -= (e.clientX - drag[0]) * 0.005; pitch = Math.max(-1.45, Math.min(1.45, pitch + (e.clientY - drag[1]) * 0.005)); drag = [e.clientX, e.clientY];
+  }
+});
+function pointerEnd(e) {
+  const p = pointers.get(e.pointerId);
+  pointers.delete(e.pointerId);
+  drag = null; pinch = null;
+  if (!p || e.pointerType === 'mouse' || e.type === 'pointercancel') return;
+  const now = performance.now();
+  if (now - p.t0 > 300 || Math.hypot(e.clientX - p.x0, e.clientY - p.y0) > 12) { lastTap = null; return; }   // a drag, not a tap
+  if (lastTap && now - lastTap.t < 350 && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 40) { lastTap = null; drop(); return; }
+  lastTap = { t: now, x: e.clientX, y: e.clientY };
+}
+canvas.addEventListener('pointerup', pointerEnd);
+canvas.addEventListener('pointercancel', pointerEnd);
+// dropping a ball is input like the camera: the game decides where it starts and how it flies
+function drop() { if (ws && ws.readyState === 1 && you !== null) ws.send(JSON.stringify({ type: 'drop' })); }
+canvas.addEventListener('dblclick', drop);   // a mouse; touch double-taps above
+addEventListener('keydown', e => { if (e.code === 'Space' && !e.repeat) { e.preventDefault(); drop(); } });
+canvas.addEventListener('wheel', e => { e.preventDefault(); distance = Math.max(25, Math.min(450, distance * Math.exp(e.deltaY * 0.001))); }, { passive: false });
+
+const sub = (a, b) => a.map((v, i) => v - b[i]), dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const norm = a => { const l = Math.hypot(...a); return a.map(v => v / l); };
+function perspective(fov, aspect, near, far) { const f = 1 / Math.tan(fov / 2), n = 1 / (near - far); return [f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) * n, -1, 0, 0, 2 * far * near * n, 0]; }
+function lookAt(e, t, u) { const z = norm(sub(e, t)), x = norm(cross(u, z)), y = cross(z, x); return [x[0], y[0], z[0], 0, x[1], y[1], z[1], 0, x[2], y[2], z[2], 0, -dot(x, e), -dot(y, e), -dot(z, e), 1]; }
+function multiply(a, b) { const o = new Array(16); for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) { let s = 0; for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k]; o[c * 4 + r] = s; } return o; }
+function invert(m) {
+  const [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15] = m, i = new Array(16);
+  i[0] = a5 * a10 * a15 - a5 * a11 * a14 - a9 * a6 * a15 + a9 * a7 * a14 + a13 * a6 * a11 - a13 * a7 * a10;
+  i[4] = -a4 * a10 * a15 + a4 * a11 * a14 + a8 * a6 * a15 - a8 * a7 * a14 - a12 * a6 * a11 + a12 * a7 * a10;
+  i[8] = a4 * a9 * a15 - a4 * a11 * a13 - a8 * a5 * a15 + a8 * a7 * a13 + a12 * a5 * a11 - a12 * a7 * a9;
+  i[12] = -a4 * a9 * a14 + a4 * a10 * a13 + a8 * a5 * a14 - a8 * a6 * a13 - a12 * a5 * a10 + a12 * a6 * a9;
+  i[1] = -a1 * a10 * a15 + a1 * a11 * a14 + a9 * a2 * a15 - a9 * a3 * a14 - a13 * a2 * a11 + a13 * a3 * a10;
+  i[5] = a0 * a10 * a15 - a0 * a11 * a14 - a8 * a2 * a15 + a8 * a3 * a14 + a12 * a2 * a11 - a12 * a3 * a10;
+  i[9] = -a0 * a9 * a15 + a0 * a11 * a13 + a8 * a1 * a15 - a8 * a3 * a13 - a12 * a1 * a11 + a12 * a3 * a9;
+  i[13] = a0 * a9 * a14 - a0 * a10 * a13 - a8 * a1 * a14 + a8 * a2 * a13 + a12 * a1 * a10 - a12 * a2 * a9;
+  i[2] = a1 * a6 * a15 - a1 * a7 * a14 - a5 * a2 * a15 + a5 * a3 * a14 + a13 * a2 * a7 - a13 * a3 * a6;
+  i[6] = -a0 * a6 * a15 + a0 * a7 * a14 + a4 * a2 * a15 - a4 * a3 * a14 - a12 * a2 * a7 + a12 * a3 * a6;
+  i[10] = a0 * a5 * a15 - a0 * a7 * a13 - a4 * a1 * a15 + a4 * a3 * a13 + a12 * a1 * a7 - a12 * a3 * a5;
+  i[14] = -a0 * a5 * a14 + a0 * a6 * a13 + a4 * a1 * a14 - a4 * a2 * a13 - a12 * a1 * a6 + a12 * a2 * a5;
+  i[3] = -a1 * a6 * a11 + a1 * a7 * a10 + a5 * a2 * a11 - a5 * a3 * a10 - a9 * a2 * a7 + a9 * a3 * a6;
+  i[7] = a0 * a6 * a11 - a0 * a7 * a10 - a4 * a2 * a11 + a4 * a3 * a10 + a8 * a2 * a7 - a8 * a3 * a6;
+  i[11] = -a0 * a5 * a11 + a0 * a7 * a9 + a4 * a1 * a11 - a4 * a3 * a9 - a8 * a1 * a7 + a8 * a3 * a5;
+  i[15] = a0 * a5 * a10 - a0 * a6 * a9 - a4 * a1 * a10 + a4 * a2 * a9 + a8 * a1 * a6 - a8 * a2 * a5;
+  const det = a0 * i[0] + a1 * i[4] + a2 * i[8] + a3 * i[12];
+  return i.map(v => v / det);
+}
+
+// ---------- this viewer's camera, as input to the game: everyone else sees it move
+let sentEye = null, sentAt = 0;
+function sendCamera(eye) {
+  const now = performance.now() / 1000;
+  if (!ws || ws.readyState !== 1 || you === null || now - sentAt < 0.033) return;
+  if (sentEye && Math.hypot(eye[0] - sentEye[0], eye[1] - sentEye[1], eye[2] - sentEye[2]) < 0.01) return;
+  // looking at the middle: turn by -pitch about x, then by yaw about y (the camera looks down its -z)
+  const [sy, cy, sp, cp] = [Math.sin(yaw / 2), Math.cos(yaw / 2), Math.sin(-pitch / 2), Math.cos(-pitch / 2)];
+  const q = [cy * sp, sy * cp, -sy * sp, cy * cp];
+  ws.send(JSON.stringify({ type: 'camera', p: eye, q }));
+  sentEye = eye; sentAt = now;
+}
+
+// ---------- render loop
+let frames = 0, fps = 0;
+const empty = gl.createVertexArray();
+function draw(material, vp, eye, renderTime) {
+  const k = material.batch;
+  if (k.count === 0) return;
+  const prog = material.program;
+  gl.useProgram(prog.p);
+  gl.uniformMatrix4fv(prog.u('uViewProjection'), false, vp);
+  gl.uniform1f(prog.u('uTime'), renderTime);
+  gl.uniform3fv(prog.u('uEye'), eye);
+  gl.uniform1i(prog.u('uTumble'), material.tumble ? 1 : 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, k.instances);
+  gl.bufferData(gl.ARRAY_BUFFER, k.data.subarray(0, k.count * FLOATS), gl.DYNAMIC_DRAW);
+  gl.bindVertexArray(k.vao);
+  gl.drawElementsInstanced(gl.TRIANGLES, k.indexCount, gl.UNSIGNED_SHORT, 0, k.count);
+  const l = material.links;
+  if (!l || l.count === 0) return;
+  gl.useProgram(l.program.p);
+  gl.uniformMatrix4fv(l.program.u('uViewProjection'), false, vp);
+  gl.uniform1f(l.program.u('uTime'), renderTime);
+  gl.uniform3fv(l.program.u('uEye'), eye);
+  gl.bindBuffer(gl.ARRAY_BUFFER, l.instances);
+  gl.bufferData(gl.ARRAY_BUFFER, l.data.subarray(0, l.count * LINK_FLOATS), gl.DYNAMIC_DRAW);
+  gl.bindVertexArray(l.vao);
+  gl.drawElementsInstanced(gl.TRIANGLES, l.indexCount, gl.UNSIGNED_SHORT, 0, l.count);
+}
+function frame() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.floor(canvas.clientWidth * dpr), h = Math.floor(canvas.clientHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  gl.viewport(0, 0, w, h);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  const eye = [distance * Math.cos(pitch) * Math.sin(yaw), distance * Math.sin(pitch), distance * Math.cos(pitch) * Math.cos(yaw)];
+  const vp = multiply(perspective(0.85, w / h, 0.5, 2000), lookAt(eye, [0, 0, 0], [0, 1, 0]));
+  const renderTime = serverNow() - delay - timeBase;
+  sendCamera(eye);
+  if (pending.length) {   // descriptions whose moment has come
+    const due = renderTime + timeBase, later = [];
+    for (const b of pending) { if (b[1] <= due) writeBody(b[0], b.slice(1)); else later.push(b); }
+    pending = later;
+  }
+  for (const root of trees) placeTree(root, renderTime);
+
+  gl.disable(gl.DEPTH_TEST);   // the environment, behind everything
+  gl.useProgram(backgroundProgram.p);
+  gl.uniformMatrix4fv(backgroundProgram.u('uInverseViewProjection'), false, invert(vp));
+  gl.bindVertexArray(empty);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  gl.enable(gl.DEPTH_TEST); gl.enable(gl.CULL_FACE); gl.depthMask(true);
+  for (const m of materials) if (!m.transparent) draw(m, vp, eye, renderTime);   // solid first
+  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
+  if (boxReady) {
+    gl.useProgram(lineProgram.p);
+    gl.uniformMatrix4fv(lineProgram.u('uViewProjection'), false, vp);
+    gl.uniform3fv(lineProgram.u('uEye'), eye);
+    gl.bindVertexArray(boxVao);
+    gl.drawArrays(gl.LINES, 0, 24);
+  }
+  for (const m of materials) if (m.transparent) draw(m, vp, eye, renderTime);    // then glass
+  gl.depthMask(true); gl.disable(gl.BLEND);
+
+  frames++;
+  const now = performance.now();
+  if (now - lastStats >= 1000) {
+    const s = (now - lastStats) / 1000;
+    fps = frames / s; bps = bytes / s; ups = updates / s;
+    // the delay also covers the lateness actually seen (decaying slowly), so corrections arrive before they are due
+    lateMax = lateNow; lateness = Math.max(lateness * 0.97, lateNow > 0 ? delay + lateNow + 0.005 : 0); lateNow = 0;
+    if (lateness > delay) delay = lateness;
+    frames = bytes = updates = 0; lastStats = now;
+  }
+  const counts = materials.map(m => m.batch.count);
+  if (counts.length) {
+    hud.innerHTML = `<b>Phame</b> · rocks and glass in a box, simulated in PHP<br>` +
+      (worker ? `<span class="k">your socket's worker</span> ${worker} · <span class="k">of</span> 4<br>` : '') +
+      `<span class="k">rocks</span> ${counts[0] ?? 0} · <span class="k">marbles</span> ${counts[1] ?? 0} · <span class="k">other viewers</span> ${Math.max(0, (counts[2] ?? 0) - 1)} · <span class="k">ragdolls</span> ${trees.size} · <span class="k">fps</span> ${fps.toFixed(0)}<br>` +
+      `<span class="k">round trip</span> ${(rttAvg * 1000).toFixed(1)} ms · <span class="k">delay</span> ${(delay * 1000).toFixed(0)} ms<br>` +
+      `<span class="k">descriptions</span> ${ups.toFixed(0)}/s · ${(bps / 1024).toFixed(1)} KB/s<br>` +
+      `<span class="k">late descriptions</span> ${lateCount} · <span class="k">worst</span> ${(lateMax * 1000).toFixed(1)} ms`;
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

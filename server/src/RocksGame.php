@@ -192,6 +192,7 @@ final class RocksGame
                     self::$lock = $lock;   // held for the life of this worker
                     try {
                         self::$instance = new self();
+                        SolarGame::start();   // the same elected worker runs both games, each its own World
                         self::$instance->run();
                     } catch (\Throwable $e) {   // log it, and let another worker (or this one) start a new game
                         error_log('phame rocks game stopped: ' . $e);

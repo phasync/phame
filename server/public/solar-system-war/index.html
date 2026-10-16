@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Solar system war</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #03040a; font: 13px/1.45 system-ui, sans-serif; color: #cfd3e6; }
+  #hud { position: fixed; left: 12px; top: 10px; padding: 8px 11px; border-radius: 8px; background: rgba(10, 12, 24, .7); white-space: pre; }
+</style>
+</head>
+<body>
+<div id="hud">Connecting…</div>
+<script>
+'use strict';
+// Placeholder client: confirms the socket and the wire protocol (see PhameServer\SolarGame's docblock) work.
+// The full WebGL renderer for this demo is a separate piece of work, built from that documented protocol.
+const hud = document.getElementById('hud');
+const base = /\.[a-z0-9]+$/i.test(location.pathname) ? location.pathname.replace(/[^/]*$/, '') : location.pathname.replace(/\/?$/, '/');
+const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + base + 'ws';
+
+let nodeCount = 0, named = [], batches = 0, lastBatch = 0, epoch = null, gameTime = 0;
+
+function connect() {
+  const ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { hud.textContent = 'Joining…'; };
+  ws.onclose = () => { hud.textContent = 'Disconnected. Reconnecting…'; setTimeout(connect, 1500); };
+  ws.onmessage = (e) => {
+    if (typeof e.data !== 'string') {
+      const v = new DataView(e.data);
+      if (v.getUint8(0) !== 1) return;
+      gameTime = v.getFloat64(1, true);
+      let count = 0;
+      for (let o = 9; o + 76 <= v.byteLength; o += 76) count++;
+      batches++; lastBatch = count;
+      render();
+      return;
+    }
+    const m = JSON.parse(e.data);
+    if (m.type === 'snapshot') {
+      if ((m.part ?? 0) === 0) { nodeCount = 0; named = []; epoch = m.epoch; }
+      nodeCount += m.nodes.length;
+      for (const n of m.nodes) if (n[2]) named.push(n[2]);
+      gameTime = m.t;
+      render();
+    }
+  };
+}
+function render() {
+  const date = epoch !== null ? new Date((epoch + gameTime) * 1000).toISOString() : '?';
+  hud.textContent = `Solar system war (observer)\nnodes: ${nodeCount}\nnamed: ${named.join(', ')}\n` +
+    `game time: ${gameTime.toFixed(1)} s\nsim date (UTC): ${date}\nbatches received: ${batches} (last: ${lastBatch} nodes)`;
+}
+connect();
+</script>
+</body>
+</html>

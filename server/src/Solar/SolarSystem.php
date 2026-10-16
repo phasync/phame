@@ -12,6 +12,14 @@ use Phame\Scene\Scene3D;
  */
 class SolarSystem
 {
+    // What a node is, for a networking layer that doesn't otherwise know the tree's shape (see nodes()).
+    public const KIND_STAR = 0;
+    public const KIND_PLANET = 1;
+    public const KIND_MOON = 2;
+    public const KIND_ASTEROID = 3;
+    public const KIND_ANCHOR = 4;
+    public const KIND_ORBIT_FRAME = 5;
+
     private Scene3D $scene;
     private float $epoch;  // unix timestamp for t=0
     private const ERROR_BUDGET = 10.0;  // km tolerance for position error
@@ -20,6 +28,8 @@ class SolarSystem
     private array $planets = [];
     /** @var array<string, Node3D> moon bodies, keyed by name */
     private array $moons = [];
+    /** @var list<array{Node3D, ?Node3D, int}> every node this system created, parents before children, with its kind */
+    private array $allNodes = [];
 
     public function __construct(Scene3D $scene, float $epoch)
     {
@@ -28,8 +38,30 @@ class SolarSystem
         $this->buildSystem();
     }
 
+    /** Every node this system created: [node, parent (null at the scene root), kind]. Parents always precede children. */
+    public function nodes(): array
+    {
+        return $this->allNodes;
+    }
+
+    private function track(Node3D $node, ?Node3D $parent, int $kind): void
+    {
+        $this->allNodes[] = [$node, $parent, $kind];
+    }
+
     private function buildSystem(): void
     {
+        // As for planets and asteroids: the radius must not land directly on a root child, or it joins collision
+        // detection, so a motionless anchor at the origin carries the visible Sun as its child.
+        $sunAnchor = new Node3D();
+        $this->scene->root->addChild($sunAnchor);
+        $sun = new Node3D();
+        $sun->name = 'Sun';
+        $sun->radius = Ephemeris::SUN_RADIUS;
+        $sunAnchor->addChild($sun);
+        $this->track($sunAnchor, null, self::KIND_ANCHOR);
+        $this->track($sun, $sunAnchor, self::KIND_STAR);
+
         foreach (['Mercury', 'Venus', 'Earth', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune'] as $planet) {
             $this->addPlanet($planet);
         }
@@ -45,6 +77,7 @@ class SolarSystem
         $this->scene->root->addChild($anchor);
         $anchor->addEventListener('expire', fn () => $this->refitPlanetAnchor($name, $anchor));
         $this->refitPlanetAnchor($name, $anchor);
+        $this->track($anchor, null, self::KIND_ANCHOR);
 
         // Planet body: fixed axial tilt, spinning about its own (tilted) pole so the pole direction never moves.
         $body = new Node3D();
@@ -54,6 +87,7 @@ class SolarSystem
         $rate = 2 * M_PI / $this->getRotationPeriod($name);
         $body->spin($wx * $rate, $wy * $rate, $wz * $rate);
         $anchor->addChild($body);
+        $this->track($body, $anchor, self::KIND_PLANET);
 
         match ($name) {
             'Earth' => $this->addMoon('Moon', $anchor, 'Earth'),
@@ -104,6 +138,8 @@ class SolarSystem
 
         $orbitFrame->addEventListener('expire', fn () => $this->refitMoon($name, $planet, $orbitFrame, $moonNode));
         $this->refitMoon($name, $planet, $orbitFrame, $moonNode);
+        $this->track($orbitFrame, $parentAnchor, self::KIND_ORBIT_FRAME);
+        $this->track($moonNode, $orbitFrame, self::KIND_MOON);
 
         $this->moons[$name] = $moonNode;
     }
@@ -248,6 +284,8 @@ class SolarSystem
             $asteroid->addChild($body);
             $asteroid->addEventListener('expire', fn () => $this->refitAsteroid($asteroid, $a, $lon0, $lat));
             $this->refitAsteroid($asteroid, $a, $lon0, $lat);
+            $this->track($asteroid, null, self::KIND_ANCHOR);
+            $this->track($body, $asteroid, self::KIND_ASTEROID);
         }
     }
 
