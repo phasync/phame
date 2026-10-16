@@ -2,10 +2,13 @@
 
 namespace PhameServer\Solar;
 
+use Phame\Rendering\MeshShader;
 use Phame\Scene\Geometry;
 use Phame\Scene\Material;
 use Phame\Scene\Mesh;
+use Phame\Scene\Label;
 use Phame\Scene\Node3D;
+use Phame\Scene\PointLight;
 use Phame\Scene\Scene3D;
 
 /**
@@ -34,13 +37,87 @@ class SolarSystem
         $this->buildSystem();
     }
 
-    /** A sphere of $radius, drawn in $color: shares one unit Geometry (scaled), as RocksGame's balls do. */
-    private static function body(float $radius, int $color, bool $emissive = false): Mesh
+    private static ?MeshShader $bodyShader = null;
+
+    /**
+     * A sphere of $radius, drawn in $color: shares one unit Geometry (scaled), as RocksGame's balls do. $shadowed
+     * (the Sun, every planet, every moon - never one of the 300 asteroids) opts into the eclipse-capable shader
+     * below; every Material is still its own object (so each body keeps its own colour - Net\View has no notion of
+     * per-instance colour, only per-material), but the eclipse shader's GLSL is a few KB, and View's snapshot does
+     * not chunk by byte size, only by node count - inlining it into all ~300 asteroids' materials once blew a single
+     * snapshot chunk past Swerve's 128 KiB ceiling (and so past silently). Asteroids are far too small on screen for
+     * the shadow to read anyway, so they get the plain (shaderless, still lit) material instead.
+     */
+    private static ?Material $asteroidMaterial = null;
+
+    private static function body(float $radius, int $color, bool $emissive = false, bool $shadowed = true): Mesh
     {
-        $mesh = new Mesh(self::$sphere ??= Geometry::sphere(1.0), new Material(color: $color, emissive: $emissive ? $color : 0x000000));
+        // every asteroid is the same colour and shaderless - one shared Material (not a fresh one per body) keeps
+        // the snapshot small (see the shader-size note above) and lets the browser instance all 300 in one draw
+        // call, exactly as it does for RocksGame's identical rocks.
+        $material = $shadowed ? new Material(color: $color, emissive: $emissive ? $color : 0x000000, shader: self::bodyShader())
+            : (self::$asteroidMaterial ??= new Material(color: $color));
+        $mesh = new Mesh(self::$sphere ??= Geometry::sphere(1.0, 16, 10), $material);
         $mesh->radius = $radius;
         $mesh->setScale($radius);
         return $mesh;
+    }
+
+    /**
+     * Lit by the nearest point light (the Sun) plus an eclipse shadow: the fraction of the Sun's disc covered by
+     * the nearest few large bodies (phame.js's generic "occluder" uniforms - see client/phame.js's docblock and
+     * docs/REMOTE-VIEW.md's note on this), darkening and reddening a body passing through another's shadow (the
+     * Moon during a lunar eclipse). The Sun's own radius is baked in as a GLSL constant: PointLight carries no
+     * physical size (it is a true point for ordinary lighting), so there is no uniform to read it from - the engine
+     * could add one (`PointLight::$radius`, defaulting to 0) if another game ever needs a light's own angular size;
+     * until then this is the one place that needs it, and it never changes.
+     */
+    private static function bodyShader(): MeshShader
+    {
+        // GLSL is strictly typed: embedding a whole number without a decimal point makes it an int literal, and
+        // int/float has no implicit conversion - sprintf keeps this a float literal even though the value is whole.
+        $sunRadius = sprintf('%.1f', Ephemeris::SUN_RADIUS);
+        return self::$bodyShader ??= new MeshShader(<<<GLSL
+            // area of the circular segment of a circle (radius r) cut by a chord at distance d1 from its centre
+            float segment(float r, float d1) { return r*r*acos(clamp(d1/r, -1.0, 1.0)) - d1*sqrt(max(r*r - d1*d1, 0.0)); }
+            float lensArea(float d, float r1, float r2) {
+                float d1 = (d*d - r2*r2 + r1*r1) / (2.0*d);
+                return segment(r1, d1) + segment(r2, d - d1);
+            }
+            // fraction of the sun's disc (angular radius r1) covered by an occluder (angular radius r2), separated by angle d
+            float coverage(float d, float r1, float r2) {
+                if (d >= r1 + r2) return 0.0;
+                if (d <= abs(r1 - r2)) { float m = min(r1, r2); return (m * m) / (r1 * r1); }
+                return clamp(lensArea(d, r1, r2) / (3.14159265 * r1 * r1), 0.0, 1.0);
+            }
+            vec4 shade() {
+                vec3 n = normalize(gl_FrontFacing ? vNormal : -vNormal);
+                float ndotl = max(dot(n, SUN), 0.0);
+                float shadow = 0.0;
+                if (vEmissive.r < 0.01 && uPointCount > 0) {
+                    vec3 toSun = uPointPos[0] - vWorldPos; float dSun = max(length(toSun), 1.0);
+                    float sunAngR = {$sunRadius} / dSun;
+                    vec3 sunDir = toSun / dSun;
+                    for (int i = 0; i < uOccCount; i++) {
+                        vec3 toOcc = uOccPos[i] - vWorldPos; float dOcc = length(toOcc);
+                        if (dOcc < vRadius * 1.2) continue;   // this body is its own "occluder" entry: skip
+                        float occAngR = uOccRadius[i] / max(dOcc, 1.0);
+                        float theta = acos(clamp(dot(sunDir, toOcc / dOcc), -1.0, 1.0));
+                        shadow = max(shadow, coverage(theta, sunAngR, occAngR));
+                    }
+                }
+                float lit = ndotl * (1.0 - shadow);
+                vec3 base;
+                if (vEmissive.r > 0.01) {
+                    base = vColor * 2.4 + vEmissive;
+                } else {
+                    base = vColor * (0.035 + 0.965 * lit);
+                    if (shadow > 0.2) base = mix(base, vec3(0.5, 0.2, 0.09) * (0.04 + 0.6 * ndotl), clamp((shadow - 0.2) / 0.8, 0.0, 1.0) * 0.75);
+                    base *= 1.0 + 0.04 * sin(n.y * 16.0 + vRadius * 0.001);   // cheap banding, visible mainly on gas giants
+                }
+                return vec4(base, 1.0);
+            }
+            GLSL);
     }
 
     private function buildSystem(): void
@@ -51,7 +128,11 @@ class SolarSystem
         $this->scene->root->addChild($sunAnchor);
         $sun = self::body(Ephemeris::SUN_RADIUS, 0xfff2cc, emissive: true);
         $sun->name = 'Sun';
+        $sun->addChild(new Label('Sun'));
         $sunAnchor->addChild($sun);
+        // every body's N.L lighting (and the eclipse shadow above) comes from this, not the scene's directional
+        // sun - a real point light at the Sun's position casts correctly as the viewer flies anywhere in the system.
+        $sunAnchor->addChild(new PointLight(color: 0xfff2cc, intensity: 1.0, range: 1.0e12));
 
         foreach (['Mercury', 'Venus', 'Earth', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune'] as $planet) {
             $this->addPlanet($planet);
@@ -77,6 +158,7 @@ class SolarSystem
         [$wx, $wy, $wz] = $this->getSpinAxis($name);
         $rate = 2 * M_PI / $this->getRotationPeriod($name);
         $body->spin($wx * $rate, $wy * $rate, $wz * $rate);
+        $body->addChild(new Label($name));
         $anchor->addChild($body);
 
         match ($name) {
@@ -123,6 +205,7 @@ class SolarSystem
         $moonNode = self::body($this->getMoonRadius($name), 0x999990);
         $moonNode->name = $name;
         $moonNode->setOrientation(0.0, 1.0, 0.0, 0.0);  // tidally locked: fixed face toward the orbit frame's origin
+        $moonNode->addChild(new Label($name));
         $orbitFrame->addChild($moonNode);
 
         $orbitFrame->addEventListener('expire', fn () => $this->refitMoon($name, $planet, $orbitFrame, $moonNode));
@@ -266,7 +349,7 @@ class SolarSystem
             // directly on a root child, or every one of the 300 asteroids joins the scene's collision detection.
             $asteroid = new Node3D();
             $this->scene->root->addChild($asteroid);
-            $body = self::body(5.0, 0x8a8278);
+            $body = self::body(5.0, 0x8a8278, shadowed: false);
             $asteroid->addChild($body);
             $asteroid->addEventListener('expire', fn () => $this->refitAsteroid($asteroid, $a, $lon0, $lat));
             $this->refitAsteroid($asteroid, $a, $lon0, $lat);

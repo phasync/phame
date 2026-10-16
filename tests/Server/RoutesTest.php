@@ -92,7 +92,7 @@ class RoutesTest extends TestCase
     {
         [$status, $body] = $this->get('/solar-system-war/');
         $this->assertSame(200, $status);
-        $this->assertStringContainsString('WebSocket', $body);
+        $this->assertStringContainsString('phame.js', $body);
     }
 
     public function testRocksInBoxWithoutTrailingSlashRedirects(): void

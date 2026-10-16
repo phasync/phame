@@ -9,20 +9,18 @@
   html, body { margin: 0; height: 100%; background: #000103; overflow: hidden; font: 13px/1.45 system-ui, sans-serif; color: #cfd3e6; }
   canvas { display: block; width: 100vw; height: 100vh; cursor: grab; touch-action: none; }
   canvas:active { cursor: grabbing; }
-  #hud { position: fixed; left: 12px; top: 10px; padding: 8px 11px; border-radius: 8px; background: rgba(10, 12, 24, .72); backdrop-filter: blur(6px); white-space: pre; pointer-events: none; min-width: 15rem; }
+  #hud { position: fixed; left: 12px; top: 10px; padding: 8px 11px; border-radius: 8px; background: rgba(10, 12, 24, .72); backdrop-filter: blur(6px); white-space: pre; pointer-events: none; min-width: 15rem; z-index: 3; }
   #hud b { color: #ffd77a; font-weight: 600; }
   #hud .k { color: #8890b0; }
-  #labels { position: fixed; inset: 0; pointer-events: none; overflow: hidden; z-index: 2; }
-  .label { position: absolute; transform: translate(-50%, -50%); font-size: 11px; color: #e4e8ff; text-shadow: 0 0 4px #000, 0 0 2px #000; white-space: nowrap; pointer-events: auto; cursor: pointer; padding: 2px 5px; }
-  .label:hover { color: #ffd77a; }
-  .label .dot { display: inline-block; width: 4px; height: 4px; border-radius: 50%; background: #e4e8ff; margin-right: 4px; vertical-align: middle; }
+  .phame-label { cursor: pointer; padding: 2px 5px; }
+  .phame-label:hover { color: #ffd77a; }
   #panel { position: fixed; right: 10px; bottom: 10px; padding: 8px 10px; border-radius: 8px; background: rgba(10, 12, 24, .72); backdrop-filter: blur(6px); max-width: 280px; z-index: 3; }
   #panel .row { display: flex; align-items: center; gap: 6px; margin: 3px 0; }
   #panel button { background: #1b2040; color: #cfd3e6; border: 1px solid #38406e; border-radius: 5px; padding: 3px 8px; font: inherit; cursor: pointer; }
   #panel button:hover { background: #2a2f58; }
   #panel input[type=range] { flex: 1; }
   #panel .time { color: #8890b0; font-size: 11px; }
-  #help { position: fixed; left: 12px; bottom: 10px; color: #70769a; font-size: 11px; pointer-events: none; }
+  #help { position: fixed; left: 12px; bottom: 10px; color: #70769a; font-size: 11px; pointer-events: none; z-index: 3; }
   @media (max-width: 640px) {
     #hud { font-size: 12px; min-width: 11rem; }
     #panel { max-width: 46vw; font-size: 11px; }
@@ -33,7 +31,6 @@
 <body>
 <canvas id="c"></canvas>
 <div id="hud">Connecting…</div>
-<div id="labels"></div>
 <div id="panel">
   <div class="row"><b>Time</b> <span class="time" id="timeLabel">now</span></div>
   <div class="row">
@@ -43,655 +40,101 @@
   <div class="row"><button id="eclipse" style="flex:1">Next lunar eclipse</button></div>
 </div>
 <div id="help">drag to orbit · wheel/pinch to zoom · 0-9 or Tab: pick target · click a label · P: perf</div>
-<script type="importmap">
-{ "imports": {
-  "three": "https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.module.js",
-  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.186.1/examples/jsm/"
-} }
-</script>
 <script type="module">
 'use strict';
-// The Solar System War observer client, rendered with three.js (loaded as an ES module from jsdelivr - no build
-// step). Reads PhameServer\SolarGame's wire protocol (see its docblock): a snapshot of the node tree, then binary
-// description batches. Every node's world position/orientation is evaluated in double-precision JS from its motion
-// description (position = p0 + v*dt + 1/2*a*dt^2, orientation turned by a constant spin, composed parent-to-child -
-// see computeWorld()), independently of three.js.
-//
-// Precision at planetary distances: the three.js camera always sits at the scene origin; every Object3D's position
-// is set to (that body's world position - the camera's world position), computed in JS doubles, every frame. Three
-// composes matrices in JS (also double precision) and only the final per-object matrix is uploaded to the GPU as
-// float32 - by then the magnitudes involved are "distance from camera", not "distance from the Sun", so float32 is
-// plenty. The renderer also gets logarithmicDepthBuffer so a moon a few thousand km away and Neptune can both draw
-// correctly in the same frame.
-//
-// Level of detail: the ~18 bodies big enough to matter (the Sun, planets, major moons) each get a real lit
-// SphereGeometry mesh, given a stable 1:1 mapping built once from the snapshot (there are few enough that no
-// per-frame pool-assignment logic is needed). Everything else - every asteroid - is one shared THREE.Points cloud,
-// sized per-point in its own vertex shader from a minimum-apparent-size floor. Three.js's own frustum culling
-// handles off-screen meshes "for free"; Points are left to ordinary clip-space point clipping.
-//
-// Shadows: three.js shadow maps do not work at this scale (the depth range spans AU to km). Eclipses instead come
-// from a small custom ShaderMaterial (ndotl lighting plus an analytic Sun-disc-coverage calculation against the
-// nearest few large bodies) applied to every body mesh - see PLANET_FS.
+// The Solar System War observer page. All rendering (the scene mirror, double-precision evaluation, the camera,
+// instancing, the eclipse shader) is phame.js's job now - see /phame.js and docs/REMOTE-VIEW.md. This page only
+// adds its own HUD, a target list built from the node names SolarSystem.php assigns, and the time-travel panel.
+import { connect } from '../phame.js';
 
-import * as THREE from 'three';
-import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
-
-const canvas = document.getElementById('c');
 const hud = document.getElementById('hud');
-const labelsEl = document.getElementById('labels');
 const AU = 1.495978707e8; // km
 
-// ---------- three.js setup
-const NEAR = 1e-4, FAR = 2e11; // km: a 10cm near plane, a far plane generous enough to cover the whole system
-const FCOEF = 1 / Math.log2(FAR + 1); // for the manual per-fragment log-depth write (see PLANET_FS/POINTS_FS)
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, logarithmicDepthBuffer: true });
-renderer.setClearColor(0x000000, 1);
-let dprCap = 2; // adaptive: stepped down under sustained load, back up once it recovers (see the stats tick below)
-renderer.setPixelRatio(dprCap);
-const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(51.57, 1, NEAR, FAR); // 0.9 rad, matching the earlier hand-rolled client
-const cssRenderer = new CSS2DRenderer({ element: labelsEl });
+// SolarSystem.php's bodies are a few hundred km across at the smallest (an asteroid) to ~1.4M km (the Sun): large
+// enough above the noise of the ~10km position-refit error budget that "large body" reliably means "planet, moon
+// or the Sun," never an asteroid - which is exactly the set the eclipse shader's occluder search should consider.
+const game = connect((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + location.pathname.replace(/\/?$/, '/') + 'ws', {
+  canvas: document.getElementById('c'), near: 1e-3, far: 2e11, startDistance: 50000, occluderMinRadius: 500,
+});
 
-// a sparse, purely decorative starfield at a fixed huge distance - not part of the protocol or physics
-{
-  const N = 2500, pos = new Float32Array(N * 3);
-  for (let i = 0; i < N; i++) {
-    const u = Math.random() * 2 - 1, a = Math.random() * Math.PI * 2, r = Math.sqrt(1 - u * u);
-    pos[i*3] = r * Math.cos(a) * 5e10; pos[i*3+1] = u * 5e10; pos[i*3+2] = r * Math.sin(a) * 5e10;
-  }
-  const starGeo = new THREE.BufferGeometry();
-  starGeo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  const stars = new THREE.Points(starGeo, new THREE.PointsMaterial({ color: 0xaaaaaa, size: 1.3, sizeAttenuation: false, depthWrite: false }));
-  stars.frustumCulled = false;
-  scene.add(stars);
+// ---------- target list + labels: built from node names once the snapshot is in, refreshed on later adds (none
+// expected here - SolarGame's scene is static in composition, only descriptions change)
+const ORDER = ['Sun', 'Mercury', 'Venus', 'Earth', 'Moon', 'Mars', 'Phobos', 'Deimos', 'Jupiter', 'Io', 'Europa', 'Ganymede', 'Callisto', 'Saturn', 'Titan', 'Uranus', 'Neptune'];
+let nameToId = new Map(), targetList = [], initialCameraSet = false;
+function refreshTargets() {
+  nameToId = new Map();
+  for (const n of game.nodes) if (n.name) nameToId.set(n.name, n.id);
+  targetList = ORDER.map(n => nameToId.get(n)).filter(id => id !== undefined);
+  if (!initialCameraSet) setInitialCamera();
 }
+game.on('snapshot', refreshTargets);
+game.on('add', refreshTargets);
 
-// ---------- the Sun as a point light (no decay - constant intensity regardless of distance) plus its own mesh
-const sunLight = new THREE.PointLight(0xfff4e0, 3, 0, 0);
-scene.add(sunLight);
-
-// ---------- body shader: lit diffuse (N.L) plus the analytic eclipse shadow, shared source for every body mesh.
-// Each mesh gets its own material instance (own uColor/uIsSun/uRadius), but the global uniforms (sun position,
-// occluders) are literally the same {value:...} wrapper objects across all of them (see makeBodyMaterial), so
-// updating the wrapper once a frame updates every material at once without a per-material uniform loop.
-const sharedUniforms = {
-  uSunPos: { value: new THREE.Vector3() }, uSunRadius: { value: 696000 },
-  uOccPos: { value: [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()] },
-  uOccRadius: { value: new Float32Array(4) }, uOccCount: { value: 0 },
-};
-const PLANET_VS = `
-  varying vec3 vWorldPos; varying vec3 vNormal; varying float vClipW;
-  void main() {
-    vWorldPos = (modelMatrix * vec4(position, 1.0)).xyz;
-    vNormal = normalize(normalMatrix * normal);
-    vec4 clip = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-    vClipW = clip.w;
-    gl_Position = clip;
-  }`;
-const PLANET_FS = `
-  precision highp float;
-  varying vec3 vWorldPos; varying vec3 vNormal; varying float vClipW;
-  uniform vec3 uColor; uniform float uIsSun; uniform float uRadius; uniform float uFcoef;
-  uniform vec3 uSunPos; uniform float uSunRadius;
-  uniform vec3 uOccPos[4]; uniform float uOccRadius[4]; uniform int uOccCount;
-  // area of the circular segment of a circle (radius r) cut by a chord at distance d1 from its centre
-  float segment(float r, float d1) { return r*r*acos(clamp(d1/r, -1.0, 1.0)) - d1*sqrt(max(r*r - d1*d1, 0.0)); }
-  float lensArea(float d, float r1, float r2) {
-    float d1 = (d*d - r2*r2 + r1*r1) / (2.0*d);
-    return segment(r1, d1) + segment(r2, d - d1);
-  }
-  // fraction of the sun's disc (angular radius r1) covered by an occluder (angular radius r2) separated by angle d
-  float coverage(float d, float r1, float r2) {
-    if (d >= r1 + r2) return 0.0;
-    if (d <= abs(r1 - r2)) { float m = min(r1, r2); return (m*m) / (r1*r1); }
-    return clamp(lensArea(d, r1, r2) / (3.14159265 * r1 * r1), 0.0, 1.0);
-  }
-  void main() {
-    vec3 N = normalize(vNormal);
-    vec3 toSun = uSunPos - vWorldPos; float dSun = length(toSun); vec3 L = toSun / max(dSun, 1e-6);
-    float ndotl = max(dot(N, L), 0.0);
-    float shadow = 0.0;
-    if (uIsSun < 0.5) {
-      float sunAngR = uSunRadius / dSun;
-      for (int i = 0; i < 4; i++) {
-        if (i >= uOccCount) break;
-        vec3 toOcc = uOccPos[i] - vWorldPos; float dOcc = length(toOcc);
-        if (dOcc < uRadius * 1.2) continue;   // this body is its own "occluder" entry: skip
-        vec3 Locc = toOcc / dOcc;
-        float occAngR = uOccRadius[i] / dOcc;
-        float theta = acos(clamp(dot(L, Locc), -1.0, 1.0));
-        shadow = max(shadow, coverage(theta, sunAngR, occAngR));
-      }
-    }
-    float lit = ndotl * (1.0 - shadow);
-    vec3 base;
-    if (uIsSun > 0.5) {
-      base = uColor * 2.4;
-    } else {
-      base = uColor * (0.035 + 0.965 * lit);
-      if (shadow > 0.2) base = mix(base, vec3(0.5, 0.2, 0.09) * (0.04 + 0.6 * ndotl), clamp((shadow - 0.2) / 0.8, 0.0, 1.0) * 0.75);
-      base *= 1.0 + 0.04 * sin(N.y * 16.0 + uRadius * 0.01);   // cheap banding, visible mainly on gas giants
-    }
-    gl_FragColor = vec4(base, 1.0);
-    gl_FragDepth = clamp(log2(max(1e-6, vClipW + 1.0)) * uFcoef, 0.0, 1.0);   // logarithmic depth, per fragment
-  }`;
-function makeBodyMaterial(colorArr3, isSun, radius) {
-  return new THREE.ShaderMaterial({
-    vertexShader: PLANET_VS, fragmentShader: PLANET_FS,
-    uniforms: { ...sharedUniforms, uFcoef: { value: FCOEF },
-      uColor: { value: new THREE.Color(colorArr3[0], colorArr3[1], colorArr3[2]) }, uIsSun: { value: isSun ? 1 : 0 }, uRadius: { value: radius } },
-  });
-}
-const sphereGeo = new THREE.SphereGeometry(1, 32, 20);
-
-// ---------- the asteroid belt (and anything else too small to bother meshing): one Points cloud, sized per-point
-// in the vertex shader from a minimum-apparent-size floor (uMinPx) so nothing vanishes at a distance.
-const POINTS_VS = `
-  attribute float aRadius; attribute vec3 aColor;
-  varying vec3 vColor;
-  uniform float uScreenFactor; uniform float uMinPx;
-  void main() {
-    vColor = aColor;
-    vec4 mv = modelViewMatrix * vec4(position, 1.0);
-    float dist = max(-mv.z, 1e-6);
-    gl_PointSize = max(uMinPx, aRadius / dist * uScreenFactor);
-    gl_Position = projectionMatrix * mv;
-  }`;
-const POINTS_FS = `
-  precision highp float;
-  varying vec3 vColor;
-  void main() {
-    vec2 c = gl_PointCoord - vec2(0.5);
-    if (dot(c, c) > 0.25) discard;
-    gl_FragColor = vec4(vColor, 1.0);
-  }`;
-const pointsUniforms = { uScreenFactor: { value: 1 }, uMinPx: { value: 2.5 } };
-const pointsMaterial = new THREE.ShaderMaterial({ vertexShader: POINTS_VS, fragmentShader: POINTS_FS, uniforms: pointsUniforms });
-let pointsObj = null; // (re)built per snapshot, once the asteroid count is known - see applySnapshot
-
-// ---------- CSS2D labels (planets and major moons only - see targetList)
-document.body.appendChild(cssRenderer.domElement);
-
-// ---------- small-vector helpers for the few things still off the hot path (camera target, travel, HUD)
-const sub = (a, b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
-const norm = a => { const l = Math.hypot(...a) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
-const lerp = (a, b, t) => a + (b - a) * t;
-
-// ---------- node tree, as a struct-of-arrays indexed by a stable "slot" (0 is a virtual root: identity transform).
-// computeWorld() walks this once a frame with plain scalar arithmetic: no array literal, no Map.get/set, no object
-// is allocated per node per frame - this is independent of the rendering backend (it was the same with hand-rolled
-// WebGL, kept as-is for three.js).
-const KIND_STAR = 0, KIND_PLANET = 1, KIND_MOON = 2, KIND_ASTEROID = 3, KIND_ANCHOR = 4, KIND_ORBIT_FRAME = 5;
-let nodesById = new Map(), nameToId = new Map(), targetList = [];
-let epoch = null, gameTimeKnown = 0;
-// per-slot flat state; slot 0 is the virtual root parentId=0 maps to
-let nodesBySlot = [null], orderSlots = new Int32Array(0), parentSlot = new Int32Array(1);
-let drawableSlots = new Int32Array(0), largeSlots = new Int32Array(0), meshSlots = [], pointSlots = [];
-let radiusArr = new Float64Array(1), colorArr = new Float32Array(3);
-let worldPosX = new Float64Array(1), worldPosY = new Float64Array(1), worldPosZ = new Float64Array(1);
-let worldQuatX = new Float64Array(1), worldQuatY = new Float64Array(1), worldQuatZ = new Float64Array(1), worldQuatW = new Float64Array(1);
-worldQuatW[0] = 1;
-
-const COLORS = {
-  Sun: [1.0, 0.82, 0.35], Mercury: [0.62, 0.59, 0.56], Venus: [0.86, 0.76, 0.52], Earth: [0.18, 0.4, 0.62],
-  Moon: [0.62, 0.62, 0.6], Mars: [0.68, 0.33, 0.21], Jupiter: [0.78, 0.63, 0.46], Saturn: [0.85, 0.74, 0.55],
-  Uranus: [0.56, 0.8, 0.85], Neptune: [0.26, 0.42, 0.86], Io: [0.85, 0.78, 0.4], Europa: [0.75, 0.72, 0.68],
-  Ganymede: [0.55, 0.52, 0.5], Callisto: [0.45, 0.43, 0.42], Titan: [0.8, 0.68, 0.4], Phobos: [0.5, 0.46, 0.43],
-  Deimos: [0.5, 0.46, 0.43],
-};
-function colorFor(n) { return COLORS[n.name] || (n.kind === KIND_ASTEROID ? [0.5, 0.48, 0.46] : [0.6, 0.6, 0.62]); }
-// id -> world position, as a fresh small array: used only off the hot path (camera target, labels, HUD - a
-// handful of calls per frame, never the per-body loop), so a tiny allocation here is fine.
-function posOf(id) { const n = nodesById.get(id); return n ? [worldPosX[n.slot], worldPosY[n.slot], worldPosZ[n.slot]] : [0, 0, 0]; }
-
-// parent-to-child composition (position = p0 + v*dt + 1/2*a*dt^2 in the parent's space, orientation turned by a
-// constant spin), walked once in parent-first order; every operation here is a scalar, nothing is allocated.
-function computeWorld(t) {
-  for (let i = 0; i < orderSlots.length; i++) {
-    const slot = orderSlots[i], n = nodesBySlot[slot], d = n.desc, dt = t - d[0];
-    const lx = d[1] + d[4]*dt + 0.5*d[14]*dt*dt, ly = d[2] + d[5]*dt + 0.5*d[15]*dt*dt, lz = d[3] + d[6]*dt + 0.5*d[16]*dt*dt;
-    let qx = d[7], qy = d[8], qz = d[9], qw = d[10];
-    const wx = d[11], wy = d[12], wz = d[13], spin = Math.hypot(wx, wy, wz);
-    if (spin > 1e-12) {
-      const half = spin * dt / 2, s = Math.sin(half) / spin, sx = wx*s, sy = wy*s, sz = wz*s, sw = Math.cos(half);
-      const nqx = sw*qx + sx*qw + sy*qz - sz*qy, nqy = sw*qy - sx*qz + sy*qw + sz*qx;
-      const nqz = sw*qz + sx*qy - sy*qx + sz*qw, nqw = sw*qw - sx*qx - sy*qy - sz*qz;
-      qx = nqx; qy = nqy; qz = nqz; qw = nqw;
-    }
-    const p = parentSlot[slot];
-    const pwx = worldQuatX[p], pwy = worldQuatY[p], pwz = worldQuatZ[p], pww = worldQuatW[p];
-    // rotate (lx,ly,lz) by the parent's world orientation
-    const tx = 2*(pwy*lz - pwz*ly), ty = 2*(pwz*lx - pwx*lz), tz = 2*(pwx*ly - pwy*lx);
-    const rx = lx + pww*tx + pwy*tz - pwz*ty, ry = ly + pww*ty + pwz*tx - pwx*tz, rz = lz + pww*tz + pwx*ty - pwy*tx;
-    worldPosX[slot] = worldPosX[p] + rx; worldPosY[slot] = worldPosY[p] + ry; worldPosZ[slot] = worldPosZ[p] + rz;
-    // compose orientation: parentWorldQuat * localQuat
-    worldQuatX[slot] = pww*qx + pwx*qw + pwy*qz - pwz*qy;
-    worldQuatY[slot] = pww*qy - pwx*qz + pwy*qw + pwz*qx;
-    worldQuatZ[slot] = pww*qz + pwx*qy - pwy*qx + pwz*qw;
-    worldQuatW[slot] = pww*qw - pwx*qx - pwy*qy - pwz*qz;
-  }
-}
-
-// ---------- clock: estimate server (game-time) offset from ping round trips; evaluate at that time + a user offset
-let offset = null, bestRtt = Infinity, rttAvg = 0, jitter = 0, delay = 0.05, worker = null;
-function serverNow() { return performance.now() / 1000 + (offset ?? 0); }
-let timeOffset = 0; // seconds, user-controlled ("now" by default)
-function evalTime() { return serverNow() - delay + timeOffset; }
-
-// ---------- connection + traffic stats (rate, KB/s, snapshot load time, time since last batch), surfaced in the HUD
-const base = /\.[a-z0-9]+$/i.test(location.pathname) ? location.pathname.replace(/[^/]*$/, '') : location.pathname.replace(/\/?$/, '/');
-const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + base + 'ws';
-let ws, socketState = 'connecting';
-let bytesSinceStats = 0, bps = 0, descsSinceStats = 0, dps = 0;
-let snapshotStart = 0, snapshotBytes = 0, snapshotLoadMs = null, lastBatchAt = null;
-function connect() {
-  ws = new WebSocket(url);
-  ws.binaryType = 'arraybuffer';
-  ws.onopen = () => { socketState = 'joining'; ping(); };
-  clearInterval(window.pinger); window.pinger = setInterval(ping, 1000);
-  ws.onclose = () => { socketState = 'reconnecting'; setTimeout(connect, 1500); };
-  ws.onmessage = e => {
-    if (typeof e.data !== 'string') { bytesSinceStats += e.data.byteLength; applyBatch(new DataView(e.data)); return; }
-    bytesSinceStats += e.data.length;
-    const m = JSON.parse(e.data);
-    if (m.type === 'pong') {
-      worker = m.w;
-      const now = performance.now() / 1000, rtt = now - m.c;
-      rttAvg = rttAvg ? rttAvg * 0.9 + rtt * 0.1 : rtt;
-      jitter = jitter * 0.9 + Math.abs(rtt - rttAvg) * 0.1;
-      if (rtt <= bestRtt * 1.2 || offset === null) { bestRtt = Math.min(bestRtt, rtt); offset = m.s + rtt / 2 - now; }
-      delay = Math.max(0.03, rttAvg / 2 + 3 * jitter);
-    } else if (m.type === 'snapshot') {
-      if ((m.part ?? 0) === 0) { snapshotStart = performance.now(); snapshotBytes = 0; }
-      snapshotBytes += e.data.length;
-      applySnapshot(m);
-      if ((m.part ?? 0) === (m.parts ?? 1) - 1) snapshotLoadMs = performance.now() - snapshotStart;
-    }
-  };
-}
-function ping() { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'ping', c: performance.now() / 1000 })); }
-
-// ---------- snapshot -> the flat slot arrays (computeWorld) + the three.js objects (meshes, points cloud, labels)
-function applySnapshot(m) {
-  if ((m.part ?? 0) === 0) { nodesById = new Map(); epoch = m.epoch; }
-  gameTimeKnown = m.t;
-  for (const e of m.nodes) {
-    const [id, parentId, name, radius, kind, ...desc] = e;
-    nodesById.set(id, { id, parentId, name, radius, kind, desc, slot: 0 });
-  }
-  if ((m.part ?? 0) === (m.parts ?? 1) - 1) {
-    socketState = 'live';
-    nameToId = new Map();
-    const slotCount = nodesById.size + 1;
-    nodesBySlot = new Array(slotCount); nodesBySlot[0] = null;
-    orderSlots = new Int32Array(nodesById.size);
-    parentSlot = new Int32Array(slotCount);
-    radiusArr = new Float64Array(slotCount); colorArr = new Float32Array(slotCount * 3);
-    worldPosX = new Float64Array(slotCount); worldPosY = new Float64Array(slotCount); worldPosZ = new Float64Array(slotCount);
-    worldQuatX = new Float64Array(slotCount); worldQuatY = new Float64Array(slotCount); worldQuatZ = new Float64Array(slotCount); worldQuatW = new Float64Array(slotCount);
-    worldQuatW[0] = 1;
-    let slot = 1;
-    const idToSlot = new Map();
-    const drawable = [], large = [], meshKinds = [], pointKinds = [];
-    for (const [id, n] of nodesById) {
-      n.slot = slot; idToSlot.set(id, slot); nodesBySlot[slot] = n;
-      orderSlots[slot - 1] = slot;
-      radiusArr[slot] = n.radius;
-      const col = colorFor(n); colorArr[slot*3] = col[0]; colorArr[slot*3+1] = col[1]; colorArr[slot*3+2] = col[2];
-      if (n.name) nameToId.set(n.name, id);
-      if (n.kind !== KIND_ANCHOR && n.kind !== KIND_ORBIT_FRAME && n.radius > 0) {
-        drawable.push(slot);
-        // LOD split: the handful of star/planet/moon bodies each get a real mesh (fixed 1:1, built once here - no
-        // per-frame pool reassignment needed, there are only ever a couple dozen); every asteroid is a Point.
-        (n.kind === KIND_ASTEROID ? pointKinds : meshKinds).push(slot);
-      }
-      if (n.radius > 500 && n.kind !== KIND_STAR) large.push(slot);
-      slot++;
-    }
-    for (const [id, n] of nodesById) parentSlot[n.slot] = n.parentId === 0 ? 0 : (idToSlot.get(n.parentId) ?? 0);
-    drawableSlots = new Int32Array(drawable); largeSlots = new Int32Array(large);
-
-    // (re)build the body meshes: dispose the old ones first (a reconnect could change the node set)
-    for (const { mesh } of meshSlots) { scene.remove(mesh); mesh.material.dispose(); }
-    meshSlots = meshKinds.map(s => {
-      const n = nodesBySlot[s];
-      const mesh = new THREE.Mesh(sphereGeo, makeBodyMaterial(colorFor(n), n.kind === KIND_STAR, n.radius));
-      scene.add(mesh);
-      return { slot: s, mesh };
-    });
-    const sunMeshEntry = meshSlots.find(e => nodesBySlot[e.slot].kind === KIND_STAR);
-    if (sunMeshEntry) sunLight.userData.slot = sunMeshEntry.slot;
-
-    // (re)build the points cloud (the asteroid belt, mostly)
-    if (pointsObj) { scene.remove(pointsObj); pointsObj.geometry.dispose(); }
-    pointSlots = pointKinds;
-    const posArr = new Float32Array(pointSlots.length * 3);
-    const radArr = new Float32Array(pointSlots.length);
-    const colArr = new Float32Array(pointSlots.length * 3);
-    pointSlots.forEach((s, i) => { radArr[i] = radiusArr[s]; colArr[i*3] = colorArr[s*3]; colArr[i*3+1] = colorArr[s*3+1]; colArr[i*3+2] = colorArr[s*3+2]; });
-    const pointsGeo = new THREE.BufferGeometry();
-    pointsGeo.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
-    pointsGeo.setAttribute('aRadius', new THREE.BufferAttribute(radArr, 1));
-    pointsGeo.setAttribute('aColor', new THREE.BufferAttribute(colArr, 3));
-    pointsGeo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), Infinity); // positions are camera-relative and move every frame
-    pointsObj = new THREE.Points(pointsGeo, pointsMaterial);
-    pointsObj.frustumCulled = false;
-    scene.add(pointsObj);
-
-    const order1 = ['Sun', 'Mercury', 'Venus', 'Earth', 'Moon', 'Mars', 'Phobos', 'Deimos', 'Jupiter', 'Io', 'Europa', 'Ganymede', 'Callisto', 'Saturn', 'Titan', 'Uranus', 'Neptune'];
-    targetList = order1.map(n => nameToId.get(n)).filter(id => id !== undefined);
-    buildLabels();
-    if (!initialCameraSet) setInitialCamera();
-  }
-}
-// a batch of descriptions: id (uint32) + t0 (float64) + 16 float32s. Writes straight into the node's own small
-// `desc` array (replaced, not mutated in place, so computeWorld never sees a half-written record) - this only
-// happens when a body actually refits (per SolarGame's docblock, every few minutes to about a day), not per frame.
-function applyBatch(v) {
-  if (v.getUint8(0) !== 1) return;
-  lastBatchAt = performance.now();
-  for (let o = 9; o + 76 <= v.byteLength; o += 76) {
-    const id = v.getUint32(o, true), n = nodesById.get(id);
-    if (!n) continue;
-    const d = [v.getFloat64(o + 4, true)];
-    for (let k = 0; k < 16; k++) d.push(v.getFloat32(o + 12 + 4 * k, true));
-    n.desc = d;
-    descsSinceStats++;
-  }
-}
-connect();
-
-// ---------- camera: a target body, orbited at (distance, yaw, pitch); flyTo() blends world position over a fixed
-// wall-clock duration regardless of real distance ("faster than light"), then tracking resumes as the target moves
-let target = null, distance = 50000, yaw = 0, pitch = 0.25, initialCameraSet = false, travel = null;
-let drag = null, pointers = new Map(), pinch = null, lastTap = null;
-function offsetVector(d, yaw, pitch) { return [d * Math.cos(pitch) * Math.sin(yaw), d * Math.sin(pitch), d * Math.cos(pitch) * Math.cos(yaw)]; }
-function defaultDistanceFor(id) {
-  const n = nodesById.get(id);
-  if (!n) return 50000;
-  return n.name === 'Sun' ? n.radius * 3.5 : Math.max(n.radius * 7, 1500);
-}
-function easeInOutCubic(t) { return t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t + 2, 3) / 2; }
-function cameraWorldPos() {
-  if (travel) {
-    const elapsed = (performance.now() - travel.start) / travel.duration;
-    if (elapsed >= 1) { distance = travel.toDistance; travel = null; }
-    else {
-      const e = easeInOutCubic(Math.min(1, elapsed));
-      const toPos = posOf(travel.toId);
-      distance = lerp(travel.fromDistance, travel.toDistance, e);
-      const off = offsetVector(distance, yaw, pitch);
-      const toCam = [toPos[0] + off[0], toPos[1] + off[1], toPos[2] + off[2]];
-      return [lerp(travel.from[0], toCam[0], e), lerp(travel.from[1], toCam[1], e), lerp(travel.from[2], toCam[2], e)];
-    }
-  }
-  const p = posOf(target), off = offsetVector(distance, yaw, pitch);
-  return [p[0] + off[0], p[1] + off[1], p[2] + off[2]];
-}
-function flyTo(id, customDistance) {
-  if (id === undefined || id === null || !nodesById.has(id)) return;
-  if (id === target && !travel) return;
-  const from = cameraWorldPos();
-  travel = { from, fromDistance: distance, toId: id, toDistance: customDistance ?? defaultDistanceFor(id), start: performance.now(), duration: 3000 };
-  target = id;
-}
 function setInitialCamera() {
-  computeWorld(gameTimeKnown);
   const earth = nameToId.get('Earth'), moon = nameToId.get('Moon');
-  target = earth ?? targetList[0] ?? null;
-  if (earth !== undefined && moon !== undefined) {
-    const pe = posOf(earth), pm = posOf(moon), diff = sub(pm, pe), dist = Math.hypot(...diff), dir = norm(diff);
-    distance = Math.max(dist * 0.85, 40000);
-    yaw = Math.atan2(-dir[0], -dir[2]); pitch = Math.max(-1.4, Math.min(1.4, Math.asin(-dir[1])));
-  } else { distance = 50000; }
+  if (earth === undefined) return;
   initialCameraSet = true;
+  game.camera.target(earth);
+  if (moon === undefined) return;
+  // frame both Earth and the Moon: aim the camera from the far side of the pair, at a distance that fits both
+  const pe = game.nodePosition(earth), pm = game.nodePosition(moon);
+  const diff = [pm[0]-pe[0], pm[1]-pe[1], pm[2]-pe[2]], dist = Math.hypot(...diff);
+  const dir = diff.map(v => v / (dist || 1));
+  game.camera.distance = Math.max(dist * 0.85, 40000);
+  game.camera.yaw = Math.atan2(-dir[0], -dir[2]);
+  game.camera.pitch = Math.max(-1.4, Math.min(1.4, Math.asin(-dir[1])));
 }
 
-canvas.addEventListener('pointerdown', e => {
-  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, t0: performance.now() });
-  canvas.setPointerCapture(e.pointerId);
-  drag = pointers.size === 1 ? [e.clientX, e.clientY] : null;
-  pinch = null;
-});
-canvas.addEventListener('pointermove', e => {
-  const p = pointers.get(e.pointerId);
-  if (!p) return;
-  p.x = e.clientX; p.y = e.clientY;
-  if (pointers.size === 2) {
-    const [a, b] = [...pointers.values()], span = Math.hypot(a.x - b.x, a.y - b.y);
-    if (pinch) distance = Math.max(0.5, Math.min(2e10, distance * pinch / span));
-    pinch = span;
-  } else if (drag) {
-    yaw -= (e.clientX - drag[0]) * 0.006; pitch = Math.max(-1.45, Math.min(1.45, pitch + (e.clientY - drag[1]) * 0.006)); drag = [e.clientX, e.clientY];
-  }
-});
-function pointerEnd(e) {
-  const p = pointers.get(e.pointerId);
-  pointers.delete(e.pointerId); drag = null; pinch = null;
-  if (!p || e.pointerType === 'mouse' || e.type === 'pointercancel') return;
-  const now = performance.now();
-  if (now - p.t0 > 300 || Math.hypot(e.clientX - p.x0, e.clientY - p.y0) > 12) { lastTap = null; return; }
-  if (lastTap && now - lastTap.t < 350) { lastTap = null; distance = Math.max(0.5, distance * 0.4); return; }
-  lastTap = { t: now, x: e.clientX, y: e.clientY };
-}
-canvas.addEventListener('pointerup', pointerEnd);
-canvas.addEventListener('pointercancel', pointerEnd);
-canvas.addEventListener('wheel', e => { e.preventDefault(); distance = Math.max(0.5, Math.min(2e10, distance * Math.exp(e.deltaY * 0.0012))); }, { passive: false });
 addEventListener('keydown', e => {
-  if (e.key === 'p' || e.key === 'P') { showPerf = !showPerf; return; }
-  if (e.code === 'Tab') { e.preventDefault(); if (targetList.length) { const i = targetList.indexOf(target); flyTo(targetList[(i + 1 + targetList.length) % targetList.length]); } return; }
+  if (e.code === 'Tab') { e.preventDefault(); if (targetList.length) { const i = targetList.indexOf(game.camera.targetId); game.camera.flyTo(targetList[(i + 1 + targetList.length) % targetList.length]); } return; }
   if (e.code >= 'Digit0' && e.code <= 'Digit9') {
     const names = ['Sun', 'Mercury', 'Venus', 'Earth', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune', 'Moon'];
-    const idx = parseInt(e.code.slice(5), 10); flyTo(nameToId.get(names[idx]));
+    game.camera.flyTo(nameToId.get(names[parseInt(e.code.slice(5), 10)]));
   }
 });
+// a label (built by phame.js from this scene's Label nodes) flies the camera there on click - to the label's
+// parent (the body it names), not the label itself, which has no geometry to size the flight's arrival distance by
+game.on('labelclick', id => { const n = game.nodes.find(n => n.id === id); if (n) game.camera.flyTo(n.parentId); });
 
 // ---------- time control panel
 const tSlider = document.getElementById('tSlider'), timeLabel = document.getElementById('timeLabel');
-function setOffsetHours(h) { timeOffset = h * 3600; tSlider.value = Math.max(-720, Math.min(720, h)); }
-document.getElementById('tMinusDay').onclick = () => setOffsetHours(timeOffset / 3600 - 24);
-document.getElementById('tMinusHour').onclick = () => setOffsetHours(timeOffset / 3600 - 1);
+function setOffsetHours(h) { game.timeOffset = h * 3600; tSlider.value = Math.max(-720, Math.min(720, h)); }
+document.getElementById('tMinusDay').onclick = () => setOffsetHours(game.timeOffset / 3600 - 24);
+document.getElementById('tMinusHour').onclick = () => setOffsetHours(game.timeOffset / 3600 - 1);
 document.getElementById('tNow').onclick = () => setOffsetHours(0);
-document.getElementById('tPlusHour').onclick = () => setOffsetHours(timeOffset / 3600 + 1);
-document.getElementById('tPlusDay').onclick = () => setOffsetHours(timeOffset / 3600 + 24);
-tSlider.oninput = () => { timeOffset = Number(tSlider.value) * 3600; };
+document.getElementById('tPlusHour').onclick = () => setOffsetHours(game.timeOffset / 3600 + 1);
+document.getElementById('tPlusDay').onclick = () => setOffsetHours(game.timeOffset / 3600 + 24);
+tSlider.oninput = () => { game.timeOffset = Number(tSlider.value) * 3600; };
 document.getElementById('eclipse').onclick = () => {
-  if (epoch === null) return;
+  if (game.epoch === null) return;
   const eclipseUnix = Date.UTC(2026, 7, 28, 4, 13, 0) / 1000;
-  timeOffset = (eclipseUnix - epoch) - (serverNow() - delay);
-  setOffsetHours(timeOffset / 3600);
+  game.timeOffset = (eclipseUnix - game.epoch) - (game.evalTime - game.timeOffset);
+  setOffsetHours(game.timeOffset / 3600);
   const moon = nameToId.get('Moon');
-  if (moon !== undefined) flyTo(moon, Math.max((nodesById.get(moon)?.radius ?? 1737) * 8, 9000));
+  if (moon !== undefined) game.camera.flyTo(moon, 9000);
 };
 
-// ---------- CSS2D labels: planets and major moons only (targetList)
-let labelObjs = new Map();
-function buildLabels() {
-  for (const { obj } of labelObjs.values()) { scene.remove(obj); obj.element.remove(); }
-  labelObjs = new Map();
-  for (const id of targetList) {
-    const n = nodesById.get(id);
-    const el = document.createElement('div');
-    el.className = 'label'; el.innerHTML = `<span class="dot"></span>${n.name}`;
-    el.onclick = () => flyTo(id);
-    const obj = new CSS2DObject(el);
-    scene.add(obj);
-    labelObjs.set(id, { obj });
-  }
-}
-
-// ---------- occluder reselection: a plain scalar nearest-N scan over the (small, ~20-body) large-body list, run a
-// few times a second rather than every frame - the result barely changes between calls since orbits move slowly.
-let occSlots = new Int32Array(4), occCount = 0, lastOccAt = -Infinity;
-function maybeReselectOccluders(t) {
-  if (t - lastOccAt < 0.3 && occCount > 0) return;
-  lastOccAt = t;
-  const targetN = nodesById.get(target);
-  if (!targetN) { occCount = 0; return; }
-  const tx = worldPosX[targetN.slot], ty = worldPosY[targetN.slot], tz = worldPosZ[targetN.slot];
-  // insertion into a fixed-size top-4 (by distance), no sort(), no allocation
-  const bestSlot = [-1, -1, -1, -1], bestD = [Infinity, Infinity, Infinity, Infinity];
-  for (let i = 0; i < largeSlots.length; i++) {
-    const slot = largeSlots[i];
-    if (slot === targetN.slot) continue;
-    const dx = worldPosX[slot] - tx, dy = worldPosY[slot] - ty, dz = worldPosZ[slot] - tz;
-    const d = dx*dx + dy*dy + dz*dz;
-    for (let k = 0; k < 4; k++) {
-      if (d < bestD[k]) {
-        for (let j = 3; j > k; j--) { bestD[j] = bestD[j-1]; bestSlot[j] = bestSlot[j-1]; }
-        bestD[k] = d; bestSlot[k] = slot;
-        break;
-      }
-    }
-  }
-  occCount = 0;
-  for (let k = 0; k < 4; k++) if (bestSlot[k] >= 0) occSlots[occCount++] = bestSlot[k];
-}
-
-// ---------- render
-let frames = 0, fps = 0, lastStats = performance.now();
-let camPos = [0, 0, 0];
+// ---------- HUD
 let showPerf = false;
-const T = { tree: 0, occ: 0, mesh: 0, points: 0, render: 0, labels: 0, hud: 0, total: 0 };
-function ema(k, ms) { T[k] = T[k] ? T[k] * 0.9 + ms * 0.1 : ms; }
-// diagnostic (kept from chasing an earlier broken-geometry bug): every drawn mesh's screen-space radius is checked
-// against the viewport so a runaway sphere shows up in the console log instead of as garbled pixels.
-let lastMaxScreenPx = 0, lastMaxScreenName = '-', lastCulledMesh = 0;
-
-let lastCw = -1, lastCh = -1;
-function frame() {
-  const t0f = performance.now();
-  const cw = canvas.clientWidth || 1, ch = canvas.clientHeight || 1;
-  if (cw !== lastCw || ch !== lastCh) {
-    renderer.setSize(cw, ch, false);
-    cssRenderer.setSize(cw, ch);
-    camera.aspect = cw / ch; camera.updateProjectionMatrix();
-    lastCw = cw; lastCh = ch;
-  }
-  if (renderer.getPixelRatio() !== dprCap) renderer.setPixelRatio(dprCap);
-
-  if (drawableSlots.length) {
-    const t = evalTime();
-    const s0 = performance.now();
-    computeWorld(t);
-    const s1 = performance.now(); ema('tree', s1 - s0);
-
-    camPos = cameraWorldPos();
-    const camX = camPos[0], camY = camPos[1], camZ = camPos[2];
-    const targetN = nodesById.get(target);
-    const tgtX = targetN ? worldPosX[targetN.slot] - camX : 0, tgtY = targetN ? worldPosY[targetN.slot] - camY : 0, tgtZ = targetN ? worldPosZ[targetN.slot] - camZ : 0;
-    camera.position.set(0, 0, 0);
-    camera.up.set(0, 1, 0);
-    camera.lookAt(tgtX, tgtY, tgtZ);
-    const fwdLen = Math.hypot(tgtX, tgtY, tgtZ) || 1, fwdX = tgtX / fwdLen, fwdY = tgtY / fwdLen, fwdZ = tgtZ / fwdLen;
-
-    const s2 = performance.now();
-    maybeReselectOccluders(t);
-    const sunId = nameToId.get('Sun'), sunN = sunId !== undefined ? nodesById.get(sunId) : null;
-    const sunX = sunN ? worldPosX[sunN.slot] - camX : 0, sunY = sunN ? worldPosY[sunN.slot] - camY : 0, sunZ = sunN ? worldPosZ[sunN.slot] - camZ : 0;
-    sharedUniforms.uSunPos.value.set(sunX, sunY, sunZ);
-    sharedUniforms.uSunRadius.value = sunN ? sunN.radius : 696000;
-    sharedUniforms.uOccCount.value = occCount;
-    for (let i = 0; i < occCount; i++) {
-      const slot = occSlots[i];
-      sharedUniforms.uOccPos.value[i].set(worldPosX[slot] - camX, worldPosY[slot] - camY, worldPosZ[slot] - camZ);
-      sharedUniforms.uOccRadius.value[i] = radiusArr[slot];
-    }
-    sunLight.position.set(sunX, sunY, sunZ);
-    const s3 = performance.now(); ema('occ', s3 - s2);
-
-    // body meshes: position/orient/scale each of the ~18 star/planet/moon meshes; hide any wholly behind the near
-    // plane (three's own frustum culling handles everything else that's off-screen but in front of the camera).
-    const minPixels = 2.5, screenFactor = (ch / 2) / Math.tan((camera.fov * Math.PI / 180) / 2);
-    const pixelScale = minPixels / screenFactor;
-    let maxScreenPx = 0, maxScreenName = '-', culled = 0;
-    for (const { slot, mesh } of meshSlots) {
-      const rx = worldPosX[slot] - camX, ry = worldPosY[slot] - camY, rz = worldPosZ[slot] - camZ;
-      const distCam = Math.hypot(rx, ry, rz);
-      const trueRadius = radiusArr[slot];
-      const renderRadius = Math.max(trueRadius, distCam * pixelScale);
-      const viewZ = rx * fwdX + ry * fwdY + rz * fwdZ;
-      if (viewZ + renderRadius < NEAR) { mesh.visible = false; culled++; continue; }
-      mesh.visible = true;
-      mesh.position.set(rx, ry, rz);
-      mesh.scale.setScalar(renderRadius);
-      mesh.quaternion.set(worldQuatX[slot], worldQuatY[slot], worldQuatZ[slot], worldQuatW[slot]);
-      const px = trueRadius / Math.max(distCam, 1e-9) * screenFactor;
-      if (px > maxScreenPx) { maxScreenPx = px; maxScreenName = nodesBySlot[slot].name || '(unnamed)'; }
-    }
-    lastMaxScreenPx = maxScreenPx; lastMaxScreenName = maxScreenName; lastCulledMesh = culled;
-    const s4 = performance.now(); ema('mesh', s4 - s3);
-
-    // the points cloud (asteroids): one scalar loop over preallocated typed arrays, no per-point allocation
-    if (pointsObj) {
-      const posAttr = pointsObj.geometry.attributes.position, arr = posAttr.array;
-      for (let i = 0; i < pointSlots.length; i++) {
-        const slot = pointSlots[i], o = i * 3;
-        arr[o] = worldPosX[slot] - camX; arr[o+1] = worldPosY[slot] - camY; arr[o+2] = worldPosZ[slot] - camZ;
-      }
-      posAttr.needsUpdate = true;
-      pointsUniforms.uScreenFactor.value = screenFactor;
-    }
-    const s5 = performance.now(); ema('points', s5 - s4);
-
-    renderer.render(scene, camera);
-    const s6 = performance.now(); ema('render', s6 - s5);
-
-    // labels: three.js's CSS2DRenderer does the screen-space projection; just keep each label's world (camera-
-    // relative) position current and let it decide visibility/placement.
-    for (const [id, { obj }] of labelObjs) {
-      const n = nodesById.get(id);
-      if (n) obj.position.set(worldPosX[n.slot] - camX, worldPosY[n.slot] - camY, worldPosZ[n.slot] - camZ);
-    }
-    cssRenderer.render(scene, camera);
-    const s7 = performance.now(); ema('labels', s7 - s6);
-    updateHud(t);
-    const s8 = performance.now(); ema('hud', s8 - s7);
-  }
-
-  frames++;
-  const now = performance.now();
-  ema('total', now - t0f);
-  if (now - lastStats >= 500) {
-    const secs = (now - lastStats) / 1000;
-    fps = frames / secs; bps = bytesSinceStats / secs; dps = descsSinceStats / secs;
-    frames = 0; bytesSinceStats = 0; descsSinceStats = 0; lastStats = now;
-    if (fps < 45 && dprCap > 1) dprCap = Math.max(1, dprCap - 0.25);
-    else if (fps > 58 && dprCap < 2) dprCap = Math.min(2, dprCap + 0.25);
-    console.log(`[solar] fps=${fps.toFixed(0)} tree=${T.tree.toFixed(2)}ms occ=${T.occ.toFixed(2)}ms mesh=${T.mesh.toFixed(2)}ms points=${T.points.toFixed(2)}ms render=${T.render.toFixed(2)}ms labels=${T.labels.toFixed(2)}ms hud=${T.hud.toFixed(2)}ms total=${T.total.toFixed(2)}ms meshes=${meshSlots.length} points=${pointSlots.length} dpr=${dprCap} maxScreenPx=${lastMaxScreenPx.toFixed(1)}(${lastMaxScreenName}) culledMeshes=${lastCulledMesh}`);
-  }
-  requestAnimationFrame(frame);
-}
-
+addEventListener('keydown', e => { if (e.key === 'p' || e.key === 'P') showPerf = !showPerf; });
 function formatDistance(km) { return km > AU * 0.1 ? (km / AU).toFixed(3) + ' AU' : km.toLocaleString(undefined, { maximumFractionDigits: 0 }) + ' km'; }
-let lastHudAt = 0;
-function updateHud(t) {
-  const now = performance.now();
-  if (now - lastHudAt < 200) return;
-  lastHudAt = now;
-  const tn = nodesById.get(target);
-  const dist = tn ? Math.hypot(worldPosX[tn.slot] - camPos[0], worldPosY[tn.slot] - camPos[1], worldPosZ[tn.slot] - camPos[2]) : 0;
-  const date = epoch !== null ? new Date((epoch + t) * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' UTC' : '?';
-  const lastUpdate = lastBatchAt === null ? 'none yet' : ((now - lastBatchAt) / 1000).toFixed(0) + 's ago';
-  let perf = '';
-  if (showPerf) {
-    perf = `\n<span class="k">tree</span> ${T.tree.toFixed(2)}ms <span class="k">occ</span> ${T.occ.toFixed(2)}ms <span class="k">mesh</span> ${T.mesh.toFixed(2)}ms\n` +
-      `<span class="k">points</span> ${T.points.toFixed(2)}ms <span class="k">render</span> ${T.render.toFixed(2)}ms <span class="k">labels</span> ${T.labels.toFixed(2)}ms\n` +
-      `<span class="k">total</span> ${T.total.toFixed(2)}ms <span class="k">dpr</span> ${dprCap.toFixed(2)}`;
-  }
+game.on('tick', t => {
+  const id = game.camera.targetId;
+  const p = game.nodePosition(id), cam = game.cameraPosition;
+  const dist = Math.hypot(p[0]-cam[0], p[1]-cam[1], p[2]-cam[2]);
+  const date = game.epoch !== null ? new Date((game.epoch + t) * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' UTC' : '?';
+  const s = game.stats;
+  const perf = showPerf ? `\n<span class="k">dpr</span> ${s.dprCap.toFixed(2)} <span class="k">rtt</span> ${(s.rtt*1000).toFixed(0)}ms` : '';
   hud.innerHTML = `<b>phasync+Phame: Tech preview</b>\n` +
-    `<span class="k">target</span> ${tn ? tn.name || 'unnamed' : '-'}${travel ? ' (travelling…)' : ''}\n` +
+    `<span class="k">target</span> ${game.nodeName(id) || '-'}${game.camera.travelling ? ' (travelling…)' : ''}\n` +
     `<span class="k">distance</span> ${formatDistance(dist)}\n` +
     `<span class="k">time</span> ${date}\n` +
-    `<span class="k">fps</span> ${fps.toFixed(0)}${worker ? `  <span class="k">worker</span> ${worker}` : ''}\n` +
-    `<span class="k">socket</span> ${socketState}\n` +
-    `<span class="k">descriptions</span> ${dps.toFixed(2)}/s · ${(bps / 1024).toFixed(2)} KB/s\n` +
-    `<span class="k">snapshot</span> ${snapshotLoadMs !== null ? (snapshotBytes/1024).toFixed(0) + ' KB in ' + snapshotLoadMs.toFixed(0) + ' ms' : 'loading…'}\n` +
-    `<span class="k">last update</span> ${lastUpdate}` + perf;
-  timeLabel.textContent = timeOffset === 0 ? 'now' : (timeOffset > 0 ? '+' : '') + (timeOffset / 3600).toFixed(1) + 'h';
-}
-requestAnimationFrame(frame);
+    `<span class="k">fps</span> ${s.fps.toFixed(0)}${s.worker ? `  <span class="k">worker</span> ${s.worker}` : ''}\n` +
+    `<span class="k">socket</span> ${game.socketState}\n` +
+    `<span class="k">descriptions</span> ${s.dps.toFixed(2)}/s · ${(s.bps / 1024).toFixed(2)} KB/s\n` +
+    `<span class="k">snapshot</span> ${s.snapshotLoadMs !== null ? (s.snapshotBytes/1024).toFixed(0) + ' KB in ' + s.snapshotLoadMs.toFixed(0) + ' ms' : 'loading…'}` + perf;
+  timeLabel.textContent = game.timeOffset === 0 ? 'now' : (game.timeOffset > 0 ? '+' : '') + (game.timeOffset / 3600).toFixed(1) + 'h';
+});
 </script>
 </body>
 </html>

@@ -13,6 +13,13 @@ use Swerve\WebSocket;
 
 return new RequestHandler(function (ClientRequest $request) {
     $path = parse_url($request->getTarget(), PHP_URL_PATH) ?: '/';
+    if ($path === '/phame.js') {
+        // Phame's browser runtime ships with the engine, not with this server - see client/phame.js and
+        // docs/REMOTE-VIEW.md. public/ has no copy of it (and should not: one file, not kept in sync by hand).
+        $request->sendResponseHeaders(200, ['content-type' => 'text/javascript; charset=utf-8', 'cache-control' => 'no-cache']);
+        $request->write(file_get_contents(__DIR__ . '/../client/phame.js'));
+        return;
+    }
     if ($path === '/solar-system-war/ws') {
         // observer mode only: no input but join, see SolarGame's docblock for the wire protocol
         WebSocket::from($request, function (WebSocket $ws) {

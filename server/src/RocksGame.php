@@ -14,10 +14,22 @@ use Swerve\Swerve;
 abstract class Ball extends Mesh
 {
     private static ?Geometry $sphere = null;
+    /** @var array<class-string, MeshShader> one MeshShader per concrete class. */
+    private static array $shaders = [];
+    /** @var array<string, Material> one Material per (class, colour) pair, not one per ball: Net\View sends a
+     * Material's fields - including its shader's GLSL, a few KB - inline, every time that *Material object* is new
+     * (see docs/REMOTE-VIEW.md), regardless of whether its ->shader happens to be shared; a distinct Material per
+     * ball (needed, in View's model, for a per-ball colour) still meant the same GLSL repeated up to 700 times, a
+     * single snapshot chunk running to a megabyte against Swerve's 128 KiB ceiling (silently: the oversized publish
+     * just throws, which looks identical to the game never starting). The palette is only 6 colours - every rock
+     * (or marble) of the same colour now shares one Material, the node's own radius/position staying independent. */
+    private static array $materials = [];
 
     public function __construct(int $color)
     {
-        parent::__construct(self::$sphere ??= Geometry::sphere(1.0), new Material(color: $color, shader: static::material()));
+        $shader = self::$shaders[static::class] ??= static::material();
+        $material = self::$materials[static::class . '#' . $color] ??= new Material(color: $color, shader: $shader);
+        parent::__construct(self::$sphere ??= Geometry::sphere(1.0), $material);
     }
 
     abstract public static function material(): MeshShader;
@@ -71,6 +83,9 @@ final class Rock extends Ball
 final class Observer extends Mesh
 {
     private static ?Geometry $body = null;
+    private static ?MeshShader $shader = null;
+    /** @var array<int, Material> one per colour (see Ball's $materials for why this matters). */
+    private static array $materials = [];
     /** When (Unix time) the viewer's socket last spoke for them: a camera that goes quiet has gone. */
     public float $heard;
     /** Where the camera looks (a unit vector): down its -z, turned by its orientation. */
@@ -82,7 +97,9 @@ final class Observer extends Mesh
 
     public function __construct(public readonly string $client, int $color)
     {
-        parent::__construct(self::$body ??= Geometry::box(1.2, 0.84, 1.0), new Material(color: $color, shader: self::material()));
+        $shader = self::$shader ??= self::material();
+        $material = self::$materials[$color] ??= new Material(color: $color, shader: $shader);
+        parent::__construct(self::$body ??= Geometry::box(1.2, 0.84, 1.0), $material);
         $this->heard = microtime(true);
     }
 
@@ -184,6 +201,7 @@ final class RocksGame
                     self::$lock = $lock;   // held for the life of this worker
                     try {
                         self::$instance = new self();
+                        SolarGame::start();   // the other game this worker runs - see its own docblock
                         self::$instance->run();
                     } catch (\Throwable $e) {   // log it, and let another worker (or this one) start a new game
                         error_log('phame rocks game stopped: ' . $e);
