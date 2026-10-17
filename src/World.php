@@ -378,7 +378,8 @@ final class World
             DisplayObject::$stableFrame = -1;
         }
         $this->repairCertificates();
-        $now = $this->clock->time + 1e-9;
+        $tickEnd = $this->clock->time;
+        $now = $tickEnd + 1e-9;
         while ($this->heapCount > 0 && $this->heapTime[0] <= $now) {
             $waiter = $this->heapWaiter[0];
             $ticket = $this->heapGeneration[0];
@@ -396,12 +397,20 @@ final class World
                 }
             }
         }
+        // each at its exact time, not at the tick's end: the clock had already jumped straight to $tickEnd above (no
+        // stepping, unlike Space's own event loop), so a node whose expiry fell inside this tick is, by the time we
+        // get here, already extrapolated past it by whatever its rate carried it over the remaining fraction of the
+        // tick - exactly the wrong pose for a handler (a joint's bounce, say) that needs its generalized coordinates
+        // built from the pose *at* the event, not after it.
         while ($this->expireCount > 0 && $this->expireHeap[0]->validUntil <= $now) {
             $node = $this->expireHeap[0];
+            $at = $node->validUntil;
             $this->cancelExpiry($node);
             $node->validUntil = \INF;   // holds indefinitely again until a handler sets a new one
+            $this->clock->travelTo($at);
             $node->dispatchEvent(new Event(Event::EXPIRE));
         }
+        $this->clock->travelTo($tickEnd);
     }
 
     /*
