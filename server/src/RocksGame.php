@@ -95,7 +95,7 @@ final class Observer extends Mesh
     public float $droppedAt = 0.0;
     public int $ragdolls = 0;
 
-    public function __construct(public readonly string $client, int $color)
+    public function __construct(public readonly string $client, public readonly int $color)
     {
         $shader = self::$shader ??= self::material();
         $material = self::$materials[$color] ??= new Material(color: $color, shader: $shader);
