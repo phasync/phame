@@ -30,12 +30,6 @@ final class Body
     private array $joints = [];
     /** @var array<int, int> by joint (spl_object_id) -> its index into $joints. */
     private array $jointIndex = [];
-    /** M⁻¹ at the pose last built it, and the game time it was built at: positions only ever change between game
-     * time ticks (never within the synchronous span of one hit or one limit event), so a repeat call at the same
-     * time - effectiveInverseMass() immediately followed by applyImpulse(), say - reuses it instead of inverting
-     * the same matrix twice. */
-    private ?array $cachedMinv = null;
-    private float $cachedAt = -INF;
 
     public function __construct(public readonly Node3D $root)
     {
@@ -152,44 +146,66 @@ final class Body
                 }
             }
         }
-        // a small Tikhonov regularization: a random pose can bring two joints' axes and positions close enough to
-        // near-dependent columns that Gauss-Jordan elimination amplifies rounding error past what a sub-1
-        // restitution hit should ever cost in energy; this trades a negligible, uniform bias for that not
-        // happening, far below the scale of the masses and radii actually in play. jointLimitImpulse() additionally
-        // checks the one invariant that matters (kinetic energy cannot rise) and falls back to an uncoupled bounce
-        // whenever even this isn't enough - a many-jointed chain folded on itself (a rope ragdoll) can still bring
-        // M's smallest eigenvalue far closer to 0 than this constant, at which point M⁻¹ cannot be trusted at all.
-        for ($i = 0; $i < $n; ++$i) {
-            $m[$i][$i] += 1e-9;
-        }
         return $m;
     }
 
-    /** M⁻¹ at the current pose, from the cache if nothing has had a chance to move since it was built. */
-    private function inverseMassMatrix(): array
+    /**
+     * M's Cholesky factor L (M = LLᵀ), fresh from the current pose every time: M is symmetric positive definite for
+     * any pose as long as every generalized coordinate actually moves some real mass (see the class docblock's
+     * dof()), so this always succeeds for a correctly built Body - no inverse, no regularization needed. Built
+     * fresh (not cached) because a coupled solve's own applyDelta() can - through a different joint also due for
+     * its own limit at this same instant - advance that joint's position too (see nudgeJointRate()); a cache keyed
+     * only by game time would not see that. A failed decomposition (a non-positive pivot) means some generalized
+     * coordinate has no real inertia - a joint with nothing of its own hanging below it - and is a modelling bug in
+     * the body, not something to paper over here.
+     */
+    private function cholesky(): array
     {
-        $now = $this->root->clock?->time ?? 0.0;
-        if ($this->cachedMinv === null || $now !== $this->cachedAt) {
-            $this->cachedMinv = self::invert($this->massMatrix());
-            $this->cachedAt = $now;
+        $m = $this->massMatrix();
+        $n = count($m);
+        $l = array_fill(0, $n, array_fill(0, $n, 0.0));
+        for ($i = 0; $i < $n; ++$i) {
+            for ($j = 0; $j <= $i; ++$j) {
+                $s = $m[$i][$j];
+                for ($k = 0; $k < $j; ++$k) {
+                    $s -= $l[$i][$k] * $l[$j][$k];
+                }
+                if ($i === $j) {
+                    if ($s <= 0.0) {
+                        throw new \RuntimeException("Body's mass matrix is not positive definite at generalized coordinate $i (pivot {$s}): a joint with no real inertia of its own - give it the inertia of what hangs below it, or fold it out as a DOF");
+                    }
+                    $l[$i][$j] = sqrt($s);
+                } else {
+                    $l[$i][$j] = $s / $l[$j][$j];
+                }
+            }
         }
-        return $this->cachedMinv;
+        return $l;
     }
 
-    /** $jₙ · M⁻¹ · $jₙᵀ for a generalized-coordinate row $jn (length dof()): the quadratic form both
-     * effectiveInverseMass() and applyImpulse() need, computed once from the same $minv either already has. */
-    private static function quadraticForm(array $minv, array $jn): float
+    /** Solves M x = $rhs via $l (M's Cholesky factor): forward substitution (L y = rhs), then back substitution
+     * (Lᵀ x = y) - O(n²), the only work effectiveInverseMass(), applyImpulse() and jointLimitImpulse() need from
+     * M⁻¹, without ever forming it. */
+    private static function solve(array $l, array $rhs): array
     {
-        $n = count($jn);
-        $sum = 0.0;
+        $n = count($l);
+        $y = [];
         for ($i = 0; $i < $n; ++$i) {
-            $s = 0.0;
-            for ($k = 0; $k < $n; ++$k) {
-                $s += $minv[$i][$k] * $jn[$k];
+            $s = $rhs[$i];
+            for ($k = 0; $k < $i; ++$k) {
+                $s -= $l[$i][$k] * $y[$k];
             }
-            $sum += $jn[$i] * $s;
+            $y[$i] = $s / $l[$i][$i];
         }
-        return $sum;
+        $x = array_fill(0, $n, 0.0);
+        for ($i = $n - 1; $i >= 0; --$i) {
+            $s = $y[$i];
+            for ($k = $i + 1; $k < $n; ++$k) {
+                $s -= $l[$k][$i] * $x[$k];
+            }
+            $x[$i] = $s / $l[$i][$i];
+        }
+        return $x;
     }
 
     /**
@@ -203,7 +219,12 @@ final class Body
     {
         [$jv] = $this->jacobians($part);
         $jn = array_map(static fn (array $v) => $nx * $v[0] + $ny * $v[1] + $nz * $v[2], $jv);
-        return self::quadraticForm($this->inverseMassMatrix(), $jn);
+        $x = self::solve($this->cholesky(), $jn);
+        $sum = 0.0;
+        foreach ($jn as $i => $v) {
+            $sum += $v * $x[$i];
+        }
+        return $sum;
     }
 
     /** The current generalized velocity: the root's own linear and angular velocity, then one per joint, in the
@@ -229,7 +250,16 @@ final class Body
     {
         $qdot = $this->qdot();
         $m = $this->massMatrix();
-        return 0.5 * self::quadraticForm($m, $qdot);
+        $n = count($qdot);
+        $sum = 0.0;
+        for ($i = 0; $i < $n; ++$i) {
+            $s = 0.0;
+            for ($k = 0; $k < $n; ++$k) {
+                $s += $m[$i][$k] * $qdot[$k];
+            }
+            $sum += $qdot[$i] * $s;
+        }
+        return 0.5 * $sum;
     }
 
     /**
@@ -258,17 +288,8 @@ final class Body
     {
         [$jv] = $this->jacobians($part);
         $jn = array_map(static fn (array $v) => $nx * $v[0] + $ny * $v[1] + $nz * $v[2], $jv);
-        $minv = $this->inverseMassMatrix();
-        $n = $this->dof();
-        $delta = [];
-        for ($i = 0; $i < $n; ++$i) {
-            $s = 0.0;
-            for ($k = 0; $k < $n; ++$k) {
-                $s += $minv[$i][$k] * $jn[$k];
-            }
-            $delta[$i] = $s * $impulse;
-        }
-        $this->applyDelta($delta);
+        $x = self::solve($this->cholesky(), $jn);
+        $this->applyDelta(array_map(static fn (float $v) => $v * $impulse, $x));
     }
 
     /**
@@ -277,17 +298,16 @@ final class Body
      * target value instead of a world-space contact normal - the reaction this takes from the rest of the body
      * (root included) falls out of the same M⁻¹, not a separate rule.
      *
-     * A coupled solve is only as good as M⁻¹: at a pose where two joints' axes and positions are nearly dependent
-     * (a chain folded on itself - common for a many-jointed rope ragdoll), Gauss-Jordan elimination's M⁻¹ can be
-     * inaccurate enough that M·M⁻¹ meaningfully differs from the identity, and the usual guarantee that a bounce
-     * (bounce ≤ 1) never raises kinetic energy - exact whenever M⁻¹ is exact - breaks: a little energy slips in,
-     * and bounce after bounce (the common case for a limit under a sustained load) compounds it, eventually driving
-     * a joint's own rate (and so everything coupled to it) to the point where other parts of the engine - the
-     * compound's probing against nearby bodies, which bounds how fast it reschedules on a turning node's own
-     * angular speed - start firing thousands of times a second. The fix is to check the one invariant that matters
-     * (kinetic energy cannot rise here) and fall back to an uncoupled bounce - exactly what a joint without a Body
-     * already does - whenever the coupled solve would violate it: real articulation is lost only at the rare poses
-     * where M⁻¹ cannot be trusted, and energy is never gained.
+     * With M's exact Cholesky factor (no inverse, no regularization) and applyDelta() never clamping a joint it
+     * only touches through coupling (see nudgeJointRate()), this is energy non-increasing by construction whenever
+     * $newRate's bounce coefficient is at most 1: ΔKE = (newRate² - oldRate²) / (2·diag), diag = M⁻¹'s own (col,
+     * col) entry, always positive for a positive-definite M - provided M itself is built from the pose $joint was
+     * actually at when it crossed its limit. A tick advances game time in one jump (not step by step through each
+     * event the way Space's own contacts are), so by the time this runs, $joint's honest jointPositionNow() may
+     * already be past the limit by however far its rate carried it over the rest of the tick; the clock is
+     * rewound to the exact crossing instant (Node3D::jointCrossingTime()) for the whole solve, then restored - the
+     * same "handle it at its exact time" every other event in this engine already gets. The check below is then an
+     * assertion of the identity above, not a behaviour: if it ever fires, the solve has a real bug.
      */
     public function jointLimitImpulse(Node3D $joint, float $newRate): void
     {
@@ -296,57 +316,51 @@ final class Body
             return;
         }
         $col = 6 + $i;
-        $minv = $this->inverseMassMatrix();
-        $diag = $minv[$col][$col];
-        if ($diag < 1e-9) {
-            $joint->setJointRate($newRate);   // too close to singular (or, numerically, negative) to trust: bounce it alone
-            return;
+        $oldRate = $joint->jointRate;
+        $limit = $oldRate > 0.0 ? $joint->jointMax : $joint->jointMin;   // the side it was approaching
+        $clock = $this->root->clock;
+        $now = $clock?->time ?? 0.0;
+        $at = $clock !== null ? $joint->jointCrossingTime($limit) : $now;
+        $rewound = $clock !== null && $at < $now - 1e-9;
+        if ($rewound) {
+            $clock->travelTo($at);
         }
-        $tau = ($newRate - $joint->jointRate) / $diag;
         $n = $this->dof();
-        $delta = [];
-        for ($i2 = 0; $i2 < $n; ++$i2) {
-            $delta[$i2] = $minv[$i2][$col] * $tau;
-        }
-        $before = $this->snapshotVelocities();
+        $e = array_fill(0, $n, 0.0);
+        $e[$col] = 1.0;
+        $x = self::solve($this->cholesky(), $e);   // M⁻¹'s column $col, without ever forming M⁻¹
+        $tau = ($newRate - $oldRate) / $x[$col];
         $keBefore = $this->kineticEnergy();
-        $this->applyDelta($delta);
-        if ($this->kineticEnergy() > $keBefore + 1e-6 * max(1.0, abs($keBefore))) {
-            $this->restoreVelocities($before);
-            $joint->setJointRate($newRate);   // the coupled solve gained energy here: bounce it alone instead
+        $this->applyDelta(array_map(static fn (float $v) => $v * $tau, $x), $joint, $limit);
+        $keAfter = $this->kineticEnergy();
+        if ($rewound) {
+            $clock->travelTo($now);   // the rest of the engine still thinks it is "now"; every node's own rebase()
+            // mechanism correctly carries its new, post-impulse motion forward from $at to here
+        }
+        if ($keAfter > $keBefore + 1e-6 * max(1.0, abs($keBefore))) {
+            throw new \RuntimeException("jointLimitImpulse() gained energy ($keBefore -> $keAfter): the mass-matrix solve has a bug, not the pose");
         }
     }
 
-    /** The root's own velocity and spin, and every joint's own rate - what jointLimitImpulse() restores exactly if
-     * a coupled solve turns out untrustworthy at the current pose (see there). */
-    private function snapshotVelocities(): array
-    {
-        $root = $this->root;
-        return [$root->velocityX, $root->velocityY, $root->velocityZ, $root->mwx, $root->mwy, $root->mwz, array_map(static fn (Node3D $j) => $j->jointRate, $this->joints)];
-    }
-
-    private function restoreVelocities(array $snapshot): void
-    {
-        [$vx, $vy, $vz, $wx, $wy, $wz, $rates] = $snapshot;
-        $root = $this->root;
-        $root->setVelocity($vx, $vy, $vz);
-        $root->spin($wx, $wy, $wz);
-        foreach ($this->joints as $i => $joint) {
-            if ($joint->jointRate !== $rates[$i]) {
-                $joint->setJointRate($rates[$i]);
-            }
-        }
-    }
-
-    /** Applies a generalized velocity change (root linear, root angular, then one per joint) to the real tree. */
-    private function applyDelta(array $delta): void
+    /**
+     * Applies a generalized velocity change (root linear, root angular, then one per joint) to the real tree. $pin
+     * and $pinAt are jointLimitImpulse()'s own joint and the limit it just reached: every other joint this delta
+     * touches is only a coupling reaction (nudgeJointRate() - no clamp, see there), but the one whose own limit
+     * this is must land exactly on it, or a position that drifted past it from an earlier, unrelated coupling touch
+     * is never corrected and keeps re-triggering.
+     */
+    private function applyDelta(array $delta, ?Node3D $pin = null, float $pinAt = 0.0): void
     {
         $root = $this->root;
         $root->setVelocity($root->velocityX + $delta[0], $root->velocityY + $delta[1], $root->velocityZ + $delta[2]);
         $root->spin($root->mwx + $delta[3], $root->mwy + $delta[4], $root->mwz + $delta[5]);
         foreach ($this->joints as $i => $joint) {
             if ($delta[6 + $i] != 0.0) {
-                $joint->setJointRate($joint->jointRate + $delta[6 + $i]);
+                if ($joint === $pin) {
+                    $joint->pinJointAtLimit($pinAt, $joint->jointRate + $delta[6 + $i]);
+                } else {
+                    $joint->nudgeJointRate($joint->jointRate + $delta[6 + $i]);
+                }
             }
         }
     }
@@ -372,50 +386,4 @@ final class Body
         return [$x, $y, $z, $chain];
     }
 
-    /** The inverse of an N x N matrix (list of N rows of N floats), by Gauss-Jordan elimination with partial
-     * pivoting - called once per hit or limit event, not per tick, so O(N^3) for N ~ 10-20 costs nothing worth
-     * avoiding. A column that cannot be pivoted (a genuinely singular direction - an isolated point with nothing
-     * to turn it) is left as the identity's: that generalized coordinate just does not couple to anything else. */
-    private static function invert(array $m): array
-    {
-        $n = count($m);
-        $a = [];
-        for ($i = 0; $i < $n; ++$i) {
-            $row = $m[$i];
-            for ($j = 0; $j < $n; ++$j) {
-                $row[] = $i === $j ? 1.0 : 0.0;
-            }
-            $a[] = $row;
-        }
-        for ($col = 0; $col < $n; ++$col) {
-            $pivot = $col;
-            for ($r = $col + 1; $r < $n; ++$r) {
-                if (abs($a[$r][$col]) > abs($a[$pivot][$col])) {
-                    $pivot = $r;
-                }
-            }
-            if (abs($a[$pivot][$col]) < 1e-12) {
-                continue;
-            }
-            [$a[$col], $a[$pivot]] = [$a[$pivot], $a[$col]];
-            $div = $a[$col][$col];
-            for ($j = 0; $j < 2 * $n; ++$j) {
-                $a[$col][$j] /= $div;
-            }
-            for ($r = 0; $r < $n; ++$r) {
-                if ($r === $col || $a[$r][$col] == 0.0) {
-                    continue;
-                }
-                $factor = $a[$r][$col];
-                for ($j = 0; $j < 2 * $n; ++$j) {
-                    $a[$r][$j] -= $factor * $a[$col][$j];
-                }
-            }
-        }
-        $inv = [];
-        for ($i = 0; $i < $n; ++$i) {
-            $inv[] = array_slice($a[$i], $n);
-        }
-        return $inv;
-    }
 }
