@@ -266,9 +266,8 @@ $scenes = [
     'gravity' => buildGravityBox(...),
 ];
 
-// one scene, one run: used only as a subprocess (see below), so that phasync's event loop (process-wide state that
-// does not fully reset between top-level phasync::run() calls, confirmed by a "stalled" deadlock after a few dozen
-// runs in one process) never has to survive more than one scene
+// one scene, one run: used only as a subprocess (see below), so that each measurement starts from a fresh process
+// (memory, the cycle collector's buffers, opcache and JIT state) rather than inheriting the previous scene's
 $scene = null;
 $seconds = 5.0;
 foreach ($argv as $arg) {
