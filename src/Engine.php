@@ -112,15 +112,13 @@ final class Engine
     public function run(?\Closure $main = null): void
     {
         $this->quitRequested = false;
+        // World::run() itself rethrows a coroutine's failure (see there); nothing left to check here.
         phasync::run(fn () => $this->world->run(function (World $world) use ($main) {
             if ($main !== null) {
                 $world->go(fn () => $main($this));
             }
             $this->loop();
         }));
-        if (($failure = $this->world->takeFailure()) !== null) {
-            throw $failure;
-        }
     }
 
     /** See World::go(). */

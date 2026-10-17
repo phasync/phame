@@ -200,6 +200,9 @@ final class World
                     throw $e;   // cancelled from outside, not by the world's own ending
                 }
             }
+            if (($failure = $this->takeFailure()) !== null) {
+                throw $failure;   // a coroutine's exception stopped the world (see runGuarded()): don't swallow it
+            }
             return $result;
         });
     }

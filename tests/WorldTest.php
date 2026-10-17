@@ -48,14 +48,21 @@ final class WorldTest extends TestCase
         $a = new World();
         $b = new World();
         $bTicks = 0;
-        \phasync::run(static function () use ($a, $b, &$bTicks) {
-            \phasync::go(static fn () => $a->run(static function (World $w) {
-                $w->go(static function () { Async::awaitFrame(); throw new \RuntimeException('boom in a'); });
-                while (!$w->stopped) {
-                    $w->tick(0.1);
-                    \phasync::sleep(0);
+        $aFailure = null;
+        \phasync::run(static function () use ($a, $b, &$bTicks, &$aFailure) {
+            \phasync::go(static function () use ($a, &$aFailure) {
+                try {
+                    $a->run(static function (World $w) {
+                        $w->go(static function () { Async::awaitFrame(); throw new \RuntimeException('boom in a'); });
+                        while (!$w->stopped) {
+                            $w->tick(0.1);
+                            \phasync::sleep(0);
+                        }
+                    });
+                } catch (\RuntimeException $e) {
+                    $aFailure = $e;   // World::run() rethrows it (see there) instead of leaving it for takeFailure()
                 }
-            }));
+            });
             \phasync::go(static function () use ($b, &$bTicks) {
                 $b->run(static function (World $w) use (&$bTicks) {
                     for ($i = 0; $i < 5; ++$i, ++$bTicks) {
@@ -65,7 +72,8 @@ final class WorldTest extends TestCase
                 });
             });
         });
-        $this->assertSame('boom in a', $a->takeFailure()?->getMessage());
+        $this->assertSame('boom in a', $aFailure?->getMessage());
+        $this->assertNull($a->takeFailure(), 'run() already took it');
         $this->assertNull($b->takeFailure());
         $this->assertSame(5, $bTicks, 'b kept running');
         $a->dispose();
