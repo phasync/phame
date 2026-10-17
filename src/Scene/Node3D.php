@@ -383,7 +383,10 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
     }
 
     /** Wires the one-time reaction to a Hinge/Ball/Slider limit or a Rope going taut: turns back with $jointBounce
-     * of its speed, or stops when that is too slow to matter (0.05: a swing or slide, not a rope's own faster snap). */
+     * of its speed, or stops when that is too slow to matter. 0.3 rad/s (or units/s): below this, the next bounce
+     * would arrive before anything else about the joint has had a chance to change, over and over, forever (a Zeno
+     * point - the joint is, for every practical purpose, at rest against its stop); above it, the joint is still
+     * doing something a game or a viewer could tell apart from rest. The old (pre-Body) engine used the same 0.3. */
     private function wireJointExpiry(): void
     {
         if ($this->jointWired) {
@@ -408,7 +411,7 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
                 return;   // the expiry was for some other reason (already stopped here, or not due yet)
             }
             $rate = -$this->jointRate * $this->jointBounce;
-            $rate = abs($rate) < 0.05 ? 0.0 : $rate;
+            $rate = abs($rate) < 0.3 ? 0.0 : $rate;
             if ($this->body !== null) {
                 $this->body->jointLimitImpulse($this, $rate);   // the exact reaction on the rest of the body
             } else {
