@@ -325,10 +325,24 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
         return $this->jointPos + $this->jointRate * (($this->clock?->time ?? 0.0) - $this->jointSince);
     }
 
+    /** @internal The exact game time (absolute, not relative to now) at which this joint's current straight-line
+     * motion reaches $limit, from its own (jointPos, jointSince, jointRate) alone - what Body::jointLimitImpulse()
+     * rebuilds the mass matrix and applies the impulse at, instead of wherever the clock has since moved to (a
+     * coarse tick advances game time in one jump, not step by step through each event the way Space's own contacts
+     * are; by the time an 'expire' handler runs, this joint's honest jointPositionNow() can already be well past
+     * the limit it was due to reach partway through that tick). */
+    public function jointCrossingTime(float $limit): float
+    {
+        return $this->jointRate == 0.0 ? $this->jointSince : $this->jointSince + ($limit - $this->jointPos) / $this->jointRate;
+    }
+
     /**
      * Drives a Hinge, Ball or Slider from now on at $rate (rad/s or units/s); at a limit it can only move back
      * towards the other one (pushing further is clamped to 0). $axis redirects a Ball's own swing axis (Hinge and
-     * Slider ignore it - theirs is fixed); omitted, the joint keeps its current axis.
+     * Slider ignore it - theirs is fixed); omitted, the joint keeps its current axis. A game or a demo drives a
+     * joint through this; Body::applyDelta() does not (see nudgeJointRate()) - the clamp below is exactly the
+     * "pushing past a limit does nothing" contract this method promises its callers, not a general-purpose rate
+     * setter.
      */
     public function setJointRate(float $rate, ?array $axis = null): void
     {
@@ -339,6 +353,36 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
         if (($pos >= $this->jointMax && $rate > 0.0) || ($pos <= $this->jointMin && $rate < 0.0)) {
             $rate = 0.0;
         }
+        $this->setJointState($pos, $rate);
+    }
+
+    /**
+     * @internal Body::applyDelta()'s touch on a joint that is not the one whose own limit just fired: the coupled
+     * solve only ever changes velocities, never positions, so this honestly extrapolates where the joint already
+     * was (at its old rate, same bookkeeping setJointRate() uses) and sets the new rate - no clamp. A joint that
+     * happens to be independently overdue for its own limit at this same instant (two joints due at once) gets to
+     * run its own 'expire' handler for that in this same pass - World::advance()'s loop keeps processing every node
+     * whose validUntil has passed before game time moves on - rather than having this unrelated coupling discontinuously
+     * stop it first: that stop would not be the joint's own bounce (wrong coefficient, wrong direction handling) and
+     * silently breaks the one invariant a coupled impulse must keep (kinetic energy never rises for a bounce ≤ 1).
+     */
+    public function nudgeJointRate(float $rate): void
+    {
+        $this->setJointState($this->jointPositionNow(), $rate);
+    }
+
+    /** @internal Body::jointLimitImpulse() calls this, after applyDelta(), for the one joint whose own limit just
+     * fired: pins it exactly at $pos (jointMin or jointMax - nudgeJointRate() left it wherever its old rate's
+     * honest extrapolation put it, which is the limit only if nothing else had already nudged this same joint
+     * earlier in the same instant) and gives it its bounce rate. Without this, a joint whose position drifted past
+     * its limit through an earlier, unrelated coupling touch never gets back inside it, and keeps re-triggering. */
+    public function pinJointAtLimit(float $pos, float $rate): void
+    {
+        $this->setJointState($pos, $rate);
+    }
+
+    private function setJointState(float $pos, float $rate): void
+    {
         [$this->jointPos, $this->jointSince, $this->jointRate] = [$pos, $this->clock?->time ?? 0.0, $rate];
         match ($this->jointType) {
             \Phame\Physics\JointType::Hinge, \Phame\Physics\JointType::Ball => $this->driveHingeOrBall($pos, $rate),
@@ -370,7 +414,14 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
         if ($limit === INF || $limit === -INF) {
             return INF;
         }
-        return max(0.0, ($limit - $this->jointPositionNow()) / $this->jointRate);
+        $until = max(0.0, ($limit - $this->jointPositionNow()) / $this->jointRate);
+        // a joint already resting at its limit picks up a tiny residual rate every time a coupled impulse elsewhere
+        // in the body touches it (nudgeJointRate() never clamps a joint it only touches through coupling - see
+        // there); left as is, that rate would schedule - and immediately re-fire - its own expire forever, a Zeno
+        // point just like a real bounce below the same rest threshold (see wireJointExpiry()). Only a joint already
+        // AT its limit is affected: one genuinely approaching it, however slowly, still gets a real (if distant)
+        // $until.
+        return $until < 1e-9 && abs($this->jointRate) < 0.3 ? INF : $until;
     }
 
     /** Seconds until a Rope reaches its length ($jointMax), moving outward; INF while slack or unbounded. */
