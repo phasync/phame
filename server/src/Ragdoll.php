@@ -2,35 +2,39 @@
 
 namespace PhameServer;
 
+use Phame\Physics\Body;
 use Phame\Physics\Contact;
+use Phame\Physics\JointType;
+use Phame\Scene\Geometry;
+use Phame\Scene\Material;
+use Phame\Scene\Mesh;
 use Phame\Scene\Node3D;
-use Phame\Wake\Wake;
 use Phame\World;
 
 /**
- * A ragdoll as a tree: this invisible root carries the flight (a straight line and a tumble), hinge joints turn under
- * it at their own rates, and limbs sit still on the joints. While nothing hits it, a tumbling, flailing ragdoll is a
- * handful of motion descriptions and no events at all; a joint reaching its limit and a rock hitting a limb are the
- * only things that happen. Physics\Space sees it as one compound body.
+ * A ragdoll as a tree: this invisible root carries the flight (a straight line and a tumble), engine Hinge joints
+ * turn under it at their own rates, and limbs sit still on their joints. While nothing hits it, a tumbling,
+ * flailing ragdoll is a handful of motion descriptions and no events at all; a joint reaching its limit and a rock
+ * hitting a limb are the only things that happen - the joints' own limit events and a hit's momentum are both
+ * Physics\Body's job now (see docs/PHYSICS-PLAN.md's Phase 2), not this class's own.
  */
 final class Ragdoll extends Node3D
 {
     public const TYPES = ['dummy', 'spider', 'rope', 'starfish'];
 
-    /** @var list<Joint> */
-    public private(set) array $joints = [];
+    private static ?Geometry $bone = null;
+    private static ?Material $boneMaterial = null;
+
+    /** @var list<Node3D> every Hinge joint, for launch()'s initial flail. */
+    private array $joints = [];
     /** @var list<Limb> */
     public private(set) array $limbs = [];
-    /** @var array<int, float> by joint: the mass of the limbs that turn with it */
-    private array $below = [];
-    private float $inertia = 1.0;
     /** How much of the throw's tumble it takes: a long rope swung like a baton would whip its end around. */
     private float $tumble = 1.0;
     public bool $gone = false;
 
     public function __construct(public readonly Observer $by, public readonly string $type)
     {
-        $this->compound = true;
         $this->confined = false;
         match ($type) {
             'dummy' => $this->dummy(),
@@ -38,20 +42,7 @@ final class Ragdoll extends Node3D
             'rope' => $this->rope(),
             default => $this->starfish(),
         };
-        // mass, an inertia about the root (the rest pose, as a cloud of spheres), and a radius that holds every pose
-        $this->mass = 0.0;
-        $this->inertia = 0.0;
-        $reach = 0.0;
-        foreach ($this->limbs as $limb) {
-            [$x, $y, $z, $chain] = self::restPosition($limb);
-            $this->mass += $limb->mass;
-            $this->inertia += $limb->mass * ((2 / 3) * ($x * $x + $y * $y + $z * $z) + 0.4 * $limb->radius ** 2);
-            $reach = max($reach, $chain + $limb->radius);
-        }
-        $this->radius = $reach;
-        foreach ($this->joints as $joint) {
-            $this->below[spl_object_id($joint)] = self::massBelow($joint);
-        }
+        new Body($this);   // mass, inertia tensor, the super sphere (Node3D::$radius) - all from this tree
     }
 
     // ---------- the types: built from joints (pivot, axis, limits) and limbs (offset on their joint, radius)
@@ -97,7 +88,7 @@ final class Ragdoll extends Node3D
         $parent = $this;
         $at = -0.6;
         for ($i = 1; $i < 11; ++$i) {
-            $joint = $this->joint($parent, 0.0, 0.0, $at, $i % 2 ? [0, 1, 0] : [1, 0, 0], -1.4, 1.4, 0.4, 1.0);
+            $joint = $this->joint($parent, 0.0, 0.0, $at, $i % 2 ? [0, 1, 0] : [1, 0, 0], -1.4, 1.4, 0.4);
             $segment = $this->limb($joint, 0.0, 0.0, -0.6, 0.75 - 0.025 * $i);
             [$parent, $previous, $at] = [$joint, $segment, -1.2];
         }
@@ -118,43 +109,63 @@ final class Ragdoll extends Node3D
         }
     }
 
-    private function joint(Node3D $parent, float $x, float $y, float $z, array $axis, float $min, float $max, float $bounce = 0.0, float $flail = 3.0): Joint
+    /** An invisible Hinge (Physics\JointType) at ($x, $y, $z) in $parent's space, turning about $axis. */
+    private function joint(Node3D $parent, float $x, float $y, float $z, array $axis, float $min, float $max, float $bounce = 0.0): Node3D
     {
-        $joint = new Joint(...array_map('floatval', $axis), min: $min, max: $max, bounce: $bounce, flail: $flail);
+        $joint = new Node3D();
+        $joint->jointType = JointType::Hinge;
+        [$joint->jointAxisX, $joint->jointAxisY, $joint->jointAxisZ] = array_map('floatval', $axis);
+        $joint->jointMin = $min;
+        $joint->jointMax = $max;
+        $joint->jointBounce = $bounce;
         $joint->moveTo($x, $y, $z);
         $parent->addChild($joint);
         $this->joints[] = $joint;
         return $joint;
     }
 
+    /** A limb on $parent (a joint, or this root for one with no joint of its own), with a bone between them: a
+     * thin cylinder from the joint's own pivot to the limb's centre - a fixed local shape (the limb never moves
+     * relative to its own joint), so unlike a bone spanning two independently moving joints, this one costs
+     * nothing to keep right: built once, it turns with the joint like the limb itself does. */
     private function limb(Node3D $parent, float $x, float $y, float $z, float $radius): Limb
     {
         $limb = new Limb($this, $radius);
         $limb->moveTo($x, $y, $z);
         $parent->addChild($limb);
         $this->limbs[] = $limb;
+        if ($parent !== $this) {
+            $parent->addChild($this->bone($x, $y, $z));
+        }
         return $limb;
     }
 
-
-    /** Where a limb sits in the rest pose, relative to the root, and the length of its chain of offsets from it. */
-    private static function restPosition(Node3D $node): array
+    /** A thin cylinder from (0, 0, 0) to ($x, $y, $z), in whichever space it is added to. */
+    private function bone(float $x, float $y, float $z): Mesh
     {
-        [$x, $y, $z, $chain] = [0.0, 0.0, 0.0, 0.0];
-        for ($n = $node; !($n instanceof self); $n = $n->parent) {
-            [$x, $y, $z] = [$x + $n->x, $y + $n->y, $z + $n->z];
-            $chain += sqrt($n->x ** 2 + $n->y ** 2 + $n->z ** 2);
-        }
-        return [$x, $y, $z, $chain];
+        $length = sqrt($x * $x + $y * $y + $z * $z) ?: 1.0;
+        $bone = new Mesh(self::$bone ??= Geometry::cylinder(0.5, 1.0), self::$boneMaterial ??= new Material(color: 0x3a3632));
+        [$qx, $qy, $qz, $qw] = self::rotationFromUpTo($x / $length, $y / $length, $z / $length);
+        $bone->setOrientation($qx, $qy, $qz, $qw);
+        $bone->setScale(0.12, $length, 0.12);
+        return $bone;
     }
 
-    private static function massBelow(Node3D $node): float
+    /** The quaternion turning (0, 1, 0) to the unit vector ($x, $y, $z). */
+    private static function rotationFromUpTo(float $x, float $y, float $z): array
     {
-        $mass = $node instanceof Limb ? $node->mass : 0.0;
-        foreach ($node->children as $child) {
-            $mass += self::massBelow($child);
+        if ($y > 0.999999) {
+            return [0.0, 0.0, 0.0, 1.0];
         }
-        return $mass;
+        if ($y < -0.999999) {
+            return [1.0, 0.0, 0.0, 0.0];   // 180 degrees about x
+        }
+        // axis = (0,1,0) x (x,y,z), angle = acos(y); the half-angle sine/cosine form avoids the acos/sin round trip
+        [$ax, $ay, $az] = [-$z, 0.0, $x];
+        $s = sqrt((1.0 - $y) / 2.0);
+        $c = sqrt((1.0 + $y) / 2.0);
+        $n = sqrt($ax * $ax + $az * $az) ?: 1.0;
+        return [$ax / $n * $s, $ay * $s, $az / $n * $s, $c];
     }
 
     // ---------- in the world
@@ -166,85 +177,33 @@ final class Ragdoll extends Node3D
         $this->setVelocity(...$v);
         $this->spin(...array_map(fn (float $c) => $c * $this->tumble, $spin));
         foreach ($this->joints as $joint) {
-            $joint->setRate(mt_rand(-100, 100) / 100 * $joint->flail);
-            // each joint waits for its limit (an exact time: its angle is a straight line too), stops there, and
-            // starts over whenever a hit changes its rate
-            $world->go(function () use ($joint) {
-                while (!$this->gone) {
-                    $woken = $joint->wait(min($joint->untilLimit(), 60.0), Wake::woken());
-                    if ($this->gone) {
-                        return;
-                    }
-                    if ($woken === null && $joint->untilLimit() <= 1e-9) {
-                        $joint->reachLimit();
-                    }
-                }
-            });
+            $joint->setJointRate(mt_rand(-100, 100) / 100 * 3.0);   // each waits for its own limit - Event::EXPIRE, not a coroutine
         }
     }
 
     /**
-     * A limb hit a ball (or the ball hit the limb). The impulse at the contact point is shared by the flight, the
-     * tumble (its torque about the root) and every joint between the limb and the root (its torque about its hinge),
-     * in proportion to how easily each gives way: the effective mass at the point decides how hard the ball bounces.
+     * A limb hit a ball (or the ball hit the limb): the impulse at the limb's centre is shared by the body (its
+     * flight, its tumble, and every joint between the limb and the root) through Physics\Body's own exact
+     * articulated-mass-matrix solve - see Body::effectiveInverseMass() and Body::applyImpulse().
      */
     public function hit(Limb $limb, Ball $ball, Contact $c): void
     {
         [$nx, $ny, $nz] = [$c->nx, $c->ny, $c->nz];   // from the limb towards the ball
-        $m = $limb->getWorldMatrix();
-        [$px, $py, $pz] = [$m->m12, $m->m13, $m->m14];
-        [$rx, $ry, $rz] = [$px - $this->x, $py - $this->y, $pz - $this->z];
-        [$tx, $ty, $tz] = [$ry * $nz - $rz * $ny, $rz * $nx - $rx * $nz, $rx * $ny - $ry * $nx];   // r x n
-        $inverse = 1.0 / $this->mass + ($tx * $tx + $ty * $ty + $tz * $tz) / $this->inertia;
-        // every joint between the limb and the root gives way, each by its torque about its hinge and the mass that
-        // turns with it: a hit near the end of a rope curls the length of it
-        $giving = [];
-        for ($joint = $limb->parent; $joint instanceof Joint; $joint = $joint->parent) {
-            $j = $joint->getWorldMatrix();
-            [$lx, $ly, $lz] = [$px - $j->m12, $py - $j->m13, $pz - $j->m14];
-            $p = $joint->parent->getWorldMatrix();   // the hinge axis turns with the joint's parent
-            [$wx, $wy, $wz] = [
-                $p->m0 * $joint->ax + $p->m4 * $joint->ay + $p->m8 * $joint->az,
-                $p->m1 * $joint->ax + $p->m5 * $joint->ay + $p->m9 * $joint->az,
-                $p->m2 * $joint->ax + $p->m6 * $joint->ay + $p->m10 * $joint->az,
-            ];
-            $arm = ($ly * $nz - $lz * $ny) * $wx + ($lz * $nx - $lx * $nz) * $wy + ($lx * $ny - $ly * $nx) * $wz;   // (l x n) . axis
-            $angle = $joint->angleNow();
-            if (($angle >= $joint->max && $arm < 0.0) || ($angle <= $joint->min && $arm > 0.0)) {
-                continue;   // pushed against its limit: it holds
-            }
-            $jointInertia = $this->below[spl_object_id($joint)] * max(0.5, $lx * $lx + $ly * $ly + $lz * $lz);
-            $inverse += $arm * $arm / $jointInertia;
-            $giving[] = [$joint, $arm, $jointInertia];
-        }
-        $impulse = 1.5 * -$c->normalSpeed / (1.0 / $ball->mass + $inverse);   // restitution 0.5: plastic gives a little
-        $k = $impulse / $ball->mass;
+        $inverse = $this->body->effectiveInverseMass($limb, $nx, $ny, $nz);
+        $impulseOnBall = 1.5 * -$c->normalSpeed / (1.0 / $ball->mass + $inverse);   // restitution 0.5: plastic gives a little
+        $k = $impulseOnBall / $ball->mass;
         $ball->setVelocity($ball->velocityX + $k * $nx, $ball->velocityY + $k * $ny, $ball->velocityZ + $k * $nz);
-        $k = $impulse / $this->mass;
-        $this->setVelocity($this->velocityX - $k * $nx, $this->velocityY - $k * $ny, $this->velocityZ - $k * $nz);
-        $k = $impulse / $this->inertia;
-        $this->spin($this->mwx - $k * $tx, $this->mwy - $k * $ty, $this->mwz - $k * $tz);
-        foreach ($giving as [$joint, $arm, $jointInertia]) {
-            $turn = $impulse * $arm / $jointInertia;
-            if (abs($turn) < 0.15) {
-                continue;   // far up a long chain the share is next to nothing: not worth waking the joint for
-            }
-            $joint->setRate($joint->rate - $turn);
-            $this->world()->wake($joint);
-        }
+        $this->body->applyImpulse($limb, $nx, $ny, $nz, -$impulseOnBall);
     }
 
     /**
-     * Gone: the joints stop waiting (their coroutines end), and the tree is taken apart, so nothing of it is left
-     * for the cycle collector (see Node3D::dispose()).
+     * Gone: the tree is taken apart (its joints' own Event::EXPIRE listeners go with their nodes), so nothing of it
+     * is left for the cycle collector (see Node3D::dispose()).
      */
     public function dispose(): void
     {
         $this->gone = true;
-        foreach ($this->joints as $joint) {
-            $this->world()->wake($joint);
-        }
-        [$this->joints, $this->limbs, $this->below] = [[], [], []];
+        [$this->joints, $this->limbs] = [[], []];
         parent::dispose();
     }
 

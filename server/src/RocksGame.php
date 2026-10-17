@@ -82,7 +82,7 @@ final class Rock extends Ball
  * physics radius is set - only its visual scale). */
 final class Observer extends Mesh
 {
-    private static ?Geometry $body = null;
+    private static ?Geometry $shape = null;
     private static ?MeshShader $shader = null;
     /** @var array<int, Material> one per colour (see Ball's $materials for why this matters). */
     private static array $materials = [];
@@ -95,11 +95,11 @@ final class Observer extends Mesh
     public float $droppedAt = 0.0;
     public int $ragdolls = 0;
 
-    public function __construct(public readonly string $client, int $color)
+    public function __construct(public readonly string $client, public readonly int $color)
     {
         $shader = self::$shader ??= self::material();
         $material = self::$materials[$color] ??= new Material(color: $color, shader: $shader);
-        parent::__construct(self::$body ??= Geometry::box(1.2, 0.84, 1.0), $material);
+        parent::__construct(self::$shape ??= Geometry::box(1.2, 0.84, 1.0), $material);
         $this->heard = microtime(true);
     }
 

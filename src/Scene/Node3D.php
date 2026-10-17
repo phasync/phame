@@ -84,6 +84,37 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
     public bool $compound = false;
     /** @internal The compound body whose part (or joint) this node is. */
     public ?Node3D $physicsCompound = null;
+    /** The mass and articulated mass matrix of the coupled subtree this node's root owns - Physics\Body::__construct()
+     * sets this on the root and every descendant, so any node in a jointed tree can reach it (a joint reaching its
+     * own limit needs the exact reaction this gives the rest of the body; see Body::jointLimitImpulse()). Null
+     * outside one. */
+    public ?\Phame\Physics\Body $body = null;
+
+    /**
+     * How this node is held to its parent beyond being a plain child of its transform - Physics\JointType::Free
+     * (the default) leaves the parent as only a frame; Fixed, Hinge, Ball, Slider and Rope constrain it, driven
+     * through setJointRate() (Hinge/Ball/Slider) or by nothing at all but gravity and a Rope's own length (see
+     * jointRopeUntilTaut()). See docs/PHYSICS-PLAN.md's Phase 2.
+     */
+    public \Phame\Physics\JointType $jointType = \Phame\Physics\JointType::Free;
+    /** Hinge/Slider: the fixed axis, in the parent's space. Ball: whatever setJointRate()'s own $axis last set -
+     * each swing is exact about it while it lasts, like a Hinge's. Unused by Fixed, Free and Rope. */
+    public float $jointAxisX = 0.0;
+    public float $jointAxisY = 0.0;
+    public float $jointAxisZ = 1.0;
+    /** Hinge/Ball: radians either side of the axis's own zero. Slider: units either side of the parent's origin.
+     * Rope: ignored - $jointMax alone is the tether's length, measured from 0. */
+    public float $jointMin = -INF;
+    public float $jointMax = INF;
+    /** How much of its speed a Hinge, Ball, Slider or Rope keeps, turning back, at a limit (0: it stops there). */
+    public float $jointBounce = 0.0;
+    /** The joint's own coordinate (an angle for Hinge/Ball, a distance for Slider) at $jointSince. */
+    private float $jointPos = 0.0;
+    private float $jointSince = 0.0;
+    /** rad/s (Hinge/Ball) or units/s (Slider): a straight line, like any other description, so where the joint is
+     * at any time - including a limit - is known exactly. See jointPositionNow(). */
+    public private(set) float $jointRate = 0.0;
+    private bool $jointWired = false;
     /** Whether the walls of the scene's box hold it in (see Scene3D's world bounds). False: it goes straight through. */
     public bool $confined = true;
     /** @internal */
@@ -288,6 +319,119 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
         $this->edited();
     }
 
+    /** The joint's own coordinate now: an angle (Hinge/Ball) or a distance (Slider). INF-free even at a limit. */
+    public function jointPositionNow(): float
+    {
+        return $this->jointPos + $this->jointRate * (($this->clock?->time ?? 0.0) - $this->jointSince);
+    }
+
+    /**
+     * Drives a Hinge, Ball or Slider from now on at $rate (rad/s or units/s); at a limit it can only move back
+     * towards the other one (pushing further is clamped to 0). $axis redirects a Ball's own swing axis (Hinge and
+     * Slider ignore it - theirs is fixed); omitted, the joint keeps its current axis.
+     */
+    public function setJointRate(float $rate, ?array $axis = null): void
+    {
+        if ($axis !== null) {
+            [$this->jointAxisX, $this->jointAxisY, $this->jointAxisZ] = $axis;
+        }
+        $pos = max($this->jointMin, min($this->jointMax, $this->jointPositionNow()));
+        if (($pos >= $this->jointMax && $rate > 0.0) || ($pos <= $this->jointMin && $rate < 0.0)) {
+            $rate = 0.0;
+        }
+        [$this->jointPos, $this->jointSince, $this->jointRate] = [$pos, $this->clock?->time ?? 0.0, $rate];
+        match ($this->jointType) {
+            \Phame\Physics\JointType::Hinge, \Phame\Physics\JointType::Ball => $this->driveHingeOrBall($pos, $rate),
+            \Phame\Physics\JointType::Slider => $this->driveSlider($pos, $rate),
+            default => null,
+        };
+    }
+
+    private function driveHingeOrBall(float $angle, float $rate): void
+    {
+        $s = sin($angle / 2);
+        $this->setOrientation($this->jointAxisX * $s, $this->jointAxisY * $s, $this->jointAxisZ * $s, cos($angle / 2));
+        $this->spin($this->jointAxisX * $rate, $this->jointAxisY * $rate, $this->jointAxisZ * $rate);
+    }
+
+    private function driveSlider(float $offset, float $rate): void
+    {
+        $this->moveTo($this->jointAxisX * $offset, $this->jointAxisY * $offset, $this->jointAxisZ * $offset);
+        $this->setVelocity($this->jointAxisX * $rate, $this->jointAxisY * $rate, $this->jointAxisZ * $rate);
+    }
+
+    /** Seconds until a Hinge, Ball or Slider reaches the limit it is moving towards; INF while still or unbounded. */
+    public function jointUntilLimit(): float
+    {
+        if ($this->jointRate === 0.0) {
+            return INF;
+        }
+        $limit = $this->jointRate > 0.0 ? $this->jointMax : $this->jointMin;
+        if ($limit === INF || $limit === -INF) {
+            return INF;
+        }
+        return max(0.0, ($limit - $this->jointPositionNow()) / $this->jointRate);
+    }
+
+    /** Seconds until a Rope reaches its length ($jointMax), moving outward; INF while slack or unbounded. */
+    public function jointRopeUntilTaut(): float
+    {
+        if ($this->jointMax === INF) {
+            return INF;
+        }
+        return \Phame\Physics\Space::tetherTaut($this->mx, $this->my, $this->mz, $this->mvx, $this->mvy, $this->mvz, $this->jointMax);
+    }
+
+    /** Wires the one-time reaction to a Hinge/Ball/Slider limit or a Rope going taut: turns back with $jointBounce
+     * of its speed, or stops when that is too slow to matter (0.05: a swing or slide, not a rope's own faster snap). */
+    private function wireJointExpiry(): void
+    {
+        if ($this->jointWired) {
+            return;
+        }
+        $this->jointWired = true;
+        $this->addEventListener('expire', function (): void {
+            if ($this->jointType === \Phame\Physics\JointType::Rope) {
+                $speed = sqrt($this->mvx * $this->mvx + $this->mvy * $this->mvy + $this->mvz * $this->mvz);
+                if ($speed == 0.0 || $this->jointRopeUntilTaut() > 1e-9) {
+                    return;   // the expiry was for some other reason, or it is already slack again
+                }
+                $d = sqrt($this->mx * $this->mx + $this->my * $this->my + $this->mz * $this->mz) ?: 1.0;
+                [$nx, $ny, $nz] = [$this->mx / $d, $this->my / $d, $this->mz / $d];
+                $radial = $this->mvx * $nx + $this->mvy * $ny + $this->mvz * $nz;
+                $k = -(1.0 + $this->jointBounce) * $radial;
+                $this->setVelocity($this->mvx + $k * $nx, $this->mvy + $k * $ny, $this->mvz + $k * $nz);
+                $this->refreshJointLimit();
+                return;
+            }
+            if ($this->jointRate === 0.0 || $this->jointUntilLimit() > 1e-9) {
+                return;   // the expiry was for some other reason (already stopped here, or not due yet)
+            }
+            $rate = -$this->jointRate * $this->jointBounce;
+            $rate = abs($rate) < 0.05 ? 0.0 : $rate;
+            if ($this->body !== null) {
+                $this->body->jointLimitImpulse($this, $rate);   // the exact reaction on the rest of the body
+            } else {
+                $this->setJointRate($rate);
+            }
+        });
+    }
+
+    /** Schedules the next Event::EXPIRE a Hinge/Ball/Slider limit or Rope's length is due, folded into whatever
+     * else already wants this node's expiry (the sooner of the two wins, as Event::EXPIRE always does). */
+    private function refreshJointLimit(): void
+    {
+        $this->wireJointExpiry();
+        $until = match ($this->jointType) {
+            \Phame\Physics\JointType::Hinge, \Phame\Physics\JointType::Ball, \Phame\Physics\JointType::Slider => $this->jointUntilLimit(),
+            \Phame\Physics\JointType::Rope => $this->jointRopeUntilTaut(),
+            default => INF,
+        };
+        if ($until !== INF) {
+            $this->validUntil = min($this->validUntil, ($this->clock?->time ?? 0.0) + $until);
+        }
+    }
+
     public bool $isMoving {
         get => $this->mvx != 0.0 || $this->mvy != 0.0 || $this->mvz != 0.0 || $this->mwx != 0.0 || $this->mwy != 0.0 || $this->mwz != 0.0
             || $this->accX != 0.0 || $this->accY != 0.0 || $this->accZ != 0.0
@@ -351,6 +495,9 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
         $this->motionChanged();
         $this->physicsSpace?->changed($this);
         $this->physicsCompound?->physicsSpace?->changed($this->physicsCompound);   // a joint turned: the body changed
+        if ($this->jointType !== \Phame\Physics\JointType::Free && $this->jointType !== \Phame\Physics\JointType::Fixed) {
+            $this->refreshJointLimit();
+        }
         if ($this->published && $this->clock !== null) {
             $this->world()->descriptionChanged($this);
         }

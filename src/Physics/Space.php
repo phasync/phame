@@ -920,7 +920,7 @@ final class Space
      * Seconds until two tethered bodies are $length apart and moving apart: the other at offset d, with relative
      * velocity v. 0 if they are there now; INF if they never get there.
      */
-    private static function tetherTaut(float $dx, float $dy, float $dz, float $vx, float $vy, float $vz, float $length): float
+    public static function tetherTaut(float $dx, float $dy, float $dz, float $vx, float $vy, float $vz, float $length): float
     {
         $a = $vx * $vx + $vy * $vy + $vz * $vz;
         if ($a === 0.0) {
