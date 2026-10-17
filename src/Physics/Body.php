@@ -155,7 +155,10 @@ final class Body
         // a small Tikhonov regularization: a random pose can bring two joints' axes and positions close enough to
         // near-dependent columns that Gauss-Jordan elimination amplifies rounding error past what a sub-1
         // restitution hit should ever cost in energy; this trades a negligible, uniform bias for that not
-        // happening, far below the scale of the masses and radii actually in play.
+        // happening, far below the scale of the masses and radii actually in play. jointLimitImpulse() additionally
+        // checks the one invariant that matters (kinetic energy cannot rise) and falls back to an uncoupled bounce
+        // whenever even this isn't enough - a many-jointed chain folded on itself (a rope ragdoll) can still bring
+        // M's smallest eigenvalue far closer to 0 than this constant, at which point M⁻¹ cannot be trusted at all.
         for ($i = 0; $i < $n; ++$i) {
             $m[$i][$i] += 1e-9;
         }
@@ -273,6 +276,18 @@ final class Body
      * same mass-matrix solve as applyImpulse(), aimed at one generalized coordinate (the joint's own) reaching a
      * target value instead of a world-space contact normal - the reaction this takes from the rest of the body
      * (root included) falls out of the same M⁻¹, not a separate rule.
+     *
+     * A coupled solve is only as good as M⁻¹: at a pose where two joints' axes and positions are nearly dependent
+     * (a chain folded on itself - common for a many-jointed rope ragdoll), Gauss-Jordan elimination's M⁻¹ can be
+     * inaccurate enough that M·M⁻¹ meaningfully differs from the identity, and the usual guarantee that a bounce
+     * (bounce ≤ 1) never raises kinetic energy - exact whenever M⁻¹ is exact - breaks: a little energy slips in,
+     * and bounce after bounce (the common case for a limit under a sustained load) compounds it, eventually driving
+     * a joint's own rate (and so everything coupled to it) to the point where other parts of the engine - the
+     * compound's probing against nearby bodies, which bounds how fast it reschedules on a turning node's own
+     * angular speed - start firing thousands of times a second. The fix is to check the one invariant that matters
+     * (kinetic energy cannot rise here) and fall back to an uncoupled bounce - exactly what a joint without a Body
+     * already does - whenever the coupled solve would violate it: real articulation is lost only at the rare poses
+     * where M⁻¹ cannot be trusted, and energy is never gained.
      */
     public function jointLimitImpulse(Node3D $joint, float $newRate): void
     {
@@ -283,8 +298,9 @@ final class Body
         $col = 6 + $i;
         $minv = $this->inverseMassMatrix();
         $diag = $minv[$col][$col];
-        if (abs($diag) < 1e-12) {
-            return;   // a degenerate pose: leave the rate as it is rather than divide by nothing
+        if ($diag < 1e-9) {
+            $joint->setJointRate($newRate);   // too close to singular (or, numerically, negative) to trust: bounce it alone
+            return;
         }
         $tau = ($newRate - $joint->jointRate) / $diag;
         $n = $this->dof();
@@ -292,7 +308,34 @@ final class Body
         for ($i2 = 0; $i2 < $n; ++$i2) {
             $delta[$i2] = $minv[$i2][$col] * $tau;
         }
+        $before = $this->snapshotVelocities();
+        $keBefore = $this->kineticEnergy();
         $this->applyDelta($delta);
+        if ($this->kineticEnergy() > $keBefore + 1e-6 * max(1.0, abs($keBefore))) {
+            $this->restoreVelocities($before);
+            $joint->setJointRate($newRate);   // the coupled solve gained energy here: bounce it alone instead
+        }
+    }
+
+    /** The root's own velocity and spin, and every joint's own rate - what jointLimitImpulse() restores exactly if
+     * a coupled solve turns out untrustworthy at the current pose (see there). */
+    private function snapshotVelocities(): array
+    {
+        $root = $this->root;
+        return [$root->velocityX, $root->velocityY, $root->velocityZ, $root->mwx, $root->mwy, $root->mwz, array_map(static fn (Node3D $j) => $j->jointRate, $this->joints)];
+    }
+
+    private function restoreVelocities(array $snapshot): void
+    {
+        [$vx, $vy, $vz, $wx, $wy, $wz, $rates] = $snapshot;
+        $root = $this->root;
+        $root->setVelocity($vx, $vy, $vz);
+        $root->spin($wx, $wy, $wz);
+        foreach ($this->joints as $i => $joint) {
+            if ($joint->jointRate !== $rates[$i]) {
+                $joint->setJointRate($rates[$i]);
+            }
+        }
     }
 
     /** Applies a generalized velocity change (root linear, root angular, then one per joint) to the real tree. */
