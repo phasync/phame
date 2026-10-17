@@ -78,14 +78,13 @@ final class Space
     private static float $placedAt = NAN;
     private static int $placedCounter = -1;
     /**
-     * @var array<int, array{int, float, list<?array{float, float, float}>, list<?list<array{float, float, float,
-     * float, float, float, float, float, float, float, float, float, float, float, float, float}>>}> by compound:
-     * at which of its counters, the game time $t0 the entries below were captured at; each part's centre in the
-     * root's space while the joints above it are still (null while one turns, see the next field); and, for a part
-     * that does turn, its chain of still-or-turning ancestors between it and the compound, root to part order, each
-     * a snapshot at $t0 of Node3D::x/y/z, velocityX/Y/Z, accelerationX/Y/Z (gravity folded in), orientationX/Y/Z/W
-     * and mwx/mwy/mwz - everything evaluatePartChain() needs to place it again at any later time without walking
-     * the tree or touching a single Node3D property (those getters cost real time, called this often).
+     * @var array<int, array{int, float, list<?array{float, float, float}>, array<int, true>, array<int, list<float>>}>
+     * by compound: at which of its counters, the game time $t0 the entries below were captured at; each part's
+     * centre in the root's space while the joints above it are still (null while one turns); the nodes on the way
+     * down to the turning parts ($walk, as placeMoving() walks); and, by node id, a snapshot at $t0 of Node3D::x/y/z,
+     * velocityX/Y/Z, accelerationX/Y/Z (gravity folded in), orientationX/Y/Z/W, angularVelocityNow() and $spinDecel -
+     * everything placeMoving() needs to place it again at any later time without walking to the root or touching a
+     * single Node3D property (those getters cost real time, called this often).
      */
     private array $offsets = [];
     /** @var array<int, int> by part: its index among its compound's parts */
@@ -901,13 +900,16 @@ final class Space
             if (!isset($walk[$id])) {
                 continue;
             }
-            [$x, $y, $z, $vx, $vy, $vz, $ax, $ay, $az, $lqx, $lqy, $lqz, $lqw, $wx, $wy, $wz] = $steps[$id];
+            [$x, $y, $z, $vx, $vy, $vz, $ax, $ay, $az, $lqx, $lqy, $lqz, $lqw, $wx, $wy, $wz, $decel] = $steps[$id];
             $lx = $x + ($vx + 0.5 * $ax * $dt) * $dt;
             $ly = $y + ($vy + 0.5 * $ay * $dt) * $dt;
             $lz = $z + ($vz + 0.5 * $az * $dt) * $dt;
             $speed = sqrt($wx * $wx + $wy * $wy + $wz * $wz);
             if ($speed != 0.0) {
-                $half = $speed * $dt / 2.0;
+                // the exact integral of a speed decelerating under Coulomb friction (Node3D::$spinDecel), clamped
+                // once it stops - Node3D::sweptAngle()'s own formula, inlined (this is the engine's hottest walk)
+                $swept = $decel == 0.0 ? $speed * $dt : ($dt >= $speed / $decel ? $speed * $speed / (2.0 * $decel) : $speed * $dt - 0.5 * $decel * $dt * $dt);
+                $half = $swept / 2.0;
                 $k = sin($half) / $speed;
                 [$dx, $dy, $dz, $dw] = [$wx * $k, $wy * $k, $wz * $k, cos($half)];
                 [$lqx, $lqy, $lqz, $lqw] = [
@@ -978,6 +980,7 @@ final class Space
                     if ($n !== $part && ($n->scaleX !== 1.0 || $n->scaleY !== 1.0 || $n->scaleZ !== 1.0)) {
                         throw new \RuntimeException('Body/Space compound internals (an ancestor of a part, not the part itself) must not be scaled: a pivot that scales has no meaning, and placeMoving() does not account for it');
                     }
+                    [$wx, $wy, $wz] = $n->angularVelocityNow();   // $n->mwx and friends decay under Node3D::$spinDecel
                     $steps[$id] = [
                         $n->x, $n->y, $n->z,
                         $n->velocityX, $n->velocityY, $n->velocityZ,
@@ -985,7 +988,7 @@ final class Space
                         $n->accelerationY + ($n->parent?->gravityY ?? 0.0),
                         $n->accelerationZ + ($n->parent?->gravityZ ?? 0.0),
                         $n->orientationX, $n->orientationY, $n->orientationZ, $n->orientationW,
-                        $n->mwx, $n->mwy, $n->mwz,
+                        $wx, $wy, $wz, $n->spinDecel,
                     ];
                 }
                 continue;

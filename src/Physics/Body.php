@@ -234,7 +234,7 @@ final class Body
         $root = $this->root;
         $q = [$root->velocityX, $root->velocityY, $root->velocityZ, $root->mwx, $root->mwy, $root->mwz];
         foreach ($this->joints as $joint) {
-            $q[] = $joint->jointRate;
+            $q[] = $joint->jointRateNow();   // decelerating under Node3D::$jointFriction, if any - not $jointRate
         }
         return $q;
     }
@@ -316,8 +316,8 @@ final class Body
             return;
         }
         $col = 6 + $i;
-        $oldRate = $joint->jointRate;
-        $limit = $oldRate > 0.0 ? $joint->jointMax : $joint->jointMin;   // the side it was approaching
+        $limit = $joint->jointRate > 0.0 ? $joint->jointMax : $joint->jointMin;   // the side it was approaching -
+        // friction only ever decelerates towards 0, never reverses, so the stored rate's sign already settles this
         $clock = $this->root->clock;
         $now = $clock?->time ?? 0.0;
         $at = $clock !== null ? $joint->jointCrossingTime($limit) : $now;
@@ -325,6 +325,7 @@ final class Body
         if ($rewound) {
             $clock->travelTo($at);
         }
+        $oldRate = $joint->jointRateNow();   // at the exact crossing instant, not $jointRate's stale, pre-friction value
         $n = $this->dof();
         $e = array_fill(0, $n, 0.0);
         $e[$col] = 1.0;
@@ -356,10 +357,12 @@ final class Body
         $root->spin($root->mwx + $delta[3], $root->mwy + $delta[4], $root->mwz + $delta[5]);
         foreach ($this->joints as $i => $joint) {
             if ($delta[6 + $i] != 0.0) {
+                // the delta is a change to the CURRENT velocity: add it to jointRateNow(), not the stale $jointRate
+                // a friction-slowing joint was given at its last event
                 if ($joint === $pin) {
-                    $joint->pinJointAtLimit($pinAt, $joint->jointRate + $delta[6 + $i]);
+                    $joint->pinJointAtLimit($pinAt, $joint->jointRateNow() + $delta[6 + $i]);
                 } else {
-                    $joint->nudgeJointRate($joint->jointRate + $delta[6 + $i]);
+                    $joint->nudgeJointRate($joint->jointRateNow() + $delta[6 + $i]);
                 }
             }
         }

@@ -277,6 +277,119 @@ final class JointsAndBodiesTest extends TestCase
         });
     }
 
+    /**
+     * Coulomb friction's closed form: a hinge spinning at $omega0, decelerating at constant $alpha, travels
+     * $omega0²/(2·$alpha) before stopping, taking $omega0/$alpha seconds to do it - Phase 1's own constant-
+     * deceleration kinematics (docs/PHYSICS-PLAN.md), applied to a joint's own angle instead of a position.
+     */
+    public function testHingeFrictionStopsAtTheExactClosedFormAngleAndTime(): void
+    {
+        [$world, $scene] = $this->stage();
+        \phasync::run(function () use ($world, $scene) {
+            $world->run(function (World $w) use ($scene) {
+                $root = new Node3D();
+                $root->radius = 0.0;
+                $scene->root->addChild($root);
+                [$joint, $limb] = $this->arm($root, 2.0, 1.0, 1.0);
+                $joint->jointMin = -1000.0;
+                $joint->jointMax = 1000.0;   // wide enough that only friction, never a limit, stops it
+                $alpha = 1.5;
+                $joint->jointFriction = $alpha;
+                $omega0 = 4.0;
+                $theta0 = $joint->jointPositionNow();
+                $joint->setJointRate($omega0);
+
+                $tStop = $omega0 / $alpha;
+                $thetaStop = $theta0 + $omega0 * $omega0 / (2.0 * $alpha);
+
+                $w->tick($tStop + 0.5);   // well past the stop: the event must already have fired and frozen it
+
+                $this->assertSame(0.0, $joint->jointRate, 'friction alone must leave the joint exactly at rest');
+                $this->assertEqualsWithDelta($thetaStop, $joint->jointPositionNow(), 1e-9, 'stopped at the exact closed-form angle');
+                $w->stop();
+            });
+        });
+    }
+
+    /**
+     * The randomized energy gate (see testRandomizedPosesAndHitsNeverGainEnergyAndConserveMomentumExactly()),
+     * extended for Node3D::$jointFriction: unlike a limit bounce (one instant, checked once), friction removes
+     * energy continuously, so this samples kinetic energy at several points during - and checks it is monotonically
+     * non-increasing, in a system with no other energy source (no hit, no limit reached: friction is the only thing
+     * happening). The root is left at rest and every joint hangs directly off it, no nesting (unlike the general
+     * random-structure helper the other randomized gate uses): Node3D::$jointFriction decelerates each joint's own
+     * generalized coordinate in isolation (a kinematic description, like Phase 1's, not a coupled dynamic force
+     * solved through the mass matrix), so the total 0.5 q̇ᵀMq̇ is only guaranteed non-increasing where that is also
+     * exactly how the physics decomposes: a root at rest with every joint a direct, independent child makes M
+     * block-diagonal in the joints (no part is ever a descendant of two of them, so every cross term is exactly
+     * zero) and each joint's own diagonal term constant (its part's lever arm about a fixed axis does not change as
+     * it turns) - total energy is then exactly Σ ½ Mᵢᵢ rateᵢ², strictly decreasing termwise. Nest a joint under
+     * another turning one, or give the root its own motion, and this stops holding - not a bug, the same way two
+     * ordinary constant velocities can momentarily add up to more speed or less depending on the angle between
+     * them: a lever's own instantaneous contribution to a shared, moving frame's kinetic energy depends on
+     * direction, not only on the magnitudes decelerating it.
+     */
+    public function testRandomizedJointFrictionNeverIncreasesEnergy(): void
+    {
+        [$world, $scene] = $this->stage();
+        $failures = [];
+        \phasync::run(function () use ($world, $scene, &$failures) {
+            $world->run(function (World $w) use ($scene, &$failures) {
+                mt_srand(20261101);
+                $trials = 500;
+                for ($trial = 0; $trial < $trials; ++$trial) {
+                    $root = new Node3D();
+                    $root->radius = 0.0;
+                    $scene->root->addChild($root);
+                    $root->confined = false;
+                    $torso = new Node3D();
+                    $torso->radius = 0.8 + self::rnd(0.0, 1.0);
+                    $torso->mass = 3.0 + self::rnd(0.0, 5.0);
+                    $root->addChild($torso);
+                    $parts = [$torso];
+                    $joints = [];
+                    $chains = mt_rand(1, 4);
+                    for ($c = 0; $c < $chains; ++$c) {
+                        // every joint a direct child of the root - no nesting (see this test's own docblock for why)
+                        $joint = new Node3D();
+                        $joint->jointType = JointType::Hinge;
+                        [$ax, $ay, $az] = self::randomUnitVector();
+                        [$joint->jointAxisX, $joint->jointAxisY, $joint->jointAxisZ] = [$ax, $ay, $az];
+                        $joint->jointMin = -1000.0;
+                        $joint->jointMax = 1000.0;   // friction, not a limit, is what this trial measures
+                        $joint->jointFriction = self::rnd(0.1, 3.0);
+                        $joint->moveTo(self::rnd(-1.5, 1.5), self::rnd(-1.5, 1.5), self::rnd(-1.5, 1.5));
+                        $root->addChild($joint);
+                        $joints[] = $joint;
+                        $limb = new Node3D();
+                        $limb->radius = 0.2 + self::rnd(0.0, 0.5);
+                        $limb->mass = 0.3 + self::rnd(0.0, 2.0);
+                        $limb->moveTo(self::rnd(-1.5, 1.5), self::rnd(-1.5, 1.5), self::rnd(-1.5, 1.5));
+                        $joint->addChild($limb);
+                        $parts[] = $limb;
+                    }
+                    foreach ($joints as $joint) {
+                        $joint->setJointRate(self::rnd(-6.0, 6.0));
+                    }
+                    $body = new Body($root);
+
+                    $previous = $body->kineticEnergy();
+                    for ($step = 0; $step < 5; ++$step) {
+                        $w->tick(self::rnd(0.05, 0.4));
+                        $now = $body->kineticEnergy();
+                        if ($now > $previous + 1e-6 * max(1.0, abs($previous))) {
+                            $failures[] = sprintf('trial %d step %d: KE rose %.9f -> %.9f', $trial, $step, $previous, $now);
+                        }
+                        $previous = $now;
+                    }
+                    $root->dispose();
+                }
+                $w->stop();
+            });
+        });
+        $this->assertSame([], array_slice($failures, 0, 10), sprintf('%d of 2500 steps failed', count($failures)));
+    }
+
     public function testSuperSphereIsNeverViolatedAtSampledTimes(): void
     {
         [$world, $scene] = $this->stage();

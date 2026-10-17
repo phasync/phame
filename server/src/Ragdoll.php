@@ -109,8 +109,10 @@ final class Ragdoll extends Node3D
         }
     }
 
-    /** An invisible Hinge (Physics\JointType) at ($x, $y, $z) in $parent's space, turning about $axis. */
-    private function joint(Node3D $parent, float $x, float $y, float $z, array $axis, float $min, float $max, float $bounce = 0.0): Node3D
+    /** An invisible Hinge (Physics\JointType) at ($x, $y, $z) in $parent's space, turning about $axis. $friction
+     * (rad/s²) is real joint stiffness - a bare hinge with none would keep whatever speed a hit or a limit's own
+     * bounce gave it forever, which no real joint does. */
+    private function joint(Node3D $parent, float $x, float $y, float $z, array $axis, float $min, float $max, float $bounce = 0.0, float $friction = 2.0): Node3D
     {
         $joint = new Node3D();
         $joint->jointType = JointType::Hinge;
@@ -118,6 +120,7 @@ final class Ragdoll extends Node3D
         $joint->jointMin = $min;
         $joint->jointMax = $max;
         $joint->jointBounce = $bounce;
+        $joint->jointFriction = $friction;
         $joint->moveTo($x, $y, $z);
         $parent->addChild($joint);
         $this->joints[] = $joint;

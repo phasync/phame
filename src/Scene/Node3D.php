@@ -35,10 +35,17 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
     public private(set) float $accX = 0.0;
     public private(set) float $accY = 0.0;
     public private(set) float $accZ = 0.0;
-    /** Angular velocity in the parent's space: the axis is its direction, the speed (rad/s) its length. */
+    /** Angular velocity at $mt, in the parent's space: the axis is its direction, the speed (rad/s) its length -
+     * constant (as it always was) unless $spinDecel is set, in which case this is only its value at $mt (see
+     * angularVelocityNow()), the same relationship $mvx has to velocityX with $accX. */
     public private(set) float $mwx = 0.0;
     public private(set) float $mwy = 0.0;
     public private(set) float $mwz = 0.0;
+    /** Constant deceleration of the angular speed from $mt on (rad/s²), the axis unchanged: Coulomb friction's
+     * kinematic form (see Node3D::$jointFriction) - 0 for every node that never asked for it, in which case $mwx
+     * and friends are exactly what they always were and nothing below reads this at all. Readable from outside for
+     * the same reason $mwx is (Physics\Space's placeMoving() needs it to place a turning, friction-slowing part). */
+    public private(set) float $spinDecel = 0.0;
     /**
      * A uniform acceleration field in this node's space, inherited by every descendant (not by this node itself) at
      * no per-body cost: set gravity once on an ancestor (the scene root, say) instead of calling setAcceleration()
@@ -108,6 +115,12 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
     public float $jointMax = INF;
     /** How much of its speed a Hinge, Ball, Slider or Rope keeps, turning back, at a limit (0: it stops there). */
     public float $jointBounce = 0.0;
+    /** Coulomb friction: a Hinge/Ball's angular speed (rad/s²) or a Slider's linear speed (units/s²) decelerates at
+     * this constant rate, from whenever it was last set, until it reaches 0 and stays there - 0 (the default): no
+     * friction, a constant rate forever (or until a limit), as every joint has always behaved. The exact stop time
+     * is a joint-limit-style event (see jointUntilStop()); the position in between is the exact integral of the
+     * decaying speed (Node3D::sweptAngle()), so it never needs to be looked at except at that one moment. */
+    public float $jointFriction = 0.0;
     /** The joint's own coordinate (an angle for Hinge/Ball, a distance for Slider) at $jointSince. */
     private float $jointPos = 0.0;
     private float $jointSince = 0.0;
@@ -191,6 +204,24 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
     public float $orientationZ { get { $this->orientationNow(); return self::$qz; } }
     public float $orientationW { get { $this->orientationNow(); return self::$qw; } }
 
+    /** The angular velocity now (axis unchanged, speed decaying under Node3D::$spinDecel - see $mwx): what
+     * Physics\Space's placeMoving() captures instead of $mwx/$mwy/$mwz directly, so a turning, friction-slowing
+     * joint places its parts correctly between its own events, not at the speed it had at the last one. Exactly
+     * $mwx/$mwy/$mwz when nothing decelerates this node. */
+    public function angularVelocityNow(): array
+    {
+        if ($this->spinDecel == 0.0) {
+            return [$this->mwx, $this->mwy, $this->mwz];
+        }
+        $speed0 = sqrt($this->mwx * $this->mwx + $this->mwy * $this->mwy + $this->mwz * $this->mwz);
+        if ($speed0 == 0.0) {
+            return [0.0, 0.0, 0.0];
+        }
+        $speed = max(0.0, $speed0 - $this->spinDecel * $this->age());
+        $scale = $speed / $speed0;
+        return [$this->mwx * $scale, $this->mwy * $scale, $this->mwz * $scale];
+    }
+
     private static float $qx = 0.0;
     private static float $qy = 0.0;
     private static float $qz = 0.0;
@@ -199,7 +230,20 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
     private static float $ey = 0.0;
     private static float $ez = 0.0;
 
-    /** The orientation at the current game time into the $q statics: the start orientation turned by omega * age. */
+    /** How far a spin of $speed decelerating at $decel (0: constant) has turned after $t seconds: $speed · $t, or,
+     * decelerating, the exact integral of max(0, $speed - $decel·τ) from 0 to $t - linear until it stops (at
+     * $speed / $decel), constant (the total angle swept, $speed² / (2·$decel)) after. */
+    private static function sweptAngle(float $speed, float $decel, float $t): float
+    {
+        if ($decel == 0.0) {
+            return $speed * $t;
+        }
+        $tStop = $speed / $decel;
+        return $t >= $tStop ? $speed * $speed / (2.0 * $decel) : $speed * $t - 0.5 * $decel * $t * $t;
+    }
+
+    /** The orientation at the current game time into the $q statics: the start orientation turned by omega * age
+     * (or, decelerating, by sweptAngle()'s exact integral of the decaying speed - see Node3D::$spinDecel). */
     private function orientationNow(): void
     {
         $qx = $this->mqx;
@@ -208,7 +252,7 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
         $qw = $this->mqw;
         $speed = sqrt($this->mwx * $this->mwx + $this->mwy * $this->mwy + $this->mwz * $this->mwz);
         if ($speed != 0.0) {
-            $half = $speed * $this->age() / 2;
+            $half = self::sweptAngle($speed, $this->spinDecel, $this->age()) / 2;
             $k = sin($half) / $speed;
             $dx = $this->mwx * $k;   // the turn so far, about the axis of omega (in the parent's space: applied first)
             $dy = $this->mwy * $k;
@@ -309,20 +353,71 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
     /**
      * Turning from now on, as an angular velocity in the parent's space: the axis (x, y, z) scaled by the speed in
      * radians per second. spin(0, M_PI, 0) turns half a circle per second around the up axis. Exact for any axis.
+     * $decel (rad/s², 0: none) decelerates the speed at a constant rate, the axis unchanged, until it reaches 0 and
+     * stays there - Coulomb friction's kinematic form (see Node3D::$jointFriction); every other caller leaves it 0
+     * and gets exactly the constant spin this always was.
      */
-    public function spin(float $x, float $y = 0.0, float $z = 0.0): void
+    public function spin(float $x, float $y = 0.0, float $z = 0.0, float $decel = 0.0): void
     {
         $this->rebase();
         $this->mwx = $x;
         $this->mwy = $y;
         $this->mwz = $z;
+        $this->spinDecel = $decel;
         $this->edited();
     }
 
     /** The joint's own coordinate now: an angle (Hinge/Ball) or a distance (Slider). INF-free even at a limit. */
     public function jointPositionNow(): float
     {
-        return $this->jointPos + $this->jointRate * (($this->clock?->time ?? 0.0) - $this->jointSince);
+        $dt = ($this->clock?->time ?? 0.0) - $this->jointSince;
+        if ($this->jointFriction == 0.0 || $this->jointRate == 0.0) {
+            return $this->jointPos + $this->jointRate * $dt;
+        }
+        $sign = $this->jointRate > 0.0 ? 1.0 : -1.0;
+        return $this->jointPos + $sign * self::sweptAngle(abs($this->jointRate), $this->jointFriction, $dt);
+    }
+
+    /** The joint's own rate now: $jointRate, decelerating under Node3D::$jointFriction (never past 0, never
+     * reversing) exactly like Node3D::angularVelocityNow() does for a general spin - what Body::qdot() reads
+     * instead of $jointRate directly, so a friction-slowing joint's kinetic energy is seen falling continuously,
+     * not only at the moment it stops. */
+    public function jointRateNow(): float
+    {
+        if ($this->jointFriction == 0.0 || $this->jointRate == 0.0) {
+            return $this->jointRate;
+        }
+        $dt = ($this->clock?->time ?? 0.0) - $this->jointSince;
+        $sign = $this->jointRate > 0.0 ? 1.0 : -1.0;
+        return $sign * max(0.0, abs($this->jointRate) - $this->jointFriction * $dt);
+    }
+
+    /** @internal Seconds (from $jointSince) this joint's current rate, decelerating under Node3D::$jointFriction,
+     * reaches $limit; INF if friction brings it to rest first. The quadratic root behind jointUntilLimit() and
+     * jointCrossingTime() alike. */
+    private function timeToLimit(float $limit): float
+    {
+        if ($this->jointFriction == 0.0) {
+            return ($limit - $this->jointPos) / $this->jointRate;
+        }
+        $sign = $this->jointRate > 0.0 ? 1.0 : -1.0;
+        $speed0 = abs($this->jointRate);
+        $target = ($limit - $this->jointPos) * $sign;   // distance to travel, along the direction of travel
+        $disc = $speed0 * $speed0 - 2.0 * $this->jointFriction * $target;
+        return $disc < 0.0 ? INF : ($speed0 - sqrt($disc)) / $this->jointFriction;
+    }
+
+    /** Seconds until Node3D::$jointFriction alone (no limit in the way) decelerates this joint to rest; INF without
+     * friction, already at rest, or already below the same 0.3 rest threshold wireJointExpiry() treats a bounce
+     * below as resting (a residual rate that low, picked up from a coupled impulse elsewhere in the body, would
+     * otherwise schedule - and almost immediately refire - its own stop event forever, the same Zeno point). */
+    public function jointUntilStop(): float
+    {
+        if ($this->jointFriction == 0.0 || abs($this->jointRate) < 0.3) {
+            return INF;
+        }
+        $elapsed = ($this->clock?->time ?? 0.0) - $this->jointSince;
+        return max(0.0, abs($this->jointRate) / $this->jointFriction - $elapsed);
     }
 
     /** @internal The exact game time (absolute, not relative to now) at which this joint's current straight-line
@@ -333,7 +428,11 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
      * the limit it was due to reach partway through that tick). */
     public function jointCrossingTime(float $limit): float
     {
-        return $this->jointRate == 0.0 ? $this->jointSince : $this->jointSince + ($limit - $this->jointPos) / $this->jointRate;
+        if ($this->jointRate == 0.0) {
+            return $this->jointSince;
+        }
+        $t = $this->timeToLimit($limit);
+        return $this->jointSince + ($t === INF ? 0.0 : $t);
     }
 
     /**
@@ -395,16 +494,25 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
     {
         $s = sin($angle / 2);
         $this->setOrientation($this->jointAxisX * $s, $this->jointAxisY * $s, $this->jointAxisZ * $s, cos($angle / 2));
-        $this->spin($this->jointAxisX * $rate, $this->jointAxisY * $rate, $this->jointAxisZ * $rate);
+        $this->spin($this->jointAxisX * $rate, $this->jointAxisY * $rate, $this->jointAxisZ * $rate, $this->jointFriction);
     }
 
     private function driveSlider(float $offset, float $rate): void
     {
         $this->moveTo($this->jointAxisX * $offset, $this->jointAxisY * $offset, $this->jointAxisZ * $offset);
         $this->setVelocity($this->jointAxisX * $rate, $this->jointAxisY * $rate, $this->jointAxisZ * $rate);
+        // Coulomb friction, for a Slider, is exactly Node3D's own constant linear deceleration - no new mechanism
+        // needed (unlike a Hinge/Ball's spin, which gained one: see Node3D::$spinDecel).
+        if ($this->jointFriction != 0.0 && $rate != 0.0) {
+            $sign = $rate > 0.0 ? -1.0 : 1.0;
+            $this->setAcceleration($this->jointAxisX * $sign * $this->jointFriction, $this->jointAxisY * $sign * $this->jointFriction, $this->jointAxisZ * $sign * $this->jointFriction);
+        } elseif ($this->accX != 0.0 || $this->accY != 0.0 || $this->accZ != 0.0) {
+            $this->setAcceleration(0.0, 0.0, 0.0);
+        }
     }
 
-    /** Seconds until a Hinge, Ball or Slider reaches the limit it is moving towards; INF while still or unbounded. */
+    /** Seconds until a Hinge, Ball or Slider reaches the limit it is moving towards (its current rate decelerating
+     * under Node3D::$jointFriction, if any); INF while still, unbounded, or friction stops it first. */
     public function jointUntilLimit(): float
     {
         if ($this->jointRate === 0.0) {
@@ -414,7 +522,12 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
         if ($limit === INF || $limit === -INF) {
             return INF;
         }
-        $until = max(0.0, ($limit - $this->jointPositionNow()) / $this->jointRate);
+        $t = $this->timeToLimit($limit);
+        if ($t === INF) {
+            return INF;   // friction brings it to rest before it ever gets there
+        }
+        $elapsed = ($this->clock?->time ?? 0.0) - $this->jointSince;
+        $until = max(0.0, $t - $elapsed);
         // a joint already resting at its limit picks up a tiny residual rate every time a coupled impulse elsewhere
         // in the body touches it (nudgeJointRate() never clamps a joint it only touches through coupling - see
         // there); left as is, that rate would schedule - and immediately re-fire - its own expire forever, a Zeno
@@ -458,10 +571,22 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
                 $this->refreshJointLimit();
                 return;
             }
-            if ($this->jointRate === 0.0 || $this->jointUntilLimit() > 1e-9) {
-                return;   // the expiry was for some other reason (already stopped here, or not due yet)
+            if ($this->jointRate === 0.0) {
+                return;   // already at rest
             }
-            $rate = -$this->jointRate * $this->jointBounce;
+            $untilLimit = $this->jointUntilLimit();
+            $untilStop = $this->jointUntilStop();
+            if ($untilLimit > 1e-9 && $untilStop > 1e-9) {
+                return;   // the expiry was for some other reason: not due yet, either way
+            }
+            if ($untilStop <= $untilLimit) {
+                // Node3D::$jointFriction alone decelerated it to rest before any limit: a plain stop, not a bounce -
+                // no reaction elsewhere in the body (friction is internal to this one joint, dissipating locally,
+                // unlike a limit's reaction - see jointLimitImpulse()'s own docblock)
+                $this->setJointState($this->jointPositionNow(), 0.0);
+                return;
+            }
+            $rate = -$this->jointRateNow() * $this->jointBounce;
             $rate = abs($rate) < 0.3 ? 0.0 : $rate;
             if ($this->body !== null) {
                 $this->body->jointLimitImpulse($this, $rate);   // the exact reaction on the rest of the body
@@ -477,7 +602,8 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
     {
         $this->wireJointExpiry();
         $until = match ($this->jointType) {
-            \Phame\Physics\JointType::Hinge, \Phame\Physics\JointType::Ball, \Phame\Physics\JointType::Slider => $this->jointUntilLimit(),
+            // whichever comes first: reaching a limit, or Node3D::$jointFriction alone bringing it to rest
+            \Phame\Physics\JointType::Hinge, \Phame\Physics\JointType::Ball, \Phame\Physics\JointType::Slider => min($this->jointUntilLimit(), $this->jointUntilStop()),
             \Phame\Physics\JointType::Rope => $this->jointRopeUntilTaut(),
             default => INF,
         };
@@ -538,6 +664,17 @@ class Node3D extends EventDispatcher implements \Phame\Kinetic\Body, \Phame\Kine
                 $this->mqy = self::$qy;
                 $this->mqz = self::$qz;
                 $this->mqw = self::$qw;
+                if ($this->spinDecel != 0.0) {
+                    // from the new $mt on, age() starts at 0 again: $mwx/$mwy/$mwz must already be the decayed
+                    // speed (same axis), or a future orientationNow() would decelerate from the ORIGINAL speed
+                    // all over again
+                    $speed0 = sqrt($this->mwx * $this->mwx + $this->mwy * $this->mwy + $this->mwz * $this->mwz);
+                    $speed = max(0.0, $speed0 - $this->spinDecel * $dt);
+                    $scale = $speed0 == 0.0 ? 0.0 : $speed / $speed0;
+                    $this->mwx *= $scale;
+                    $this->mwy *= $scale;
+                    $this->mwz *= $scale;
+                }
             }
             $this->mt = $t;
         }
