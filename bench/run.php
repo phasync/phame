@@ -99,10 +99,10 @@ function placeRocksAndMarbles(Scene3D $scene, float $s): array
     $total = 700 + $marbles;
     for ($i = 0; $i < $total; ++$i) {
         $marble = $i < $marbles;
-        $ball = $marble ? new Marble() : new Rock();
+        $color = $marble ? $glass[$i % count($glass)] : $palette[$i % count($palette)];
+        $ball = $marble ? new Marble($color) : new Rock($color);
         $ball->radius = $marble ? mt_rand(330, 400) / 100 : mt_rand(50, 180) / 100;
         $ball->mass = ($marble ? 1.6 : 1.0) * $ball->radius ** 3;
-        $ball->color = $marble ? $glass[$i % count($glass)] : $palette[$i % count($palette)];
         $span = (int) (($s - $ball->radius - 0.5) * 10);
         do {
             [$x, $y, $z] = [mt_rand(-$span, $span) / 10, mt_rand(-$span, $span) / 10, mt_rand(-$span, $span) / 10];
@@ -270,9 +270,12 @@ $scenes = [
 // does not fully reset between top-level phasync::run() calls, confirmed by a "stalled" deadlock after a few dozen
 // runs in one process) never has to survive more than one scene
 $scene = null;
+$seconds = 5.0;
 foreach ($argv as $arg) {
     if (str_starts_with($arg, '--scene=')) {
         $scene = substr($arg, 8);
+    } elseif (str_starts_with($arg, '--seconds=')) {
+        $seconds = (float) substr($arg, 10);   // a short run for the smoke test (tests/BenchTest.php)
     }
 }
 if ($scene !== null) {
@@ -280,7 +283,7 @@ if ($scene !== null) {
         fwrite(STDERR, "unknown scene: $scene\n");
         exit(1);
     }
-    echo json_encode(runScene($scenes[$scene])) . "\n";
+    echo json_encode(runScene($scenes[$scene], $seconds)) . "\n";
     exit(0);
 }
 
