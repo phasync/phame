@@ -78,15 +78,18 @@ final class Space
     private static float $placedAt = NAN;
     private static int $placedCounter = -1;
     /**
-     * @var array<int, array{int, list<?array{float, float, float}>, array<int, true>}> by compound: at which of its
-     * counters; each part's centre in the root's space while the joints above it are still (null while one turns);
-     * and the nodes on the way down to the moving parts, the only ones a placement walks through
+     * @var array<int, array{int, float, list<?array{float, float, float}>, list<?list<array{float, float, float,
+     * float, float, float, float, float, float, float, float, float, float, float, float, float}>>}> by compound:
+     * at which of its counters, the game time $t0 the entries below were captured at; each part's centre in the
+     * root's space while the joints above it are still (null while one turns, see the next field); and, for a part
+     * that does turn, its chain of still-or-turning ancestors between it and the compound, root to part order, each
+     * a snapshot at $t0 of Node3D::x/y/z, velocityX/Y/Z, accelerationX/Y/Z (gravity folded in), orientationX/Y/Z/W
+     * and mwx/mwy/mwz - everything evaluatePartChain() needs to place it again at any later time without walking
+     * the tree or touching a single Node3D property (those getters cost real time, called this often).
      */
     private array $offsets = [];
     /** @var array<int, int> by part: its index among its compound's parts */
     private array $partIndex = [];
-    /** @var list<\Phame\Math\Matrix4> one transform per depth of a tree, for placement walks */
-    private static array $levels = [];
     private static ?\Phame\Math\Matrix4 $scratch = null;
     /** @var list<?Node3D> the bodies, each once, as a heap by the time of their next event (Node3D::$physicsAt) */
     private array $heap = [];
@@ -802,6 +805,18 @@ final class Space
     private static float $nz = 0.0;
     private static float $normalSpeed = 0.0;
 
+    /** @internal Verification only (see tests/Verification/PlacePartsTest.php): a compound's parts' current
+     * centres, in the order of $this->parts, the same values placeParts() puts into $partX/Y/Z. */
+    public function partCentres(Node3D $compound): array
+    {
+        $this->placeParts($compound);
+        $out = [];
+        foreach ($this->parts[spl_object_id($compound)] ?? [] as $i => $part) {
+            $out[] = [self::$partX[$i], self::$partY[$i], self::$partZ[$i]];
+        }
+        return $out;
+    }
+
     /** The gap between a body and the nearest part of a compound (negative: overlapping), now. */
     private function nearestGap(Node3D $compound, Node3D $body): float
     {
@@ -824,8 +839,11 @@ final class Space
     }
 
     /**
-     * The centres of a compound's parts now, into $partX/Y/Z in the order of its parts: one walk down the tree, one
-     * matrix product per node (Node3D::getWorldMatrix() would walk up to the root for every part).
+     * The centres of a compound's parts now, into $partX/Y/Z in the order of its parts. A still part (nothing
+     * between it and the compound has ever moved since the compound's last event) is one turn and shift of a
+     * cached offset; the turning ones share one walk down $walk (see offsetsOf()), each node's step evaluated once
+     * and reused by every part below it - cheap (no Node3D property reads, no Matrix4) however many distinct times
+     * different bodies probing this compound ask at, which is the common case (each predicts on its own schedule).
      */
     private function placeParts(Node3D $compound): void
     {
@@ -839,50 +857,104 @@ final class Space
             $this->offsets[$id] = [$compound->physicsCounter, ...$this->offsetsOf($compound)];   // until it next changes
         }
         $m = $compound->getWorldMatrix();   // the root's transform now: a still part is one turn and shift
-        [, $offsets, $walk] = $this->offsets[$id];
+        [, $t0, $offsets, $walk, $steps] = $this->offsets[$id];
         if ($walk !== []) {
-            $this->placeMoving($compound, $m, $walk, 0);   // the moving parts: one walk down their branches
+            $this->placeMoving($compound, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, $walk, $steps, $now - $t0);
         }
         foreach ($offsets as $i => $offset) {
             if ($offset === null) {
-                continue;
+                continue;   // placeMoving() just wrote self::$partX/Y/Z[$i] directly, in the compound's own space
             }
             [$x, $y, $z] = $offset;
             self::$partX[$i] = $m->m0 * $x + $m->m4 * $y + $m->m8 * $z + $m->m12;
             self::$partY[$i] = $m->m1 * $x + $m->m5 * $y + $m->m9 * $z + $m->m13;
             self::$partZ[$i] = $m->m2 * $x + $m->m6 * $y + $m->m10 * $z + $m->m14;
         }
-    }
-
-    /** Places the parts below moving nodes: down through the nodes in $walk only, one product per node. */
-    private function placeMoving(Node3D $node, \Phame\Math\Matrix4 $world, array $walk, int $depth): void
-    {
-        $m = self::$levels[$depth] ??= \Phame\Math\Matrix4::get();
-        foreach ($node->children as $child) {
-            if (!isset($walk[spl_object_id($child)])) {
-                continue;
-            }
-            $m->product($world, $child->getLocalMatrix());
-            if ($child->radius > 0.0) {
-                $i = $this->partIndex[spl_object_id($child)];
-                [self::$partX[$i], self::$partY[$i], self::$partZ[$i]] = [$m->m12, $m->m13, $m->m14];
-            }
-            if ($child->children !== []) {
-                $this->placeMoving($child, $m, $walk, $depth + 1);
+        if ($walk !== []) {
+            // the moving parts' centres placeMoving() wrote are in the compound's own space (composed only from
+            // $walk's steps, which start there): turn and shift them into world space, same as the still ones above
+            foreach ($offsets as $i => $offset) {
+                if ($offset !== null) {
+                    continue;
+                }
+                [$x, $y, $z] = [self::$partX[$i], self::$partY[$i], self::$partZ[$i]];
+                self::$partX[$i] = $m->m0 * $x + $m->m4 * $y + $m->m8 * $z + $m->m12;
+                self::$partY[$i] = $m->m1 * $x + $m->m5 * $y + $m->m9 * $z + $m->m13;
+                self::$partZ[$i] = $m->m2 * $x + $m->m6 * $y + $m->m10 * $z + $m->m14;
             }
         }
     }
 
     /**
-     * Each part's centre in the root's space, where every node between them is still (it then stays there until the
-     * compound next changes); null where one moves. And the nodes from the root down to the moving parts.
+     * Places the parts below turning nodes: down through the nodes in $walk only, one step evaluated once per node
+     * and composed into the accumulated (rotation, position) handed down to its children - exactly what
+     * Matrix4::product() down the tree gives, in quaternion-and-point form instead of 4x4 matrices (cheaper per
+     * step, nothing allocated) and from $steps' cached snapshot (see offsetsOf()) instead of Node3D::getLocalMatrix()
+     * (which would re-derive the same orientation from scratch, and re-walk to the root for every node's dirty
+     * check). A part's own centre is written straight into $partX/Y/Z, in the compound's own space - placeParts()
+     * turns it into world space together with the still parts' offsets, one matrix multiply either way.
+     */
+    private function placeMoving(Node3D $node, float $qx, float $qy, float $qz, float $qw, float $px, float $py, float $pz, array $walk, array $steps, float $dt): void
+    {
+        foreach ($node->children as $child) {
+            $id = spl_object_id($child);
+            if (!isset($walk[$id])) {
+                continue;
+            }
+            [$x, $y, $z, $vx, $vy, $vz, $ax, $ay, $az, $lqx, $lqy, $lqz, $lqw, $wx, $wy, $wz] = $steps[$id];
+            $lx = $x + ($vx + 0.5 * $ax * $dt) * $dt;
+            $ly = $y + ($vy + 0.5 * $ay * $dt) * $dt;
+            $lz = $z + ($vz + 0.5 * $az * $dt) * $dt;
+            $speed = sqrt($wx * $wx + $wy * $wy + $wz * $wz);
+            if ($speed != 0.0) {
+                $half = $speed * $dt / 2.0;
+                $k = sin($half) / $speed;
+                [$dx, $dy, $dz, $dw] = [$wx * $k, $wy * $k, $wz * $k, cos($half)];
+                [$lqx, $lqy, $lqz, $lqw] = [
+                    $dw * $lqx + $dx * $lqw + $dy * $lqz - $dz * $lqy,
+                    $dw * $lqy - $dx * $lqz + $dy * $lqw + $dz * $lqx,
+                    $dw * $lqz + $dx * $lqy - $dy * $lqx + $dz * $lqw,
+                    $dw * $lqw - $dx * $lqx - $dy * $lqy - $dz * $lqz,
+                ];
+            }
+            // (nqx,nqy,nqz,nqw, npx,npy,npz) = (qx,qy,qz,qw, px,py,pz) ∘ (lqx,lqy,lqz,lqw, lx,ly,lz)
+            $tx = 2.0 * ($qy * $lz - $qz * $ly);
+            $ty = 2.0 * ($qz * $lx - $qx * $lz);
+            $tz = 2.0 * ($qx * $ly - $qy * $lx);
+            $npx = $px + $lx + $qw * $tx + ($qy * $tz - $qz * $ty);
+            $npy = $py + $ly + $qw * $ty + ($qz * $tx - $qx * $tz);
+            $npz = $pz + $lz + $qw * $tz + ($qx * $ty - $qy * $tx);
+            $nqx = $qw * $lqx + $qx * $lqw + $qy * $lqz - $qz * $lqy;
+            $nqy = $qw * $lqy - $qx * $lqz + $qy * $lqw + $qz * $lqx;
+            $nqz = $qw * $lqz + $qx * $lqy - $qy * $lqx + $qz * $lqw;
+            $nqw = $qw * $lqw - $qx * $lqx - $qy * $lqy - $qz * $lqz;
+            if ($child->radius > 0.0) {
+                $i = $this->partIndex[$id];
+                [self::$partX[$i], self::$partY[$i], self::$partZ[$i]] = [$npx, $npy, $npz];
+            }
+            if ($child->children !== []) {
+                $this->placeMoving($child, $nqx, $nqy, $nqz, $nqw, $npx, $npy, $npz, $walk, $steps, $dt);
+            }
+        }
+    }
+
+    /**
+     * Each part's centre in the compound's own space, where every node between them is still (it then stays there
+     * until the compound next changes); null where one turns. And, for those: the nodes on the way down to them
+     * ($walk, as placeMoving() walks today), and each such node's own snapshot at $t0 of Node3D::x/y/z,
+     * velocityX/Y/Z, accelerationX/Y/Z (gravity folded in), orientationX/Y/Z/W and mwx/mwy/mwz - everything
+     * placeMoving() needs to turn and place it again at any later time without touching a single Node3D property
+     * (those getters cost real time, called this often) or re-walking to the root. A node shared by several parts'
+     * chains (the usual case: a spine, a hip) is captured once, not once per part below it.
      *
-     * @return array{list<?array{float, float, float}>, array<int, true>}
+     * @return array{float, list<?array{float, float, float}>, array<int, true>, array<int, list<float>>}
      */
     private function offsetsOf(Node3D $compound): array
     {
         $out = [];
         $walk = [];
+        $steps = [];
+        $t0 = $this->world->clock->time;
         $m = self::$scratch ??= \Phame\Math\Matrix4::get();
         foreach ($this->parts[spl_object_id($compound)] as $part) {
             $still = true;
@@ -895,7 +967,26 @@ final class Space
             if (!$still) {
                 $out[] = null;
                 for ($n = $part; $n !== $compound; $n = $n->parent) {
-                    $walk[spl_object_id($n)] = true;
+                    $id = spl_object_id($n);
+                    $walk[$id] = true;
+                    if (isset($steps[$id])) {
+                        continue;   // already captured, from another part sharing this ancestor
+                    }
+                    // the part's own scale affects only its own mesh/geometry, never its centre (it has no
+                    // children for a scaled rotation block to carry); an ANCESTOR's scale would, and placeMoving()
+                    // has no scale term to represent that, so it must never happen above the part
+                    if ($n !== $part && ($n->scaleX !== 1.0 || $n->scaleY !== 1.0 || $n->scaleZ !== 1.0)) {
+                        throw new \RuntimeException('Body/Space compound internals (an ancestor of a part, not the part itself) must not be scaled: a pivot that scales has no meaning, and placeMoving() does not account for it');
+                    }
+                    $steps[$id] = [
+                        $n->x, $n->y, $n->z,
+                        $n->velocityX, $n->velocityY, $n->velocityZ,
+                        $n->accelerationX + ($n->parent?->gravityX ?? 0.0),
+                        $n->accelerationY + ($n->parent?->gravityY ?? 0.0),
+                        $n->accelerationZ + ($n->parent?->gravityZ ?? 0.0),
+                        $n->orientationX, $n->orientationY, $n->orientationZ, $n->orientationW,
+                        $n->mwx, $n->mwy, $n->mwz,
+                    ];
                 }
                 continue;
             }
@@ -905,7 +996,7 @@ final class Space
             }
             $out[] = [$m->m12, $m->m13, $m->m14];
         }
-        return [$out, $walk];
+        return [$t0, $out, $walk, $steps];
     }
 
     /** Whether the body and the nearest part (see nearestGap()) close in, by the part's world velocity. */
